@@ -1,0 +1,4 @@
+holds 461 head queued-for at arm: p50 154s p90 612s; share >=300s 32%, >=600s 10%
+T= 300s lane-open share of hold time (enqueue-anchored): 44%
+T= 600s lane-open share of hold time (enqueue-anchored): 81%
+T= 900s lane-open share of hold time (enqueue-anchored): 93%
