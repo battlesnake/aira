@@ -1,0 +1,12 @@
+window 2026-11-15T00:00Z .. 2026-11-18T12:00Z
+backstop passes (yield lines): 456; naming a head: 384
+candidates (head jumped an older waiter still queued at the next hold): 8
+  yield 11-15 17:20:35Z head 4914 (3584 MiB) next hold head 4895: head granted 4.5 s before the next arm: unchanged (gap > 1 s)
+  yield 11-15 22:43:13Z head 1958 (1024 MiB) next hold head 1939: head granted 1.7 s before the next arm: unchanged (gap > 1 s)
+  yield 11-16 00:39:59Z head 3751 (2560 MiB) next hold head 3720: head granted 0.0 s before the next arm: changed (gap <= 1 s)
+  yield 11-16 01:19:20Z head 4046 (7168 MiB) next hold head 3987: no row
+  yield 11-16 02:44:27Z head 4708 (7168 MiB) next hold head 4629: head granted 0.0 s before the next arm: changed (gap <= 1 s)
+  yield 11-16 02:51:17Z head 4724 (7168 MiB) next hold head 4663: head granted 0.0 s before the next arm: changed (gap <= 1 s)
+  yield 11-16 10:49:06Z head 4196 (1024 MiB) next hold head 4182: head granted 8.0 s before the next arm: unchanged (gap > 1 s)
+  yield 11-18 11:21:07Z head 14816 (1024 MiB) next hold head 14800: head granted 35.0 s before the next arm: unchanged (gap > 1 s)
+summary: changed (gap <= 1 s) 3, unchanged (gap > 1 s) 4, no row 1, ambiguous 0

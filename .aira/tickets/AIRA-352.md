@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-352","project":"aira","title":"admission: a backstop pass lost to a pushed head must not clear the freeze anchor (restores the documented AIRA-307 backstop)","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
+---
+Found in AIRA-350 review (round-3 finding 14). 2026-11-18 13:21:07: the backstop pass ran with a pushed head in front and granted nothing behind it (admit.go ~2691-2692); the anchor is cleared at the start of that pass (admit.go ~2538), so the next hold needs a fresh arm and another 5 minutes. The incident's largest single loss. Candidate fix: do not clear the anchor on a backstop pass that a pushed head blocks. Needs its own short spec (what the documented backstop guarantees; behaviour with push; tests on the AIRA-228 seam). Owner chose to do this with the diagnostics, 2026-11-18. Correctness-critical: two-loop.
