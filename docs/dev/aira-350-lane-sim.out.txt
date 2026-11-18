@@ -13,6 +13,9 @@ tb-min     616s
 tb-full    616s
 cum-min    76s
 cum-g      76s
+off-x      30s
+fixed      30s
+fixed-add  30s
 
 ## W3 finding 3, backstop refill of ordinary leases: the head's grant time
 off        350s
@@ -22,6 +25,9 @@ tb-min     605s
 tb-full    605s
 cum-min    never (>3000s)
 cum-g      never (>3000s)
+off-x      never (>3000s)
+fixed      never (>3000s)
+fixed-add  never (>3000s)
 
 ## W8 finding 8, lane-admitted suites (4 workers each), head budget spent: the head's grant time
 off        20s
@@ -31,6 +37,9 @@ tb-min     150s
 tb-full    70s
 cum-min    150s
 cum-g      150s
+off-x      60s
+fixed      60s
+fixed-add  20s
 
 ## W8b the same with the head's budget fresh (today's exposure): the head's grant time
 off        140s
@@ -40,6 +49,9 @@ tb-min     150s
 tb-full    150s
 cum-min    150s
 cum-g      150s
+off-x      140s
+fixed      140s
+fixed-add  140s
 
 ## W8c finding 8, suites with a long-lived 32-worker pool, head budget spent: the head's grant time
 off        20s
@@ -49,6 +61,9 @@ tb-min     900s
 tb-full    900s
 cum-min    900s
 cum-g      900s
+off-x      60s
+fixed      60s
+fixed-add  20s
 
 ## W8d the same with the head's budget fresh (today's exposure): the head's grant time
 off        900s
@@ -58,6 +73,9 @@ tb-min     900s
 tb-full    900s
 cum-min    900s
 cum-g      900s
+off-x      930s
+fixed      930s
+fixed-add  900s
 
 ## W12 finding 12, never-ending non-lane leases: the head's grant time
 off        210s
@@ -67,49 +85,73 @@ tb-min     610s
 tb-full    610s
 cum-min    210s
 cum-g      210s
+off-x      never (>6000s)
+fixed      never (>6000s)
+fixed-add  210s
+
+## W12b the same, the never-ending 512 MiB leases granted in the lane (fixed designs; others as W12): the head's grant time
+off        210s
+spec       never (>6000s)
+spec-fresh never (>6000s)
+tb-min     610s
+tb-full    610s
+cum-min    210s
+cum-g      210s
+off-x      never (>6000s)
+fixed      300s
+fixed-add  180s
 
 ## W3 phase sweep: small jobs start at offset 0, 10, ..., 290 s (30 runs per design, horizon 3000 s)
-offset        off     spec  cum-min   tb-min
-0            350s    never    never     605s
-10          never    never    never     605s
-20          never    never    never     605s
-30          never    never    never     605s
-40          never    never    never     605s
-50          never    never    never     605s
-60          never    never    never     605s
-70          never    never    never     605s
-80          never    never    never     605s
-90          never    never    never     605s
-100         never    never    never     605s
-110         never    never    never     605s
-120         never    never    never     605s
-130         never    never    never     605s
-140         never    never    never     605s
-150         never    never    never     605s
-160         never    never    never     605s
-170         never    never    never     605s
-180         never    never    never     605s
-190         never    never    never     605s
-200         never    never    never     605s
-210         never    never    never     605s
-220         never    never    never     605s
-230         never    never    never     605s
-240         never    never    never     605s
-250         never    never    never     605s
-260         never    never    never     605s
-270         never    never     350s     605s
-280         never    never     350s     605s
-290         never    never     350s     605s
+offset        off     spec  cum-min   tb-min    off-x    fixed fixed-add
+0            350s    never    never     605s    never    never    never
+10          never    never    never     605s    never    never    never
+20          never    never    never     605s    never    never    never
+30          never    never    never     605s    never    never    never
+40          never    never    never     605s    never    never    never
+50          never    never    never     605s    never    never    never
+60          never    never    never     605s    never    never    never
+70          never    never    never     605s    never    never    never
+80          never    never    never     605s    never    never    never
+90          never    never    never     605s    never    never    never
+100         never    never    never     605s    never    never    never
+110         never    never    never     605s    never    never    never
+120         never    never    never     605s    never    never    never
+130         never    never    never     605s    never    never    never
+140         never    never    never     605s    never    never    never
+150         never    never    never     605s    never    never    never
+160         never    never    never     605s    never    never    never
+170         never    never    never     605s    never    never    never
+180         never    never    never     605s    never    never    never
+190         never    never    never     605s    never    never    never
+200         never    never    never     605s    never    never    never
+210         never    never    never     605s    never    never    never
+220         never    never    never     605s    never    never    never
+230         never    never    never     605s    never    never    never
+240         never    never    never     605s    never    never    never
+250         never    never    never     605s    never    never    never
+260         never    never    never     605s    never    never    never
+270         never    never     350s     605s    never    never    never
+280         never    never     350s     605s    never    never    never
+290         never    never     350s     605s    never    never    never
 off      starved in 29 of 30
 spec     starved in 30 of 30
 cum-min  starved in 27 of 30
 tb-min   starved in 0 of 30
+off-x    starved in 30 of 30
+fixed    starved in 30 of 30
+fixed-add starved in 30 of 30
 today grants, cum-min starves, at offsets: [0]
 today starves, cum-min grants, at offsets: [270, 280, 290]
+off-x grants the head later than today (or never) at offsets: [0]
+fixed grants the head later than today (or never) at offsets: [0]
+fixed-add grants the head later than today (or never) at offsets: [0]
 
 ## W3 at offset 0 traced: hold arms, backstop passes and 5 GiB refills before the head
-off      0s arm, 300s backstop, 320s arm, 350s HEAD GRANTED
-cum-min  20s arm, 320s backstop, 320s refill, 350s arm, 650s backstop, 650s refill, 700s arm, 1000s backstop, 1000s refill, 1050s arm, ... head not granted
+off       0s arm, 300s backstop, 320s arm, 350s HEAD GRANTED
+cum-min   20s arm, 320s backstop, 320s refill, 350s arm, 650s backstop, 650s refill, 700s arm, 1000s backstop, 1000s refill, 1050s arm, ... head not granted
+off-x     0s arm, 300s backstop, 320s arm, 620s backstop, 620s refill, 640s arm, 940s backstop, 940s refill, 960s arm, 1260s backstop, 1260s refill, 1280s arm, ... head not granted
+fixed     350s arm, 650s backstop, 650s refill, 700s arm, 1000s backstop, 1000s refill, 1050s arm, ... head not granted
+fixed-add 1s arm, 301s backstop, 301s refill, 350s arm, 650s backstop, 650s refill, 700s arm, 1000s backstop, 1000s refill, 1050s arm, ... head not granted
 
 ## W0 illustrative, the 13:55 queue on a model slice (not evidence)
 off        head 60s, 2154 240s, 2700 360s, small mean wait 157s
@@ -119,3 +161,6 @@ tb-min     head 240s, 2154 300s, 2700 420s, small mean wait 43s
 tb-full    head 240s, 2154 300s, 2700 420s, small mean wait 43s
 cum-min    head 240s, 2154 300s, 2700 420s, small mean wait 47s
 cum-g      head 240s, 2154 300s, 2700 420s, small mean wait 47s
+off-x      head 240s, 2154 420s, 2700 540s, small mean wait 215s
+fixed      head 240s, 2154 420s, 2700 480s, small mean wait 47s
+fixed-add  head 60s, 2154 240s, 2700 420s, small mean wait 66s

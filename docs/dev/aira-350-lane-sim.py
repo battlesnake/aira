@@ -37,6 +37,21 @@ Lane designs (each a set of switches):
 In tb-* and cum-* the lane case is evaluated AFTER the backstop case, so a backstop pass is
 exactly today's; in spec* it is before, as the spec wrote it.
 
+Fixed-lane designs (docs/superpowers/specs/2026-11-18-fixed-small-lane-design.md):
+  fixed       round 2, the partition: a job-level waiter of at most y with no workers (not a
+              suite parent) is tried in a separate pool of x first, before the head rule,
+              while lane footprint (size + per-job headroom) + its own <= x, it fits today's
+              whole-slice ledger, and CPU and VRAM leave the head's; closed behind a pushed
+              head; a lane grant never counts in the budget and never arms. Every other grant
+              must also fit (ceiling - x) - headroom(main jobs + 1) - main bookings, and a head
+              must fit an empty main pool.
+  off-x       a control, not a design: today's rules with the ceiling x lower and no lane. The
+              gap between off and off-x is the partition's capacity cost alone.
+  fixed-add   round 1, additive: the same lane, but main is judged on ceiling - headroom(main
+              jobs + 1) - main bookings with no x subtracted, and the lane is not checked
+              against the whole slice (the model has no physical floor, so round 1's rule 3 is
+              absent).
+
 Run (pure Python, no input files):
     aira confine --name <unique> -- python3 -I docs/dev/aira-350-lane-sim.py
 Output is committed beside it as docs/dev/aira-350-lane-sim.out.txt.
@@ -74,11 +89,16 @@ DESIGNS = {
     "tb-full": dict(mode="conc", T=T_BOX, c7=True, c3=True, g=True, c2=True, gcpu=True, cached=False, before=False),
     "cum-min": dict(mode="cum", T=None, c7=False, c3=False, g=False, c2=False, gcpu=False, cached=False, before=False),
     "cum-g": dict(mode="cum", T=None, c7=False, c3=False, g=True, c2=True, gcpu=True, cached=False, before=False),
+    "off-x": dict(mode="offx"),
+    "fixed": dict(mode="fixed", partition=True),
+    "fixed-add": dict(mode="fixed", partition=False),
 }
 
 
 class Sim:
     def __init__(self, jobs, C, base=0, perjob=0, cpu_ceil=1 << 20, vram_ceil=0, armed0=None, design=None):
+        if design is not None and design.get("mode") == "offx":
+            C, design = C - X, None
         self.C, self.base, self.perjob = C, base, perjob
         self.cpu_ceil, self.vram_ceil, self.armed, self.d = cpu_ceil, vram_ceil, armed0, design
         self.seq = 0
@@ -139,8 +159,61 @@ class Sim:
         return True
 
     def could_fit_empty(self, w):
-        return (w.size <= self.C - self.headroom(1) and w.cpu <= self.cpu_ceil
+        main = self.C - (X if self.d and self.d.get("partition") else 0)
+        return (w.size <= main - self.headroom(1) and w.cpu <= self.cpu_ceil
                 and (w.vram == 0 or w.vram <= self.vram_ceil))
+
+    def step_fixed(self, t, phase, order):
+        """One pass of the fixed-lane designs. Returns nothing; grants in place."""
+        d = self.d
+        g = self.granted()
+        out, cpu_out, vram_out, njobs = (sum(j.size for j in g), sum(j.cpu for j in g),
+                                         sum(j.vram for j in g), len(g))
+        lane_used = sum(j.size + self.perjob for j in g if j.lane)
+        out_main = sum(j.size for j in g if not j.lane)
+        nmain = sum(1 for j in g if not j.lane)
+        head = None
+        for w in order:
+            whole = self.C - self.headroom(njobs + 1) - out
+            cpu_h = head.cpu if head is not None else 0
+            vram_h = head.vram if head is not None else 0
+            eligible = not w.sub and not w.workers and w.size <= Y
+            if (eligible and not (head is not None and head.push)
+                    and lane_used + w.size + self.perjob <= X
+                    and (not d["partition"] or w.size <= whole)
+                    and w.cpu + cpu_h <= self.cpu_ceil - cpu_out
+                    and (w.vram == 0 or w.vram + vram_h <= self.vram_ceil - vram_out)):
+                self._grant(w, t)
+                w.lane = True
+                lane_used += w.size + self.perjob
+                out, cpu_out, vram_out, njobs = out + w.size, cpu_out + w.cpu, vram_out + w.vram, njobs + 1
+                continue
+            main_cap = self.C - (X if d["partition"] else 0)
+            available = main_cap - self.headroom(nmain + 1) - out_main
+            if d["partition"]:
+                available = min(available, whole)
+            fits = (w.size <= available and w.cpu <= self.cpu_ceil - cpu_out
+                    and (w.vram == 0 or w.vram <= self.vram_ceil - vram_out))
+            protected = head is not None and not w.sub
+            withheld = False
+            if protected and fits:
+                if head.push:
+                    fits = False
+                elif phase == "yield":
+                    pass
+                elif head.bypassed + w.size > head.size // 2:
+                    fits, withheld = False, True
+            if fits:
+                self._grant(w, t)
+                out, cpu_out, vram_out, njobs = out + w.size, cpu_out + w.cpu, vram_out + w.vram, njobs + 1
+                out_main, nmain = out_main + w.size, nmain + 1
+                if protected:
+                    head.bypassed += w.size
+                continue
+            if withheld and phase == "idle":
+                self.armed, phase = t, "hold"
+            if head is None and not w.sub and self.could_fit_empty(w):
+                head = w
 
     def step(self, t):
         # releases: a lease past its end, or whose parent has ended; a respawning worker is
@@ -176,6 +249,9 @@ class Sim:
         queued = [j for j in self.live if j.state == "queued"]
         pushed = sorted([j for j in queued if j.push], key=lambda j: -j.push)
         rest = sorted([j for j in queued if not j.push], key=lambda j: j.seq)
+        if self.d is not None and self.d.get("mode") == "fixed":
+            self.step_fixed(t, phase, pushed + rest)
+            return
         head = None
         cache = [self.tree()]
         g = self.granted()
@@ -309,11 +385,13 @@ def w8(design, spent=True, pool=False):
     return sim.run(6000, head)
 
 
-def w12(design):
+def w12(design, perm_lane=False):
     """Finding 12: 1.5 GiB of leases that never end, 10 GiB of transient leases ending one per
     30 s, a 39 GiB head (fits an empty slice: ceiling net 44 GiB with 2 GiB + 64 MiB/job
-    headroom), 512 MiB small jobs every 5 s living 40 s (demand about x)."""
-    jobs = [Job("perm%d" % k, 512, INF, pre=True) for k in range(3)]
+    headroom), 512 MiB small jobs every 5 s living 40 s (demand about x). perm_lane: the
+    never-ending 512 MiB leases were granted in the lane (fixed designs only)."""
+    in_lane = perm_lane and DESIGNS[design] is not None and DESIGNS[design].get("mode") == "fixed"
+    jobs = [Job("perm%d" % k, 512, INF, pre=True, lane=in_lane) for k in range(3)]
     jobs += [Job("tr%d" % k, 1024, 30 * (k + 1), pre=True) for k in range(10)]
     head = Job("head", 39936, INF, spent=True)
     jobs.append(head)
@@ -368,13 +446,15 @@ def main():
             ("W8c finding 8, suites with a long-lived 32-worker pool, head budget spent",
              lambda d: w8(d, True, True), 6000),
             ("W8d the same with the head's budget fresh (today's exposure)", lambda d: w8(d, False, True), 6000),
-            ("W12 finding 12, never-ending non-lane leases", w12, 6000)]
+            ("W12 finding 12, never-ending non-lane leases", w12, 6000),
+            ("W12b the same, the never-ending 512 MiB leases granted in the lane (fixed designs; others as W12)",
+             lambda d: w12(d, True), 6000)]
     for title, fn, t_end in rows:
         print("## " + title + ": the head's grant time")
         for name in names:
             print("%-10s %s" % (name, fmt(fn(name), t_end)))
         print()
-    sweep = ("off", "spec", "cum-min", "tb-min")
+    sweep = ("off", "spec", "cum-min", "tb-min", "off-x", "fixed", "fixed-add")
     offsets = list(range(0, 300, 10))
     print("## W3 phase sweep: small jobs start at offset 0, 10, ..., 290 s (30 runs per design, horizon 3000 s)")
     print("%-8s %s" % ("offset", " ".join("%8s" % name for name in sweep)))
@@ -388,10 +468,14 @@ def main():
     rev = [off for i, off in enumerate(offsets) if table["off"][i] is None and table["cum-min"][i] is not None]
     print("today grants, cum-min starves, at offsets: %s" % (both or "-"))
     print("today starves, cum-min grants, at offsets: %s" % (rev or "-"))
+    for name in ("off-x", "fixed", "fixed-add"):
+        later = [off for i, off in enumerate(offsets)
+                 if table["off"][i] is not None and (table[name][i] is None or table[name][i] > table["off"][i])]
+        print("%s grants the head later than today (or never) at offsets: %s" % (name, later or "-"))
     print()
     print("## W3 at offset 0 traced: hold arms, backstop passes and 5 GiB refills before the head")
-    for name in ("off", "cum-min"):
-        print("%-8s %s" % (name, w3_trace(name)))
+    for name in ("off", "cum-min", "off-x", "fixed", "fixed-add"):
+        print("%-9s %s" % (name, w3_trace(name)))
     print()
     print("## W0 illustrative, the 13:55 queue on a model slice (not evidence)")
     for name in names:

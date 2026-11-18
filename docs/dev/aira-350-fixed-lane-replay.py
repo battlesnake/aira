@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Read-only replay of the fixed small-job lane (AIRA-350,
-docs/superpowers/specs/2026-11-18-fixed-small-lane-design.md, section 7).
+docs/superpowers/specs/2026-11-18-fixed-small-lane-design.md, section 6).
 
 Question: had a separately booked lane of fixed size x (jobs whose reserve is at most y,
 lane first, overflow to the main pool) existed, how much small-job wait would it have
@@ -35,17 +35,33 @@ Sections
       long-lived jobs (servers) the store cannot see because they have not ended.
   1c  the cut alternative "main pool first": a job granted within 1 s never enters the lane.
   1d  per UTC day, to show how the retention cap thins the earlier days.
+  1e  CPU-slot sensitivity: a lane grant is also refused while the retained jobs running at
+      that instant (each holding one slot), plus an ALLOWANCE for jobs the store does not
+      hold (aitest workers have no timing, capped signatures lost rows, servers have not
+      ended), would fill the slot ceiling. Allowance 0 is the retained rows alone.
+  1f  the partition's cost to the main pool: main's booking room is x smaller at every
+      instant, less the bookings of the jobs the lane moved out of main at that instant.
+  1g  the largest retained reserves, against the main pool's room under the partition.
   2   the 2026-11-18 incident window.
   3   aggregates from a live `aira confine --list --json` snapshot, if given.
 
-What the model leaves out (each makes the saving an UPPER bound unless stated):
-  - the CPU slot ceiling (32 slots on this box), the physical-room gate and the rule that a
-    lane grant must leave the main head's physical RAM, CPU and VRAM need: a lane grant
-    here needs only lane room;
-  - secondary effects: jobs leaving the main pool for the lane free main room for others
-    (this makes the saving a LOWER bound for jobs that stay in main);
-  - jobs still running when the store was copied (servers) have no row, so lane silting
-    by them is absent here; --snapshot reports what is running now;
+Every figure is a SIMULATED ESTIMATE, not a bound: first fit in arrival order is not
+monotone (removing a gate can admit a long-lived job that later displaces a long-waiting
+one; section 1c's main-first variant saves more than lane-first with fewer lane jobs).
+Known biases, by direction:
+  UP (the saving is overstated):
+  - no CPU slot ceiling in sections 1-1d (section 1e varies it), no physical-room gate, and
+    no reservation of the head's CPU and VRAM;
+  - the 20-row retention cap thins frequent commands, so lane occupancy is understated and
+    the lane is full less often than it would be;
+  - jobs still running at the copy (servers) are absent (section 1b adds them back as a
+    constant);
+  DOWN (the saving is understated):
+  - secondary effects: jobs leaving the main pool for the lane free main room for others.
+  NOT MODELLED: the partition's cost to large and overflow jobs (1f sizes the room lost,
+  not the wait it causes), so every saving here is GROSS.
+Other limits:
+  - --snapshot reports what is running now (servers absent from the store);
   - the store keeps 20 rows per (kind, signature) (internal/store/confine_peak_history.go:13),
     so frequent commands lost rows: the population is the retained sample;
   - pytest-worker rows carry no timing and are sub-reservations (never lane-eligible);
@@ -53,6 +69,7 @@ What the model leaves out (each makes the saving an UPPER bound unless stated):
     observe mode, so booking == reserve at grant.
 """
 import argparse
+import bisect
 import heapq
 import json
 import sqlite3
@@ -101,11 +118,14 @@ def load(db):
     return jobs, lost_sigs, no_timing
 
 
-def simulate(jobs, x, y, include_parents, silt=0, main_first=False):
+def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, allowance=0):
     """Event-driven lane replay. Returns per-run metrics.
 
     silt: a constant lane occupancy held throughout (long-lived jobs absent from the store).
-    main_first: the cut alternative; a job the main pool granted within 1 s never enters the lane."""
+    main_first: the cut alternative; a job the main pool granted within 1 s never enters the lane.
+    slots: if set, a lane grant also needs a CPU slot: the retained jobs running at that
+    instant (lane-moved jobs at their lane times, every other job at its historical times,
+    one slot each) plus `allowance` plus the candidate must not exceed `slots`."""
     elig = [j for j in jobs if j["budget"] <= y and (include_parents or not j["parent"])
             and not (main_first and j["wait"] < IMMEDIATE_MS)]
     elig.sort(key=lambda j: (j["a"], j["g"]))
@@ -116,6 +136,14 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False):
     events = []
     for j in elig:
         heapq.heappush(events, (j["a"], 1, j["_id"]))
+    if slots is not None:
+        starts = sorted(j["g"] for j in jobs)
+        ends = sorted(j["g"] + j["hold"] for j in jobs)
+        for e in ends:  # a historical job ending frees a slot: re-scan then
+            heapq.heappush(events, (e, 2, -1))
+    adj = 0           # historical intervals vacated by lane-moved jobs
+    adj_heap = []
+    cpu_denied = set()  # jobs refused a lane grant at least once for want of a slot
     waiting = []  # ids in arrival order
     deadline_heap = []
     occ = silt
@@ -163,6 +191,8 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False):
         # releases and arrivals at t
         while events and events[0][0] == t:
             _, kind, i = heapq.heappop(events)
+            if kind == 2:
+                continue
             if kind == 0:
                 occ -= elig[i]["_f"]
                 del residents[i]
@@ -170,14 +200,30 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False):
                 waiting.append(i)
                 heapq.heappush(deadline_heap, (elig[i]["g"], i))
         # first-fit scan in arrival order
+        while adj_heap and adj_heap[0][0] <= t:
+            adj += heapq.heappop(adj_heap)[1]
         still = []
         for i in waiting:
             j = elig[i]
             if occ + j["_f"] <= x:
+                if slots is not None:
+                    running = bisect.bisect_right(starts, t) - bisect.bisect_right(ends, t) + adj + len(residents)
+                    self_counted = 1 if j["g"] <= t < j["g"] + j["hold"] else 0
+                    if running - self_counted + allowance + 1 > slots:
+                        cpu_denied.add(i)
+                        still.append(i)
+                        continue
                 occ += j["_f"]
                 residents[i] = True
                 admitted_at[i] = t
                 heapq.heappush(events, (t + j["hold"], 0, i))
+                if slots is not None and j["hold"] > 0:
+                    # its historical interval no longer holds a slot
+                    if j["g"] <= t:
+                        adj -= 1
+                    else:
+                        heapq.heappush(adj_heap, (j["g"], -1))
+                    heapq.heappush(adj_heap, (j["g"] + j["hold"], 1))
             else:
                 still.append(i)
         waiting = still
@@ -221,7 +267,7 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False):
         long_share=area_long / area if area else 0, m10_share=area_10m / area if area else 0,
         peak_real=peak_real / GIB, p99_real=tw_pct(real_samples, 99) / GIB, p50_real=tw_pct(real_samples, 50) / GIB,
         peak_count=peak_count, p99_count=tw_pct(count_samples, 99), span_h=span / 3.6e6,
-        admitted_at=admitted_at, elig=elig, segs=segs)
+        admitted_at=admitted_at, elig=elig, segs=segs, cpu_denied=len(cpu_denied))
 
 
 def per_day(jobs, xs, y):
@@ -261,6 +307,40 @@ def per_day(jobs, xs, y):
                          f"{area / tot / GIB if tot else 0:.2f}")
         lines.append(f"{fmt_t(lo)[:10]} | {len(rows) / hours:11.1f} | {sum(j['wait'] for j in rows) / 3.6e6:12.1f} | " + " | ".join(parts))
     return lines
+
+
+def partition_cost(r, x):
+    """Section 1f. Under the partition the main pool's booking room is x smaller at every
+    instant; the jobs the lane admitted no longer book main over their historical interval
+    [g, g + hold], which gives back their footprint there. Returns time-weighted quantiles of
+    the net loss x - (moved footprint at t), in GiB, over the replay span."""
+    ev = []
+    for j in r["elig"]:
+        if j["_id"] in r["admitted_at"] and j["hold"] > 0:
+            ev.append((j["g"], j["_f"]))
+            ev.append((j["g"] + j["hold"], -j["_f"]))
+    ev.sort()
+    lo = min(j["a"] for j in r["elig"])
+    hi = max(j["g"] + j["hold"] for j in r["elig"])
+    samples, back, last = [], 0, lo
+    for t, d in ev:
+        if t > last:
+            samples.append((t - last, x - back))
+            last = t
+        back += d
+    if hi > last:
+        samples.append((hi - last, x - back))
+    tot = sum(dt for dt, _ in samples)
+    mean = sum(dt * v for dt, v in samples) / tot
+
+    def q(p):
+        acc = 0
+        for dt, v in sorted(samples, key=lambda s: s[1]):
+            acc += dt
+            if acc >= p * tot:
+                return v
+        return samples[-1][1]
+    return mean / GIB, q(0.10) / GIB, q(0.50) / GIB, q(0.90) / GIB
 
 
 def incident(jobs, xs, y, lo, hi):
@@ -321,6 +401,9 @@ def main():
     ap.add_argument("--y", type=float, default=1.0, help="job size limit, GiB")
     ap.add_argument("--x", type=float, nargs="+", default=[2, 4, 6, 8], help="lane sizes, GiB")
     ap.add_argument("--silt", type=float, default=1.56, help="lane GiB held throughout by long-lived jobs (section 1b)")
+    ap.add_argument("--slots", type=int, default=32, help="CPU slot ceiling (section 1e)")
+    ap.add_argument("--allowance", type=int, nargs="+", default=[0, 10, 16, 20, 24, 27],
+                    help="slots held by jobs the store does not show (section 1e)")
     args = ap.parse_args()
     y = int(args.y * GIB)
     xs = [int(v * GIB) for v in args.x]
@@ -373,6 +456,29 @@ def main():
     print("\n## 1d per UTC day, eligible (the 20-row cap drops the OLDEST rows of frequent commands, so earlier days can be thinner; daily load also varies)")
     for line in per_day(jobs, [4 * GIB, 8 * GIB], y):
         print(line)
+    print(f"\n## 1e CPU-slot sensitivity, eligible ({args.slots} slots, one per job; allowance = slots held by jobs the store does not show)")
+    print("x GiB | allowance | saved-h | saved/all-small | lane-adm | jobs refused a lane grant at least once for want of a slot")
+    for x in (4 * GIB, 8 * GIB):
+        for allowance in args.allowance:
+            r = simulate(jobs, x, y, False, slots=args.slots, allowance=allowance)
+            print(f"{x / GIB:>5.0f} | {allowance:>9} | {r['saved_h']:.1f} | {r['saved_h'] / small_wait_h:.1%} | {r['admitted']} | {r['cpu_denied']}")
+    starts = sorted(j["g"] for j in jobs)
+    ends = sorted(j["g"] + j["hold"] for j in jobs)
+    conc = max(bisect.bisect_right(starts, t) - bisect.bisect_right(ends, t) for t in starts)
+    print(f"retained rows' peak concurrency (historical times): {conc} jobs")
+    for hh, mm in ((11, 13), (11, 20), (11, 25)):
+        t = int(datetime(2026, 11, 18, hh, mm, tzinfo=UTC).timestamp() * 1000)
+        print(f"retained rows running at 2026-11-18 {hh:02d}:{mm:02d} UTC (the incident; reported live: 32 jobs): "
+              f"{bisect.bisect_right(starts, t) - bisect.bisect_right(ends, t)}")
+    print("\n## 1f the partition's cost to the main pool: x less the footprint the lane moved out of main, time-weighted (GiB)")
+    print("x GiB | net main booking room lost: mean / p10 / p50 / p90")
+    for x in (4 * GIB, 8 * GIB):
+        mean, p10, p50, p90 = partition_cost(simulate(jobs, x, y, False), x)
+        print(f"{x / GIB:>5.0f} | {mean:.2f} / {p10:.2f} / {p50:.2f} / {p90:.2f}")
+    print("\n## 1g the largest retained reserves (a job above the main pool's room under the partition waits for the ceiling to rise)")
+    top = sorted((j["budget"] for j in jobs), reverse=True)
+    print(f"largest: {', '.join(f'{b / GIB:.1f}' for b in top[:5])} GiB; rows >= 20 GiB: {sum(1 for b in top if b >= 20 * GIB)}; "
+          f">= 30 GiB: {sum(1 for b in top if b >= 30 * GIB)}")
     print("\n## 2 the 2026-11-18 incident (11:09-11:30 UTC, 13:09-13:30 EET), eligible small jobs")
     lo_i = int(datetime(2026, 11, 18, 11, 9, tzinfo=UTC).timestamp() * 1000)
     hi_i = int(datetime(2026, 11, 18, 11, 30, tzinfo=UTC).timestamp() * 1000)

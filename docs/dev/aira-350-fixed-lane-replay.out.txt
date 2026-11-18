@@ -42,6 +42,33 @@ day        | elig rows/h | small wait-h | x=4: saved-h, full-for-1G, someone-wai
 2026-11-17 |       111.4 |         15.1 |  14.9,  5.6%,  0.4%, 1.11 |  15.1,  0.0%,  0.0%, 1.15
 2026-11-18 |        62.2 |         13.8 |  12.9,  8.3%,  3.3%, 0.73 |  13.8,  0.1%,  0.0%, 0.83
 
+## 1e CPU-slot sensitivity, eligible (32 slots, one per job; allowance = slots held by jobs the store does not show)
+x GiB | allowance | saved-h | saved/all-small | lane-adm | jobs refused a lane grant at least once for want of a slot
+    4 |         0 | 101.9 | 79.5% | 7987 | 0
+    4 |        10 | 101.9 | 79.5% | 7987 | 0
+    4 |        16 | 101.9 | 79.5% | 7970 | 59
+    4 |        20 | 101.0 | 78.8% | 7876 | 220
+    4 |        24 | 91.5 | 71.4% | 6599 | 1977
+    4 |        27 | 41.4 | 32.3% | 2525 | 6321
+    8 |         0 | 107.9 | 84.1% | 8373 | 0
+    8 |        10 | 107.9 | 84.1% | 8373 | 2
+    8 |        16 | 107.8 | 84.1% | 8357 | 67
+    8 |        20 | 106.6 | 83.1% | 8237 | 269
+    8 |        24 | 93.6 | 73.0% | 6747 | 2130
+    8 |        27 | 41.5 | 32.4% | 2536 | 6366
+retained rows' peak concurrency (historical times): 22 jobs
+retained rows running at 2026-11-18 11:13 UTC (the incident; reported live: 32 jobs): 5
+retained rows running at 2026-11-18 11:20 UTC (the incident; reported live: 32 jobs): 5
+retained rows running at 2026-11-18 11:25 UTC (the incident; reported live: 32 jobs): 5
+
+## 1f the partition's cost to the main pool: x less the footprint the lane moved out of main, time-weighted (GiB)
+x GiB | net main booking room lost: mean / p10 / p50 / p90
+    4 | 2.88 / 1.13 / 2.94 / 4.00
+    8 | 6.77 / 4.81 / 6.94 / 8.00
+
+## 1g the largest retained reserves (a job above the main pool's room under the partition waits for the ceiling to rise)
+largest: 25.3, 18.0, 14.0, 14.0, 14.0 GiB; rows >= 20 GiB: 1; >= 30 GiB: 0
+
 ## 2 the 2026-11-18 incident (11:09-11:30 UTC, 13:09-13:30 EET), eligible small jobs
 eligible jobs arriving in the window: 23; waited >= 10 s: 16, their wait 71.0 min, p50 317 s, max 523 s
 x=4 GiB: of those, lane-admitted 16; remaining wait 5.8 min, p50 0 s, max 207 s
