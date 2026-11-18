@@ -30,6 +30,7 @@ head from starving, or something the owner asked for.
 | Cap `x` on what the exempted jobs may hold at once | Without it, a stream of small jobs starves the head (above). | one comparison |
 | A per-waiter `laneGranted` flag, summed on demand | The cap must count only bookings that used the exemption. "Every granted job of size `<= y`" fails the incident: dozens of small jobs granted the ordinary way would fill the lane before any head appeared (§2.2 C4). | one bool, one derived sum |
 | Guard G: the head must fit beside the lane | Without it, a head larger than `ceiling - x`, or a head short of CPU, is starved by lane refill (§3.3 cases 5 and 6). | one predicate, a sibling of `admitCouldFitEmptyLocked` |
+| A lane member's sub-reservations count in the lane's size | Without it, a lane-admitted 1 GiB test-suite parent brings its exempt workers past the head. At 13:55, 13 aitest worker scopes held 28 GiB (§3.3 case 13). | one more clause in the same derived sum |
 | GPU jobs (`vram > 0`) are not lane-eligible | Without it, small-RAM GPU jobs refill VRAM in front of a VRAM-short head. | one conjunct |
 | Off in ci-shim mode | Owner decision. | one conjunct |
 | `x`, `y` set at install | Owner decision ("settable like `--pin-charge`"). | env + install plumbing, copied pattern |
@@ -90,8 +91,9 @@ From `aira confine --list --json`, saved to `~/tmp/aira-350/live-snapshot-1355.j
   - two jobs larger than 1 GiB (2154 MiB and 2700 MiB);
   - six jobs of 256-1024 MiB, queued 84-218 s (one of them this plan's own measurement job).
 - **Under this design,** with `x = 4 GiB` and `y = 1 GiB`, the first three small jobs in evaluation
-  order (1024, 256 and 512 MiB) are admitted at once. The other three wait for room, not for the head
-  (worked as in §6.1 T1).
+  order (1024, 256 and 512 MiB) are admitted at once, CPU permitting. The CPU ledger is not
+  published, so CPU is not checked here. The other three wait for room, not for the head (worked as in
+  §6.1 T1).
 
 ### 1.4 Over three and a half days
 
@@ -131,8 +133,11 @@ Measured by `docs/dev/aira-350-lane-yield-estimate.py` (output in
   - Counting bookings would let either one open lane room while the lane jobs can still use their full
     pins. A re-anchor that restores a resized booking (`admit.go:2318-2326`) could then push the lane
     past `x`.
-  - Counted in reserve, the lane is unaffected by resize, discount and re-anchor. For scope-capped
-    members it also bounds physical use: `memory.max = reserve`.
+  - Counted in reserve, the lane is unaffected by resize, discount and re-anchor. For an ordinary
+    confine member it also bounds physical use, because its `memory.max` is its reserve.
+  - This does not hold for a `--delegate-ram` suite: its scope cap is an AIRA-15 containment ceiling
+    many times its reserve (`admit.go:1189-1193`). Its tests' reservations are counted as the
+    member's children (C7).
   - **Today the two are identical for every queued waiter.** `aira install` renders pin-charge
     `observe` (`internal/install/install.go:62`), the enforce trial was rolled back (`c4db60da`), and
     observe books at the reserve (`internal/daemon/pin_charge.go:120-125`).
@@ -149,7 +154,8 @@ Measured by `docs/dev/aira-350-lane-yield-estimate.py` (output in
   from size.
   - The owner's "small-lane outstanding bookings" read literally as "every granted job of size
     `<= y`" makes the lane useless in the incident it was asked for.
-  - At 13:55 (§1.3 file), 12 job-level running scopes had a reserve of at most 1 GiB, 3392 MiB
+  - One-off observation at 13:55, from the uncommitted snapshot of §1.3 (it holds other sessions' job
+    names and commands): 12 job-level running scopes had a reserve of at most 1 GiB, 3392 MiB
     together. (This excludes the `aitest-w*` worker scopes, by name, an assumption.) 8 of them, 1536
     MiB, were servers older than an hour, 5 of them older than 5 days.
   - A lane derived from size would have had about 700 MiB left for the six queued small jobs. The
@@ -162,6 +168,22 @@ Measured by `docs/dev/aira-350-lane-yield-estimate.py` (output in
 - **C6. The daemon's raw default is off; `aira install` renders the lane on (4G, 1G).** This is
   exactly the pin-charge pattern (`pin_charge.go:31-33`). A daemon started outside the installed unit,
   and every existing test, is unchanged. The product default is on.
+- **C7. A lane member's own sub-reservations count in the lane's size and footprint.**
+  - The sub-reservations are aitest workers and `confine-reserve` per-test holds, whose
+    `parentScopeID` names a granted lane member. They are counted for both the cap and guard G.
+  - The children stay exempt from the head rule. AIRA-307 needs that exemption, or a running suite
+    deadlocks the head.
+  - **Why it is needed.** A test-suite parent is an ordinary job-level confine job, often at the
+    1 GiB cold default, so it is lane-eligible. History has `aitest-parent` rows at 1 GiB (§7 data),
+    and at 13:55 `lc-q2` (`make test-engine`, 1024 MiB) ran beside its workers.
+  - The daemon cannot know at admission that a job will spawn workers. Workers enter through
+    worker-admit with a parent scope id (`worker_admit.go:162`) and are granted on fit alone
+    (`admit.go:2688`).
+  - Today a new suite passes a head only through the budget or a backstop pass. That is why AIRA-307
+    could call the workers "bounded by the lifetimes of running suites".
+  - Uncounted, a refilling lane of suite parents would add exempt workers without limit (13 worker
+    scopes held 28672 MiB at 13:55). Counted, a suite whose workers grow past the lane's bounds closes
+    the lane until it ends.
 
 ## 3. Design
 
@@ -207,9 +229,15 @@ On a grant:
    RAM on the head's pin (`admit.go:2838-2842`). If G fails, set `heldBy = "head"` and return false.
 
 `lane` is a **pass-local** value: `laneUsedLocked(queue)` is called once before the waiter loop and
-again after each lane grant. It returns `(reserve, cpu, jobs)`, summed over waiters with
-`state == admitGranted && accounted && laneGranted`.
+again after each lane grant. It returns `(reserve, cpu, jobs)`, summed over the **lane tree**: every
+waiter with `state == admitGranted && accounted` that is either a lane member (`laneGranted`) or a
+sub-reservation whose `parentScopeID` is the scope id of a granted lane member (C7).
+- It is two walks of `queue.waiters`, at most 256 per slice (`admitMaxWaiters`, `admit.go:31`).
+  The first collects the members' scope ids; the second sums.
 - Nothing is incremented and nothing is stored on the queue.
+- A member's children stay exempt from the head rule (`protected` is false for them). They grow the
+  lane tree without passing the cap or G, which can push the lane past either bound. While it is past
+  a bound, no lane grant is made (both checks fail), so the lane closes until the suite ends.
 - The evaluator holds `queue.mu` for the whole pass, and the only writer of grants is this pass, so
   re-deriving after each lane grant is exact. Releases and re-anchors happen between passes, under the
   same lock.
@@ -236,22 +264,27 @@ again after each lane grant. It returns `(reserve, cpu, jobs)`, summed over wait
 
 **Claim.** Let H be an unpushed head that stays the head. Assume:
 - the effective ceiling does not shrink;
-- every lease that is not a lane member ends in finite time;
-- after H's budget is spent, nothing outside the lane is granted past H.
+- every lease ends in finite time;
+- after H's budget is spent, nothing outside the lane tree is granted past H.
 
 Then H is granted in finite time. The third assumption excludes the AIRA-307 backstop pass,
-sub-reservations and re-declares; §3.3.1 covers each.
+sub-reservations of parents outside the lane, and re-declares; §3.3.1 covers each. The second
+assumption is the honest limit: a lane member that never ends is case 2.
 
 **Argument.**
-1. Let `N` be the granted leases that are not lane members, sub-reservations included. Under the
-   assumptions `N` only shrinks, so it empties in finite time.
-2. Every lane grant made while H is head satisfies G for H. Removing a member preserves G, because it
-   only lowers G's left side, and the right side does not depend on the lane.
-3. Lane members granted under an earlier head may violate G for H. No new lane grant is made while G
-   fails, and those members end in finite time (assumption 2). So from some moment on, G holds for H
-   at every pass.
+1. Let `N` be the granted leases outside the lane tree, including the sub-reservations of non-lane
+   parents. Under the assumptions `N` only shrinks, so it empties in finite time.
+2. Every lane grant made while H is head satisfies G for H. Removing a member or a child preserves G,
+   because it only lowers G's left side, and the right side does not depend on the lane.
+3. G can also become false in two ways: through lane members granted under an earlier head, and
+   through children of lane members growing, which is exempt and unchecked (C7). While G is false, no
+   lane grant is made. Those leases end in finite time (assumption 2), so G becomes true again, and
+   only a lane grant that itself passes G can add to the tree.
+   - So there is a pass, after `N` has emptied, at which G holds for H.
+   - H is evaluated before every waiter behind it (`admitOrderLocked`), so at that pass it meets the
+     room before any new lane grant could take it.
 4. Once `N` is empty:
-   - `outstanding = Σ ledgerCharge(lane) <= lane.reserve`;
+   - `outstanding = Σ ledgerCharge(lane tree) <= lane.reserve`;
    - `outstandingJobs = lane.jobs`;
    - `admitSliceHeadroom(lane.jobs + 1) = admitSliceHeadroom(1) + lane.jobs x perJob`.
 5. So the room H sees is `effectiveMaximum - admitSliceHeadroom(1) - lane.jobs x perJob - outstanding`.
@@ -279,7 +312,7 @@ per-job headroom, and never more than `ceilingNet(1) - head.reserve` (by G).
 | # | Case | Without the guard named | Under this design |
 |---|---|---|---|
 | 1 | **Repeated lane refill:** small jobs keep arriving and replacing each other | Unbounded refill starves H (the §0 minimum). | Lane reserve `<= x` at every instant, and G keeps H's slot. H fits once `N` drains (§3.3). |
-| 2 | **Long-running small jobs** (a confined dev server) granted through the lane | — | They hold lane room for their lifetime ("silting"). Bounded by `x`, so heads are unaffected beyond the §3.3 cost, but small-job relief shrinks. Visible as lane bytes (§3.6). Accepted (§9 R2). |
+| 2 | **Long-running small jobs** (a confined dev server) granted through the lane | — | They hold lane room for their lifetime ("silting"), bounded by `x`. Small-job relief shrinks; visible as lane bytes (§3.6). A member that never ends, granted under an earlier, smaller head, can keep G false for a later, larger head indefinitely. That is the same class as today's accepted "long-lived granted lease" gap (queue-order spec §3.5), but bounded by `x`. Accepted (§9 R2). |
 | 3 | **High-priority head** (`--priority high`) | — | An ordinary unpushed head (AIRA-340, `admit.go:302-311`). The lane applies and the proof is unchanged. A high waiter is never behind a normal head (`admitOrderLocked` tier 2). |
 | 4 | **Pushed head** | — | Lane closed (C5). AIRA-309 invariant 3 is unchanged. |
 | 5 | **Head larger than `ceiling - x`**, e.g. 46 GiB on a 47.2 GiB empty-slice ceiling | Lane refill keeps more than `ceiling - R` occupied, so H never fits, and the backstop does not help it. | G's RAM arm closes the lane once the footprint reaches `ceiling - R`. Behind such a head its budget is large anyway (`R/2 >= (ceiling - x)/2`). |
@@ -290,7 +323,8 @@ per-job headroom, and never more than `ceilingNet(1) - head.reserve` (by G).
 | 9 | **Daemon restart** | — | Flags are lost. A re-established lease is built by `newEstablishedWaiter` (`admit.go:2114-2125`) with `laneGranted == false`, so former lane members become ordinary bookings in `N` and drain. The lane can refill up to `x` once more, so a head may wait one extra lane's worth once per restart. Fail-open for small jobs, ledger-safe (§3.4). |
 | 10 | **Many tiny jobs** fill `x` with headroom | 56 jobs of 72 MiB take 4 GiB plus 3.5 GiB of headroom. | G charges 64 MiB per member (C2). |
 | 11 | **Backstop pass** | — | Unchanged. The lane case is evaluated first, so a lane-eligible job in the backstop pass is a lane grant while the lane has room. Lane grants never arm a hold. |
-| 12 | **Sub-reservations past H** (aitest workers) | — | Unchanged: exempt and uncounted (AIRA-307 accepted gap). Never lane members, because `protected` is false for them. |
+| 12 | **Sub-reservations past H** (aitest workers) of a parent outside the lane | — | Unchanged: exempt and uncounted (AIRA-307 accepted gap). Never lane members, because `protected` is false for them. |
+| 13 | **A lane-admitted test-suite parent** (1 GiB `make test-engine`) whose workers then arrive | The workers are exempt, so uncounted they pass H without limit, and a refilling lane of suite parents keeps `N` from ever draining. At 13:55, 13 worker scopes held 28672 MiB. | C7: the children count in the lane tree. The suite closes the lane while it is large, and H's bound holds (§3.3 step 3). |
 
 ### 3.4 Interactions
 
@@ -301,7 +335,7 @@ per-job headroom, and never more than `ceilingNet(1) - head.reserve` (by G).
 | `--priority high` | The lane applies behind a high head. | A high head is an unpushed head (AIRA-340). |
 | Fairness-freeze duty cycle | Lane grants are made in every phase, never set `budgetWithheld`, and never arm. A lane-full or ineligible job that the budget then withholds arms as today. | The arm stays guarded by idle (`admit.go:2762`). The three defects in the `freezeArmedAt` comment (`admit.go:812-822`) stay unwritable: no new anchor write. |
 | AIRA-324 discount | Eligibility and lane size are in reserve (C1). The physical-fit rule is unchanged, because it is part of `fits`, computed before the head rule (`admit.go:2663-2666`). | C1. |
-| Sub-reservations and worker-admit | Unchanged: exempt, never lane members. | worker-admit requires `parent_scope_id` (`internal/daemon/worker_admit.go:162`) and enqueues through the same path (`worker_admit.go:475`). |
+| Sub-reservations and worker-admit | Still exempt from the head rule, and never lane members themselves. A sub-reservation whose parent is a granted lane member counts in the lane tree (C7). | worker-admit requires `parent_scope_id` (`internal/daemon/worker_admit.go:162`) and enqueues through the same path (`worker_admit.go:475`). |
 | Re-declare onto a live lease (same daemon) | `laneGranted` is kept: same waiter, no code. Its lane size follows the re-declared reserve, which a client sends as the reserve it was granted. | `admit.go:2318`. |
 | Re-declare after a restart (ARDR establish) | Not a lane member. | Case 9; no ARDR frame change. |
 | `confine --resize` | No effect on the lane. | Reserve-based (C1); resize writes only `target.charge` (`internal/daemon/confine_resize.go:139`). |
@@ -403,10 +437,12 @@ Draft text:
 1. **The ledger is untouched.** `outstanding`, `cpuOutstanding`, `vramOutstanding` and
    `outstandingJobs` are still written only by `rederiveLedgerLocked`. Every lane grant passed today's
    `fits`, so `Σ booking <= ceiling - headroom` holds as before (carved out of the ceiling).
-2. **Lane size `<= x` after every lane grant.** Only lane grants add members, and each is checked.
-   Releases only remove members, and resize does not change a reserve. The one exception is a
-   re-declare of a live lease with a larger reserve than it was granted (same-uid only), which can
-   exceed `x`; no lane grant is then made until the lane is below the cap again.
+2. **Lane tree size `<= x` after every lane grant.** Only lane grants add members, and each is
+   checked. Releases only remove members, and resize does not change a reserve.
+   - It can exceed `x` between lane grants in two ways: a lane member's exempt sub-reservations
+     growing (C7), or a re-declare of a live lease with a larger reserve than it was granted
+     (same-uid only).
+   - Either way, no lane grant is made until the tree is back under the cap and G.
 3. **Guard G holds for the current head after every lane grant made while it is head** (§3.3).
 4. **Lane grants never change `head.bypassed`, never set `budgetWithheld`, and never arm the hold.**
    AIRA-307 invariant 2 (an unpushed head is bypassed by at most `reserve/2` of non-lane job-level
@@ -439,6 +475,12 @@ All evaluator tests use the AIRA-228/307 seam: a hand-built queue (`queueOf`,
   job) so that the per-job term is exercised. `admitTestServer` zeroes both
   (`internal/daemon/admit_test.go:23-24`).
 - **Lane settings.** Lane on, `x = 4096 MiB`, `y = 1024 MiB`, set on the Server fields directly.
+- **Freeze settings.** `admitFreezeMaxHold` is the production 5 minutes (`paths.go:66`) and
+  `freezeArmedAt = now - 60s`, so the pass is a hold pass.
+  - The existing helper `queueOrderServer` sets one minute (`admit_queue_order_test.go:30`). With
+    that anchor the pass would be a backstop pass, and today's code would grant everything that
+    fits, so the "today" column would be wrong.
+  - T8 drives the backstop pass explicitly.
 - **Head budget.** Unless a test says otherwise, the head's budget is preset as spent
   (`bypassed = admitBypassBudget(head)`). A waiter the lane refuses then shows as a withhold, instead
   of being granted through the budget.
@@ -459,7 +501,7 @@ Every test in this table asserts the exact set of granted waiters.
 | **T8 pushed head** | A lane-eligible waiter behind a pushed head. | It waits in hold, idle and backstop passes, with `heldBy == "head"`. | Evaluate the lane case before the pushed case: granted. |
 | **T9 ci-shim** | A shim server with the lane fields set directly. A small waiter behind a head whose budget is spent. | Withheld. | Drop the `!shimMode()` conjunct: granted. |
 | **T10 GPU job** | A small waiter with `vram > 0`. | Not a lane grant. | — |
-| **T11 sub-reservation** | A granted sub-reservation past the head. | It never sets `laneGranted` and is never counted in `laneUsedLocked`. | — |
+| **T11 sub-reservations** | `x = 3584 MiB` for this test. Two granted sub-reservations of 2048 MiB past the head: one whose `parentScopeID` names a granted non-lane job, one whose parent is a lane member of 1024 MiB. Then a 1024 MiB small waiter. | Neither child sets `laneGranted`. `laneUsedLocked` returns exactly 3072 MiB with 2 jobs (the member and its child). The waiter is lane-full (3072 + 1024 > 3584). | Drop the child clause: the lane reads 1024 MiB and the waiter is granted. Count every sub-reservation: the `laneUsedLocked` assertion reads 5120 MiB. |
 | **T12 no arm from lane grants** | Idle phase, only lane grants. | `freezeArmedAt` stays zero. | Set `budgetWithheld` on the lane path: armed. |
 | **T13 release is derived** | A full lane, and a waiter held as lane-full. Two members are released through `releaseAdmitWaiterLocked`. | The next pass grants the waiter as lane. | Use a lane counter that is incremented and never decremented: still held. |
 | **T14 restart and re-anchor** | Re-declare: `enqueueReDeclare` establishes a lease. Re-anchor: a lane member re-anchored through the SET path (`admit.go:2269-2335`). | The established lease has `laneGranted == false`, and the lane reads 0 afterwards. The re-anchored member keeps `laneGranted`, and its lane size equals the re-declared reserve. | — |
@@ -479,6 +521,11 @@ Every test in this table asserts the exact set of granted waiters.
   48320 MiB. G caps the lane footprint at 1216 MiB (two members), and the head is granted by pass 31.
   - Drop G's RAM arm and the head is still queued after 1000 passes.
 - **(c) CPU variant of (b),** with 1-slot lane jobs and a 16-slot head.
+- **(d) Suite parents (C7).** A 4 GiB head; 1024 MiB suite parents arriving every pass. Each suite,
+  two passes after its grant, adds 4 sub-reservations of 2 GiB, and the whole suite ends ten passes
+  after its grant.
+  - The head is granted after `N` drains.
+  - Drop the child clause and the head is still queued after 1000 passes.
 - **Property check:** after every pass, `outstanding <= ceiling` and `lane.reserve <= x`.
 
 ### 6.3 Configuration and install
@@ -515,9 +562,11 @@ Every test in this table asserts the exact set of granted waiters.
   - allow `vram > 0` (T10);
   - judge eligibility on `ledgerCharge` (T16);
   - size the lane in `ledgerCharge` (T15);
+  - leave lane members' sub-reservations out of the lane tree (T11, 6.2d);
   - `<` / `<=` swaps at the boundaries (T3).
 - **False fail** (holds what should be granted):
   - delete the lane case (T1);
+  - count every sub-reservation in the lane tree, not only a lane member's (T11);
   - count lane grants in `bypassed` (T4);
   - membership by size (T5);
   - an incremented counter (T13);
@@ -561,7 +610,8 @@ The window is 2026-11-15 00:00 to 2026-11-18 12:00 UTC. The rows are `confine` r
     maximum of 25.3 GiB. 4 GiB was the most common head (97 of 461).
   - 29% of holds had a head whose budget (`R/2`) was already at least 4 GiB.
   - The static form of G (`R + x` above the empty-slice ceiling) would have closed the lane behind
-    **no** head in the window.
+    **no** head in the window. The script and its output call this "guard G3", an earlier name for
+    this spec's guard G in its static form, without the per-job headroom and CPU terms.
 
 ### 7.2 Estimated
 
@@ -617,6 +667,9 @@ for ordinary confine jobs and with pin-charge in observe.
   guard G or C3 refused it. The wait-line wording says "held behind the head", which is true.
 - **R6. Diagnosis drift:** `heldBy` describes the last pass. A grant between the probe and the render
   makes it stale for one line. That is the same property as `lastGrantable`.
+- **R7. A lane-admitted test suite closes the lane for its lifetime** once its workers (counted, C7)
+  push the lane tree past `x` or G. Small-job relief pauses while it runs. Heads are protected by
+  exactly that closure. Visible as lane bytes above the cap.
 
 ## 10. Deferrals (explicit, not built here)
 
@@ -671,3 +724,6 @@ is unchanged.
 4. **Inclusive `y`** captures the 1 GiB cold default (R4).
 5. **The one journal line per lane grant.** Keep it, or drop it and measure only from `wait_ms`
    before and after.
+6. **C7, counting a lane member's sub-reservations in the lane tree.** This is the fix for case 13,
+   at the cost of R7. The alternative is to accept case 13 as a stated gap. It is not recommended:
+   suite parents at the 1 GiB cold default are a common lane-eligible population.
