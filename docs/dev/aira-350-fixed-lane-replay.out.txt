@@ -28,6 +28,22 @@ x GiB | saved-h | saved/all-small | overflow (waited>=10s) | full-for-1G share
     6 | 104.3 | 81.3% | 322 (62) | 5.7%
     8 | 107.8 | 84.0% | 37 (2) | 0.6%
 
+## 1h derived accounting (spec round 3): overflowed small jobs and small suite parents granted in main
+## count against x until they end, so freed lane room goes to them first (eligible; parents never lane-admitted)
+x GiB | saved-h | saved/all-small | lane-adm | overflow (waited>=10s) | full-for-1G share | occ mean/p90/peak GiB | with silt: saved-h, saved/all-small | partition's main room lost x - min(S, x): mean / p90 GiB
+    2 | 35.9 | 28.0% | 2950 | 5428 (1857) | 69.0% | 1.70/3.83/12.12 | 4.5, 3.5% | 0.80 / 2.00
+    4 | 88.8 | 69.2% | 6844 | 1534 (482) | 23.5% | 1.70/3.75/10.06 | 55.3, 43.2% | 2.37 / 4.00
+    6 | 105.4 | 82.2% | 8150 | 228 (61) | 4.3% | 1.70/3.88/9.56 | 96.1, 74.9% | 4.30 / 6.00
+    8 | 107.8 | 84.1% | 8339 | 39 (1) | 0.5% | 1.70/3.83/9.56 | 106.4, 83.0% | 6.30 / 8.00
+
+## 1h' the same with small suite parents NOT counted (the round-3 rule: a lease with a live
+## sub-reservation is not small); only overflowed small jobs return first
+x GiB | saved-h | saved/all-small | lane-adm | overflow (waited>=10s) | full-for-1G share | occ mean/p90/peak GiB | with silt: saved-h, saved/all-small | partition's main room lost x - min(S, x): mean / p90 GiB
+    2 | 57.4 | 44.8% | 4244 | 4134 (1206) | 58.1% | 1.23/3.19/11.06 | 7.9, 6.1% | 1.03 / 2.00
+    4 | 99.1 | 77.3% | 7523 | 855 (197) | 12.7% | 1.23/3.19/8.81 | 76.5, 59.7% | 2.80 / 4.00
+    6 | 107.6 | 83.9% | 8297 | 81 (7) | 1.5% | 1.23/3.19/8.50 | 103.3, 80.5% | 4.77 / 6.00
+    8 | 107.9 | 84.1% | 8358 | 20 (0) | 0.1% | 1.23/3.19/8.50 | 107.8, 84.0% | 6.77 / 8.00
+
 ## 1c cut alternative: main first (a job granted within 1 s never enters the lane), eligible
 x GiB | lane jobs | saved-h | saved/all-small | occ mean/p90 GiB | occ by jobs >=10m / >=1h
     2 | 3023 | 79.9 | 62.3% | 0.45/1.22 | 39.6% / 6.9%

@@ -42,6 +42,10 @@ Sections
   1f  the partition's cost to the main pool: main's booking room is x smaller at every
       instant, less the bookings of the jobs the lane moved out of main at that instant.
   1g  the largest retained reserves, against the main pool's room under the partition.
+  1h  spec round 3's derived accounting: every small lease counts against x however it was
+      granted, so freed room goes first to overflowed small jobs and small suite parents.
+      1h' leaves suite parents out (round 3's rule: a lease with a live sub-reservation is
+      not small; this assumes a parent has a live worker for its whole run).
   2   the 2026-11-18 incident window.
   3   aggregates from a live `aira confine --list --json` snapshot, if given.
 
@@ -52,6 +56,9 @@ Known biases, by direction:
   UP (the saving is overstated):
   - no CPU slot ceiling in sections 1-1d (section 1e varies it), no physical-room gate, and
     no reservation of the head's CPU and VRAM;
+  - no ceiling series: a lane gated on today's whole-slice room W (round 2's partition) is
+    shut while the ceiling has fallen below what main already booked; the journal measures
+    how often the ceiling falls (docs/dev/aira-350-ceiling-drop.py), not this closure;
   - the 20-row retention cap thins frequent commands, so lane occupancy is understated and
     the lane is full less often than it would be;
   - jobs still running at the copy (servers) are absent (section 1b adds them back as a
@@ -118,24 +125,39 @@ def load(db):
     return jobs, lost_sigs, no_timing
 
 
-def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, allowance=0):
+def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, allowance=0, derived=False):
     """Event-driven lane replay. Returns per-run metrics.
 
     silt: a constant lane occupancy held throughout (long-lived jobs absent from the store).
     main_first: the cut alternative; a job the main pool granted within 1 s never enters the lane.
     slots: if set, a lane grant also needs a CPU slot: the retained jobs running at that
     instant (lane-moved jobs at their lane times, every other job at its historical times,
-    one slot each) plus `allowance` plus the candidate must not exceed `slots`."""
+    one slot each) plus `allowance` plus the candidate must not exceed `slots`.
+    derived: spec round 3's derived accounting. Lane occupancy S counts EVERY small lease
+    (reserve <= y, parentless), however it was granted: an eligible job that overflowed to
+    main counts from its historical grant g to its end, and so does every small suite
+    parent (not lane-eligible, granted in main at g). Freed lane room therefore goes to
+    those leases first, not to new waiters."""
     elig = [j for j in jobs if j["budget"] <= y and (include_parents or not j["parent"])
             and not (main_first and j["wait"] < IMMEDIATE_MS)]
     elig.sort(key=lambda j: (j["a"], j["g"]))
     for idx, j in enumerate(elig):
         j["_id"] = idx
         j["_f"] = j["budget"] + PER_JOB
-    # events: (time, order, id); order 0 release, 1 arrival; deadlines are checked after the scan
+    # events: (time, order, id); order 0 release, 1 arrival, 2 slot re-scan, 3 a derived
+    # occupancy change ext[id]; deadlines are checked after the scan
     events = []
+    ext = []
     for j in elig:
         heapq.heappush(events, (j["a"], 1, j["_id"]))
+    if derived and derived != "overflow-only" and not include_parents:
+        for j in jobs:
+            if j["budget"] <= y and j["parent"]:
+                f = j["budget"] + PER_JOB
+                ext.append(f)
+                heapq.heappush(events, (j["g"], 3, len(ext) - 1))
+                ext.append(-f)
+                heapq.heappush(events, (j["g"] + j["hold"], 3, len(ext) - 1))
     if slots is not None:
         starts = sorted(j["g"] for j in jobs)
         ends = sorted(j["g"] + j["hold"] for j in jobs)
@@ -193,6 +215,9 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, 
             _, kind, i = heapq.heappop(events)
             if kind == 2:
                 continue
+            if kind == 3:
+                occ += ext[i]
+                continue
             if kind == 0:
                 occ -= elig[i]["_f"]
                 del residents[i]
@@ -235,6 +260,12 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, 
             _, i = heapq.heappop(deadline_heap)
             if i not in admitted_at and i in waiting:
                 waiting.remove(i)
+                if derived:
+                    # granted in main at g, but counted against the lane until it ends
+                    f = elig[i]["_f"]
+                    occ += f
+                    ext.append(-f)
+                    heapq.heappush(events, (elig[i]["g"] + elig[i]["hold"], 3, len(ext) - 1))
 
     span = (last_t - t0) if last_t is not None else 0
 
@@ -447,6 +478,33 @@ def main():
     for x in xs:
         r = simulate(jobs, x, y, False, silt=silt)
         print(f"{x / GIB:>5.0f} | {r['saved_h']:.1f} | {r['saved_h'] / small_wait_h:.1%} | {r['overflow']} ({r['overflow_waited']}) | {r['full_share']:.1%}")
+    def lane_loss(r, x):
+        """The partition's net main booking room lost, x - min(S, x), time-weighted (GiB)."""
+        loss = [(dt, (x - min(occ, x)) / GIB) for _, dt, occ, _ in r["segs"]]
+        tot = sum(dt for dt, _ in loss)
+        mean = sum(dt * v for dt, v in loss) / tot if tot else 0
+        acc = 0
+        for dt, v in sorted(loss, key=lambda s: s[1]):
+            acc += dt
+            if acc >= 0.9 * tot:
+                return mean, v
+        return mean, 0
+
+    for variant, title in ((True, "1h derived accounting (spec round 3): overflowed small jobs and small suite parents granted in main\n"
+                                  "## count against x until they end, so freed lane room goes to them first (eligible; parents never lane-admitted)"),
+                           ("overflow-only", "1h' the same with small suite parents NOT counted (the round-3 rule: a lease with a live\n"
+                                             "## sub-reservation is not small); only overflowed small jobs return first")):
+        print(f"\n## {title}")
+        print("x GiB | saved-h | saved/all-small | lane-adm | overflow (waited>=10s) | full-for-1G share | occ mean/p90/peak GiB "
+              "| with silt: saved-h, saved/all-small | partition's main room lost x - min(S, x): mean / p90 GiB")
+        for x in xs:
+            r = simulate(jobs, x, y, False, derived=variant)
+            rs = simulate(jobs, x, y, False, silt=silt, derived=variant)
+            loss_mean, loss_p90 = lane_loss(r, x)
+            print(f"{x / GIB:>5.0f} | {r['saved_h']:.1f} | {r['saved_h'] / small_wait_h:.1%} | {r['admitted']} | "
+                  f"{r['overflow']} ({r['overflow_waited']}) | {r['full_share']:.1%} | "
+                  f"{r['mean_occ']:.2f}/{r['p90_occ']:.2f}/{r['peak_occ']:.2f} | {rs['saved_h']:.1f}, {rs['saved_h'] / small_wait_h:.1%} | "
+                  f"{loss_mean:.2f} / {loss_p90:.2f}")
     print("\n## 1c cut alternative: main first (a job granted within 1 s never enters the lane), eligible")
     print("x GiB | lane jobs | saved-h | saved/all-small | occ mean/p90 GiB | occ by jobs >=10m / >=1h")
     for x in xs:
