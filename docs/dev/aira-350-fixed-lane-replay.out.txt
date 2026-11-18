@@ -85,6 +85,27 @@ x GiB | net main booking room lost: mean / p10 / p50 / p90
 ## 1g the largest retained reserves (a job above the main pool's room under the partition waits for the ceiling to rise)
 largest: 25.3, 18.0, 14.0, 14.0, 14.0 GiB; rows >= 20 GiB: 1; >= 30 GiB: 0
 
+## 1i round 4: the lane INSIDE the one ceiling, with priority (x caps bookings, no 64 MiB per job in x;
+## derived S: every small job-level lease counts, however granted, suite parents included; no ceiling-room gate)
+hold intervals in the replay window: 507, 42.0 h of 82.3 h (51.1%)
+eligible small jobs' wait inside a hold: 94.2 h of 107.9 h (73.5% of all small wait-hours)
+x GiB | gate | slot allowance | saved-h | saved/all-small | lane-adm | full-for-1G share | occ mean/p90/peak GiB
+    4 | none  |              - | 95.5 | 74.5% | 7227 | 14.8% | 1.58/3.63/9.00
+    4 | holds |              - | 90.0 | 70.2% | 4509 | 14.7% | 1.58/3.54/9.31
+    4 | holds |             16 | 90.0 | 70.2% | 4507 | 14.7% | 1.58/3.54/9.31
+    4 | holds |             24 | 83.3 | 65.0% | 3805 | 14.3% | 1.58/3.50/9.31
+    4 | holds |             27 | 38.6 | 30.1% | 1372 | 13.6% | 1.58/3.50/9.31
+    8 | none  |              - | 107.9 | 84.1% | 8351 | 0.2% | 1.58/3.58/9.00
+    8 | holds |              - | 101.7 | 79.3% | 5252 | 0.2% | 1.58/3.50/9.00
+    8 | holds |             16 | 101.7 | 79.3% | 5245 | 0.2% | 1.58/3.50/9.00
+    8 | holds |             24 | 88.1 | 68.7% | 4061 | 0.2% | 1.58/3.50/9.25
+    8 | holds |             27 | 38.9 | 30.3% | 1383 | 0.3% | 1.58/3.50/9.31
+incident window, holds-gated, x=4 GiB: 16 jobs that waited >= 10 s; remaining wait 2.3 min, p50 0 s, max 97 s
+incident window, holds-gated, x=8 GiB: 16 jobs that waited >= 10 s; remaining wait 0.6 min, p50 0 s, max 33 s
+hold lines naming a head: 520; head reserve p50 4.00 GiB, p99 14.00, max 25.32 GiB
+x=4 GiB: holds where G would bind (head reserve > E - (2 GiB + 64 MiB x (lane jobs + 1)) - x, lane jobs <= 32 slots): 0 of 520 with a throttled sample within 120 s (0 without); smallest margin 15.36 GiB
+x=8 GiB: holds where G would bind (head reserve > E - (2 GiB + 64 MiB x (lane jobs + 1)) - x, lane jobs <= 32 slots): 0 of 520 with a throttled sample within 120 s (0 without); smallest margin 11.36 GiB
+
 ## 2 the 2026-11-18 incident (11:09-11:30 UTC, 13:09-13:30 EET), eligible small jobs
 eligible jobs arriving in the window: 23; waited >= 10 s: 16, their wait 71.0 min, p50 317 s, max 523 s
 x=4 GiB: of those, lane-admitted 16; remaining wait 5.8 min, p50 0 s, max 207 s

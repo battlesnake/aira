@@ -46,6 +46,19 @@ Sections
       granted, so freed room goes first to overflowed small jobs and small suite parents.
       1h' leaves suite parents out (round 3's rule: a lease with a live sub-reservation is
       not small; this assumes a parent has a live worker for its whole run).
+  1i  spec round 4 (--journal): the lane INSIDE the one ceiling, with admission priority.
+      Footprint = booking (budget; the window ran pin-charge observe, so booking ==
+      reserve), x caps bookings only; S counts every small job-level lease however granted
+      (1h's accounting). Two gates: "none" (a lane grant whenever S has room: the UPPER
+      end, since it assumes the one ceiling always had room) and "holds" (a lane grant only
+      inside a fairness hold read from the journal, the one state in which today's
+      evaluator withholds a small job that FITS; the arm proves room for one withheld
+      job, not for every one the replay admits). Then CPU allowances on "holds", the
+      incident window, and how often guard G would have bound against the head each hold
+      line names, at the ceiling sampled within 120 s before it. Run it as
+        aira confine -- python3 -I docs/dev/aira-350-fixed-lane-replay.py --db ... \\
+            --journal ~/tmp/aira-lane2-store/journal-r3.txt
+      (the journal capture is the one aira-350-ceiling-drop.py documents).
   2   the 2026-11-18 incident window.
   3   aggregates from a live `aira confine --list --json` snapshot, if given.
 
@@ -79,9 +92,10 @@ import argparse
 import bisect
 import heapq
 import json
+import re
 import sqlite3
 import statistics
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -125,7 +139,8 @@ def load(db):
     return jobs, lost_sigs, no_timing
 
 
-def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, allowance=0, derived=False):
+def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, allowance=0, derived=False,
+             extra=PER_JOB, gate=None):
     """Event-driven lane replay. Returns per-run metrics.
 
     silt: a constant lane occupancy held throughout (long-lived jobs absent from the store).
@@ -137,13 +152,24 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, 
     (reserve <= y, parentless), however it was granted: an eligible job that overflowed to
     main counts from its historical grant g to its end, and so does every small suite
     parent (not lane-eligible, granted in main at g). Freed lane room therefore goes to
-    those leases first, not to new waiters."""
+    those leases first, not to new waiters.
+    extra: the per-job addition to a lane footprint (64 MiB in rounds 1-3; 0 in round 4,
+    where x caps bookings and the per-job headroom stays in the one ceiling).
+    gate: if set, sorted non-overlapping (start, end) ms intervals; a lane grant is made only
+    at an instant inside one (round 4's hold-gated variant: the fairness holds, the only
+    state in which today's evaluator withholds a waiter that fits)."""
     elig = [j for j in jobs if j["budget"] <= y and (include_parents or not j["parent"])
             and not (main_first and j["wait"] < IMMEDIATE_MS)]
     elig.sort(key=lambda j: (j["a"], j["g"]))
     for idx, j in enumerate(elig):
         j["_id"] = idx
-        j["_f"] = j["budget"] + PER_JOB
+        j["_f"] = j["budget"] + extra
+    gate_starts = [s for s, _ in gate] if gate is not None else []
+    gate_ends = [e for _, e in gate] if gate is not None else []
+
+    def in_gate(t):
+        k = bisect.bisect_right(gate_starts, t) - 1
+        return k >= 0 and t < gate_ends[k]
     # events: (time, order, id); order 0 release, 1 arrival, 2 slot re-scan, 3 a derived
     # occupancy change ext[id]; deadlines are checked after the scan
     events = []
@@ -153,7 +179,7 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, 
     if derived and derived != "overflow-only" and not include_parents:
         for j in jobs:
             if j["budget"] <= y and j["parent"]:
-                f = j["budget"] + PER_JOB
+                f = j["budget"] + extra
                 ext.append(f)
                 heapq.heappush(events, (j["g"], 3, len(ext) - 1))
                 ext.append(-f)
@@ -163,6 +189,8 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, 
         ends = sorted(j["g"] + j["hold"] for j in jobs)
         for e in ends:  # a historical job ending frees a slot: re-scan then
             heapq.heappush(events, (e, 2, -1))
+    for s in gate_starts:  # a hold opening: re-scan then
+        heapq.heappush(events, (s, 2, -1))
     adj = 0           # historical intervals vacated by lane-moved jobs
     adj_heap = []
     cpu_denied = set()  # jobs refused a lane grant at least once for want of a slot
@@ -196,7 +224,7 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, 
             m10 = sum(elig[i]["_f"] for i in residents if elig[i]["hold"] >= 600_000)
             area_long += long_occ * dt
             area_10m += m10 * dt
-            if occ + y + PER_JOB > x:
+            if occ + y + extra > x:
                 full_ms += dt
             if waiting:
                 blocked_ms += dt
@@ -228,7 +256,10 @@ def simulate(jobs, x, y, include_parents, silt=0, main_first=False, slots=None, 
         while adj_heap and adj_heap[0][0] <= t:
             adj += heapq.heappop(adj_heap)[1]
         still = []
-        for i in waiting:
+        scan = waiting if (gate is None or in_gate(t)) else []
+        if not scan:
+            still = list(waiting)
+        for i in scan:
             j = elig[i]
             if occ + j["_f"] <= x:
                 if slots is not None:
@@ -399,6 +430,118 @@ def incident(jobs, xs, y, lo, hi):
     return out
 
 
+EET = timezone(timedelta(hours=2))  # the journal's local time; EET has no DST in November
+JTS = re.compile(r"(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) aira daemon: ")
+JTHROTTLED = re.compile(r"slice ceiling throttled \(enforce\): (\d+) effective / (\d+) configured")
+JFREEZE = re.compile(r"admission fairness-freeze (hold|yield|idle) on ")
+JHEAD = re.compile(r": head seq=\d+ reserve=(\d+) ")
+MAX_HOLD_MS = 5 * 60 * 1000  # the daemon's fairness hold (a hold line is followed by yield 5 min later)
+
+
+def parse_journal(path):
+    """Round 4. Hold intervals [hold line, min(next yield/idle/warm-up line, hold + 5 min)) with
+    the named head's reserve, and the throttled-ceiling samples, from the daemon journal
+    capture that aira-350-ceiling-drop.py reads. Times in UTC ms."""
+    holds, ceil, events = [], [], []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            m = JTS.search(line)
+            if not m:
+                continue
+            t = int(datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S").replace(tzinfo=EET).timestamp() * 1000)
+            c = JTHROTTLED.search(line)
+            if c:
+                ceil.append((t, int(c.group(1))))
+                continue
+            f = JFREEZE.search(line)
+            if f:
+                h = JHEAD.search(line)
+                events.append((t, f.group(1), int(h.group(1)) if h else None))
+            elif "slice ceiling unevaluated: warming up" in line:
+                events.append((t, "start", None))
+    open_hold = None
+    for t, kind, reserve in events:
+        if open_hold is not None and kind != "hold":
+            holds.append((open_hold[0], min(t, open_hold[0] + MAX_HOLD_MS), open_hold[1]))
+            open_hold = None
+        if kind == "hold":
+            if open_hold is not None:
+                holds.append((open_hold[0], min(t, open_hold[0] + MAX_HOLD_MS), open_hold[1]))
+            open_hold = (t, reserve)
+    if open_hold is not None:
+        holds.append((open_hold[0], open_hold[0] + MAX_HOLD_MS, open_hold[1]))
+    holds.sort()
+    return holds, ceil
+
+
+def round4(jobs, y, xs, holds, ceil, slots, allowances, small_wait_h, lo_i, hi_i):
+    """Section 1i: the round-4 design (lane inside the one ceiling, with priority)."""
+    out = []
+    gate = [(s, e) for s, e, _ in holds]
+    lo = min(j["a"] for j in jobs)
+    hi = max(j["g"] + j["hold"] for j in jobs)
+    in_window = [(max(s, lo), min(e, hi)) for s, e in gate if e > lo and s < hi]
+    hold_ms = sum(e - s for s, e in in_window)
+    out.append(f"hold intervals in the replay window: {len(in_window)}, {hold_ms / 3.6e6:.1f} h of {(hi - lo) / 3.6e6:.1f} h "
+               f"({hold_ms / (hi - lo):.1%})")
+    gs = [s for s, _ in in_window]
+    ge = [e for _, e in in_window]
+
+    def overlap(a, b):
+        tot = 0
+        k = max(0, bisect.bisect_right(gs, a) - 1)
+        while k < len(gs) and gs[k] < b:
+            tot += max(0, min(b, ge[k]) - max(a, gs[k]))
+            k += 1
+        return tot
+    elig = [j for j in jobs if j["budget"] <= y and not j["parent"]]
+    ov = sum(overlap(j["a"], j["g"]) for j in elig)
+    out.append(f"eligible small jobs' wait inside a hold: {ov / 3.6e6:.1f} h of {sum(j['wait'] for j in elig) / 3.6e6:.1f} h "
+               f"({ov / 3.6e6 / small_wait_h:.1%} of all small wait-hours)")
+    out.append("x GiB | gate | slot allowance | saved-h | saved/all-small | lane-adm | full-for-1G share | occ mean/p90/peak GiB")
+    for x in xs:
+        for label, g in (("none", None), ("holds", gate)):
+            r = simulate(jobs, x, y, False, derived=True, extra=0, gate=g)
+            out.append(f"{x / GIB:>5.0f} | {label:<5} | {'-':>14} | {r['saved_h']:.1f} | {r['saved_h'] / small_wait_h:.1%} | "
+                       f"{r['admitted']} | {r['full_share']:.1%} | {r['mean_occ']:.2f}/{r['p90_occ']:.2f}/{r['peak_occ']:.2f}")
+        for allowance in allowances:
+            r = simulate(jobs, x, y, False, derived=True, extra=0, gate=gate, slots=slots, allowance=allowance)
+            out.append(f"{x / GIB:>5.0f} | holds | {allowance:>14} | {r['saved_h']:.1f} | {r['saved_h'] / small_wait_h:.1%} | "
+                       f"{r['admitted']} | {r['full_share']:.1%} | {r['mean_occ']:.2f}/{r['p90_occ']:.2f}/{r['peak_occ']:.2f}")
+    # the incident window under the hold-gated rule
+    for x in xs:
+        r = simulate(jobs, x, y, False, derived=True, extra=0, gate=gate)
+        adm = r["admitted_at"]
+        rem = [(adm[j["_id"]] - j["a"]) if j["_id"] in adm else j["wait"]
+               for j in r["elig"] if lo_i <= j["a"] < hi_i and j["wait"] >= 10_000]
+        out.append(f"incident window, holds-gated, x={x / GIB:.0f} GiB: {len(rem)} jobs that waited >= 10 s; "
+                   f"remaining wait {sum(rem) / 60000:.1f} min, p50 {pct(rem, 50) / 1000:.0f} s, max {max(rem or [0]) / 1000:.0f} s")
+    # guard G: would a lane at x have kept the named head from fitting beside it?
+    cts = [t for t, _ in ceil]
+    sizes = sorted(r for _, _, r in holds if r is not None)
+    out.append(f"hold lines naming a head: {len(sizes)}; head reserve p50 {pct(sizes, 50) / GIB:.2f} GiB, "
+               f"p99 {pct(sizes, 99) / GIB:.2f}, max {sizes[-1] / GIB if sizes else 0:.2f} GiB")
+    for x in xs:
+        binds = unseen = 0
+        margins = []
+        for s, _, reserve in holds:
+            if reserve is None:
+                continue
+            k = bisect.bisect_right(cts, s) - 1
+            if k < 0 or s - cts[k] > 120_000:
+                unseen += 1
+                continue
+            jobs_in_lane = max(1, x // (64 * MIB))  # the most jobs a lane of x can hold (64 MiB each), plus the head
+            room = ceil[k][1] - (2 * GIB + 64 * MIB * min(jobs_in_lane + 1, 33)) - x
+            margins.append(room - reserve)
+            if reserve > room:
+                binds += 1
+        out.append(f"x={x / GIB:.0f} GiB: holds where G would bind (head reserve > E - (2 GiB + 64 MiB x (lane jobs + 1)) - x, "
+                   f"lane jobs <= 32 slots): {binds} of {len(margins)} with a throttled sample within 120 s "
+                   f"({unseen} without); smallest margin {min(margins) / GIB if margins else float('nan'):.2f} GiB")
+    return out
+
+
 def snapshot_report(path, y):
     with open(path) as fh:
         data = json.load(fh)["data"]
@@ -429,6 +572,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", required=True)
     ap.add_argument("--snapshot")
+    ap.add_argument("--journal", help="daemon journal capture (aira-350-ceiling-drop.py input); enables section 1i")
     ap.add_argument("--y", type=float, default=1.0, help="job size limit, GiB")
     ap.add_argument("--x", type=float, nargs="+", default=[2, 4, 6, 8], help="lane sizes, GiB")
     ap.add_argument("--silt", type=float, default=1.56, help="lane GiB held throughout by long-lived jobs (section 1b)")
@@ -537,9 +681,15 @@ def main():
     top = sorted((j["budget"] for j in jobs), reverse=True)
     print(f"largest: {', '.join(f'{b / GIB:.1f}' for b in top[:5])} GiB; rows >= 20 GiB: {sum(1 for b in top if b >= 20 * GIB)}; "
           f">= 30 GiB: {sum(1 for b in top if b >= 30 * GIB)}")
-    print("\n## 2 the 2026-11-18 incident (11:09-11:30 UTC, 13:09-13:30 EET), eligible small jobs")
     lo_i = int(datetime(2026, 11, 18, 11, 9, tzinfo=UTC).timestamp() * 1000)
     hi_i = int(datetime(2026, 11, 18, 11, 30, tzinfo=UTC).timestamp() * 1000)
+    if args.journal:
+        holds, ceil = parse_journal(args.journal)
+        print("\n## 1i round 4: the lane INSIDE the one ceiling, with priority (x caps bookings, no 64 MiB per job in x;\n"
+              "## derived S: every small job-level lease counts, however granted, suite parents included; no ceiling-room gate)")
+        for line in round4(jobs, y, [4 * GIB, 8 * GIB], holds, ceil, args.slots, [16, 24, 27], small_wait_h, lo_i, hi_i):
+            print(line)
+    print("\n## 2 the 2026-11-18 incident (11:09-11:30 UTC, 13:09-13:30 EET), eligible small jobs")
     for line in incident(jobs, [4 * GIB, 8 * GIB], y, lo_i, hi_i):
         print(line)
     if args.snapshot:
