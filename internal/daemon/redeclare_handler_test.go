@@ -342,7 +342,7 @@ func TestReDeclarePostSetErrorHoldsLeaseEOFReleases(t *testing.T) {
 	select {
 	case <-done:
 		t.Fatal("handler RETURNED after the ack-write error — the error path released the established lease instead of holding it (EOF must release, not the write error)")
-	case <-testdeadline.After(250 * time.Millisecond):
+	case <-time.After(250 * time.Millisecond): // a negative wait: plain timer, never testdeadline.After
 	}
 	withReDeclareLease(t, server, "post-set-err", func(w *admitWaiter) {
 		if w.state != admitGranted {

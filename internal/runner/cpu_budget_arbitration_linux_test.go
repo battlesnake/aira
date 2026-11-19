@@ -233,7 +233,10 @@ func TestAIRA136CPUBudgetDoesNotDismissAForeignKillIntent(t *testing.T) {
 // CPU attribution fails against that, deterministically, because the two
 // instants are an order of magnitude apart.
 func TestAIRA136DeadlineBranchTakenOnceUnderBothBounds(t *testing.T) {
-	h := newAIRA126Harness(t, aira126Options{})
+	// The fake scope cannot kill `sleep 30`, so Launch waits out the evidence
+	// grace after the kill; the default 2 s grace bought nothing the assertions
+	// below read, and 300 ms is what the other arbitration tests use.
+	h := newAIRA126Harness(t, aira126Options{grace: aira126Scale(300 * time.Millisecond)})
 	reader := (&scriptedCPUReader{}).push(0, true).push(time.Hour, true)
 	swapCPUReader(t, reader.read)
 	record, err := h.r.Launch(context.Background(), Request{
