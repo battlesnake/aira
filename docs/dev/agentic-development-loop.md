@@ -103,7 +103,10 @@ SliceCeiling real-cgroup fixture writes to the disk directory named in
 page cache. A hard-killed run leaves its directory in `/dev/shm`, holding RAM;
 the next run removes such a directory once it is over 10 minutes old and its
 owner file proves the run that made it is gone (same pid namespace, pid dead or
-reused); it never touches a live run's directory or anything without that proof.
+reused); it never touches a live run's directory or anything without that proof
+(a pid whose start time cannot be read counts as live). Removal deletes the owner
+file last, after restoring permissions on the tree, so a removal that cannot
+finish keeps the proof for a later sweep.
 
 ## Lighter path for trivial changes
 

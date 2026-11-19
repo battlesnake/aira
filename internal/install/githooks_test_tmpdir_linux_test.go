@@ -23,6 +23,10 @@ import (
 //     (live-run dir swept / reused-pid dir kept);
 //   - drop the pid-namespace check (other-namespace dir swept);
 //   - drop the age margin (young dead dir swept);
+//   - treat an unreadable start time of an existing pid as gone (live dir
+//     swept under a failing cat);
+//   - remove with a plain rm -rf, skip restoring permissions, or skip the
+//     left-over check (owner file lost, or a mode-000 subdir left behind);
 //   - follow a symlink, or sweep a dir without a valid owner file;
 //   - lose the command's exit status, or leave the run dir behind;
 //   - use tmpfs under CI, or when the root is missing or too small.
@@ -312,5 +316,180 @@ func TestTestTmpdirHardKillLeaksAndTheNextRunSweeps(t *testing.T) {
 	}
 	if !strings.Contains(out, "removed "+run) {
 		t.Fatalf("the sweep did not report the removal\n%s", out)
+	}
+}
+
+// shimDir makes a directory holding executable scripts named after the keys of
+// shims (body after the shebang), for prepending to PATH to inject a fault.
+func shimDir(t *testing.T, shims map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, body := range shims {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// chmodBackOnCleanup gives the user rwx on everything under root again before
+// t.TempDir's own cleanup (registered earlier, so run later) removes it.
+func chmodBackOnCleanup(t *testing.T, root string) {
+	t.Helper()
+	t.Cleanup(func() { _ = exec.Command("chmod", "-R", "u+rwX", root).Run() })
+}
+
+// TestTestTmpdirSweepKeepsADirWhoseOwnersLivenessIsUnknown: when a live
+// owner's /proc/<pid>/stat cannot be read (cat fails), liveness is unknown and
+// the dir is kept. The negative control in the same run: a dead owner (no
+// /proc/<pid>) is still swept under the same fault.
+func TestTestTmpdirSweepKeepsADirWhoseOwnersLivenessIsUnknown(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	ns := ourPidNS(t)
+	me := os.Getpid()
+	dead, deadStart := deadPid(t)
+	live := plantRunDir(t, root, "t.live", ownerLine(me, procStart(t, me), ns), time.Hour)
+	gone := plantRunDir(t, root, "t.dead", ownerLine(dead, deadStart, ns), time.Hour)
+
+	shims := shimDir(t, map[string]string{"cat": "exit 1"})
+	out, code := runTestTmpdir(t, []string{"PATH=" + shims + ":" + os.Getenv("PATH"), "AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, "true")
+	if code != 0 {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(live, "payload")); err != nil {
+		t.Errorf("a live run's dir was swept when its start time could not be read: %v\n%s", err, out)
+	}
+	if _, err := os.Lstat(gone); !os.IsNotExist(err) {
+		t.Errorf("control: the dead run's dir %s was not swept (lstat err %v)\n%s", gone, err, out)
+	}
+}
+
+// plantLockedPayload adds dir/locked/file and then makes dir/locked mode 000,
+// as TestRetireReportsUnevaluatedDigest does to its fixture dir before a hard
+// kill can stop its cleanup from restoring it.
+func plantLockedPayload(t *testing.T, dir string) {
+	t.Helper()
+	locked := filepath.Join(dir, "locked")
+	if err := os.Mkdir(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "file"), make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTestTmpdirSweepKeepsTheOwnerFileUntilThePayloadIsGone: a dead run's dir
+// holding a mode-000 subdirectory is removed completely (the removal restores
+// permissions first). When the payload still cannot be removed (chmod made a
+// no-op), the owner file survives, so the next sweep can still prove the run
+// is gone and finish the job.
+func TestTestTmpdirSweepKeepsTheOwnerFileUntilThePayloadIsGone(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	t.Parallel()
+	ns := ourPidNS(t)
+	dead, deadStart := deadPid(t)
+
+	t.Run("restores-permissions", func(t *testing.T) {
+		root := t.TempDir()
+		chmodBackOnCleanup(t, root)
+		dir := plantRunDir(t, root, "t.dead", ownerLine(dead, deadStart, ns), time.Hour)
+		plantLockedPayload(t, dir)
+		out, code := runTestTmpdir(t, []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, "true")
+		if code != 0 {
+			t.Fatalf("exit %d\n%s", code, out)
+		}
+		if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+			t.Fatalf("%s with a mode-000 subdir was not removed (lstat err %v)\n%s", dir, err, out)
+		}
+	})
+
+	t.Run("failed-removal-keeps-owner", func(t *testing.T) {
+		root := t.TempDir()
+		chmodBackOnCleanup(t, root)
+		dir := plantRunDir(t, root, "t.dead", ownerLine(dead, deadStart, ns), time.Hour)
+		plantLockedPayload(t, dir)
+		shims := shimDir(t, map[string]string{"chmod": "exit 0"})
+		out, code := runTestTmpdir(t, []string{"PATH=" + shims + ":" + os.Getenv("PATH"), "AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, "true")
+		if code != 0 {
+			t.Fatalf("exit %d\n%s", code, out)
+		}
+		if _, err := os.Stat(filepath.Join(dir, ".aira-test-owner")); err != nil {
+			t.Fatalf("a failed removal lost the owner file: %v\n%s", err, out)
+		}
+		if strings.Contains(out, "removed "+dir) {
+			t.Fatalf("a failed removal was reported as done\n%s", out)
+		}
+		out, code = runTestTmpdir(t, []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, "true")
+		if code != 0 {
+			t.Fatalf("exit %d\n%s", code, out)
+		}
+		if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+			t.Fatalf("the retry sweep did not remove %s (lstat err %v)\n%s", dir, err, out)
+		}
+	})
+}
+
+// TestTestTmpdirExitKeepsTheOwnerFileUntilThePayloadIsGone: the run's own exit
+// removes a run dir holding a mode-000 subdir; when that removal cannot finish,
+// the owner file stays, and once past the age margin a later sweep removes it.
+// The exit status stays the command's either way.
+func TestTestTmpdirExitKeepsTheOwnerFileUntilThePayloadIsGone(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	t.Parallel()
+	script := `echo "$TMPDIR" > "$1"; mkdir "$TMPDIR/locked" && head -c 4096 /dev/zero > "$TMPDIR/locked/file" && chmod 000 "$TMPDIR/locked"; exit 5`
+	// The command's own chmod must be the real one, so the shim case calls it
+	// by absolute path.
+	realChmod, err := exec.LookPath("chmod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script = strings.Replace(script, "chmod 000", realChmod+" 000", 1)
+
+	for _, broken := range []bool{false, true} {
+		root := t.TempDir()
+		chmodBackOnCleanup(t, root)
+		report := filepath.Join(t.TempDir(), "report")
+		env := []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}
+		if broken {
+			env = append(env, "PATH="+shimDir(t, map[string]string{"chmod": "exit 0"})+":"+os.Getenv("PATH"))
+		}
+		out, code := runTestTmpdir(t, env, "bash", "-c", script, "probe", report)
+		if code != 5 {
+			t.Fatalf("broken=%v: exit %d, want the command's 5\n%s", broken, code, out)
+		}
+		data, err := os.ReadFile(report)
+		if err != nil {
+			t.Fatalf("broken=%v: the command did not run: %v\n%s", broken, err, out)
+		}
+		run := strings.TrimSpace(string(data))
+		if !broken {
+			if _, err := os.Lstat(run); !os.IsNotExist(err) {
+				t.Fatalf("run dir %s with a mode-000 subdir left behind (lstat err %v)\n%s", run, err, out)
+			}
+			continue
+		}
+		owner := filepath.Join(run, ".aira-test-owner")
+		if _, err := os.Stat(owner); err != nil {
+			t.Fatalf("a failed exit removal lost the owner file: %v\n%s", err, out)
+		}
+		aged := time.Now().Add(-time.Hour)
+		if err := os.Chtimes(owner, aged, aged); err != nil {
+			t.Fatal(err)
+		}
+		out, code = runTestTmpdir(t, []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, "true")
+		if code != 0 {
+			t.Fatalf("sweep exit %d\n%s", code, out)
+		}
+		if _, err := os.Lstat(run); !os.IsNotExist(err) {
+			t.Fatalf("the later sweep did not remove %s (lstat err %v)\n%s", run, err, out)
+		}
 	}
 }

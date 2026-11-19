@@ -46,11 +46,19 @@
 #     line below, naming the pid, the pid's start time (field 22 of
 #     /proc/<pid>/stat) and the pid namespace of the run that made it;
 #   - that pid namespace is ours (in another one the pid means nothing here);
-#   - that pid is gone, or is now a different process (another start time);
+#   - that pid is gone (no /proc/<pid>), or is now a different process
+#     (another start time); when /proc/<pid> exists but its start time cannot
+#     be read, liveness is unknown and the directory is kept;
 #   - the owner file is more than 10 minutes old, a margin on top of the
 #     liveness proof.
 # Anything else is left alone: a directory without a readable owner file, a
 # live run of another session, anything that is not ours.
+#
+# Removal (by the sweep and by this run's own exit) deletes the owner file
+# LAST, only once everything else in the directory is gone. Tests leave
+# directories without permissions (mode 000) that a hard kill stops them from
+# restoring, so the removal first gives the user rwx on the tree; if anything
+# still cannot be deleted, the owner file stays so a later sweep can retry.
 set -uo pipefail
 
 AIRA_TEST_TMPFS_OWNER_VERSION='aira-test-tmpdir v1'
@@ -86,13 +94,40 @@ aira_test_proc_start() {
 	printf '%s\n' "${f[19]}"
 }
 
+# aira_test_owner_alive <pid> <start> succeeds when the run that wrote the
+# owner file may still be running: <pid> has start time <start>, or <pid>
+# exists and its start time cannot be read (unknown is kept, never swept). It
+# fails only when the pid is absent or is a different process.
+aira_test_owner_alive() {
+	local now
+	if now="$(aira_test_proc_start "$1")"; then
+		[ "$now" = "$2" ]
+		return
+	fi
+	# Unreadable: gone only if /proc works (our own entry is there) and the
+	# pid's entry is not.
+	[ -e "/proc/$1" ] || [ ! -e "/proc/$$" ]
+}
+
+# aira_test_rmrun <dir> removes a run directory, the owner file last (see the
+# header). It fails, keeping the owner file, when anything else is left.
+aira_test_rmrun() {
+	local dir="$1" left
+	# GNU chmod -R does not follow symlinks met in the traversal.
+	chmod -R u+rwX -- "$dir" 2>/dev/null
+	find "$dir" -mindepth 1 -maxdepth 1 ! -name .aira-test-owner -exec rm -rf -- {} + 2>/dev/null
+	left="$(find "$dir" -mindepth 1 -maxdepth 1 ! -name .aira-test-owner -print -quit 2>/dev/null)" || return 1
+	[ -z "$left" ] || return 1
+	rm -f -- "$dir/.aira-test-owner" && rmdir -- "$dir"
+}
+
 aira_test_pidns() {
 	readlink "/proc/$1/ns/pid" 2>/dev/null
 }
 
 # aira_test_sweep <root> removes stale run directories (see the header).
 aira_test_sweep() {
-	local root="$1" ourns dir owner line pid start ns now_start
+	local root="$1" ourns dir owner line pid start ns
 	ourns="$(aira_test_pidns $$)" || return 0
 	[ -n "$ourns" ] || return 0
 	for dir in "$root"/t.????; do
@@ -106,10 +141,12 @@ aira_test_sweep() {
 		case "$pid" in "" | *[!0-9]*) continue ;; esac
 		case "$start" in "" | *[!0-9]*) continue ;; esac
 		[ "$ns" = "$ourns" ] || continue
-		if now_start="$(aira_test_proc_start "$pid")" && [ "$now_start" = "$start" ]; then
-			continue
+		aira_test_owner_alive "$pid" "$start" && continue
+		if aira_test_rmrun "$dir"; then
+			printf 'test-tmpdir: removed %s, left by a run (pid %s) that is gone (AIRA-357).\n' "$dir" "$pid" >&2
+		else
+			printf 'test-tmpdir: could not fully remove %s (run pid %s is gone); kept its owner file for a later sweep (AIRA-357).\n' "$dir" "$pid" >&2
 		fi
-		rm -rf -- "$dir" && printf 'test-tmpdir: removed %s, left by a run (pid %s) that is gone (AIRA-357).\n' "$dir" "$pid" >&2
 	done
 	return 0
 }
@@ -149,7 +186,7 @@ if ! run="$(mktemp -d "$root/t.XXXX")"; then
 	printf 'test-tmpdir: cannot create a run directory in %s; tests use the normal TMPDIR (AIRA-357).\n' "$root" >&2
 	exec "$@"
 fi
-trap 'rm -rf -- "$run"' EXIT
+trap 'aira_test_rmrun "$run" || printf "test-tmpdir: could not fully remove %s; a later run sweeps it (AIRA-357).\n" "$run" >&2' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
