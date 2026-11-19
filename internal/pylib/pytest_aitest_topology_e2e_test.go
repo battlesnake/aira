@@ -20,6 +20,7 @@ package pylib_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -438,12 +439,107 @@ func readCgroupProcs(dir string) []int {
 	return pids
 }
 
-// processAlive reports whether a pid is a live process (signal 0 probe). Used
-// only as corroboration of the primary "scope dir is gone" proof — pid reuse
-// makes it weaker, so the dir-removal check is authoritative (rmdir requires an
-// empty cgroup, so a removed worker scope PROVES no process survived in it).
-func processAlive(pid int) bool {
-	return syscall.Kill(pid, 0) == nil
+// workerProcess is one process seen in a worker scope before the parent kill:
+// its pid and the start tick /proc/<pid>/stat gave it then, so a later check
+// can tell the same process from a reused pid.
+type workerProcess struct {
+	pid   int
+	start uint64
+}
+
+// readProcState returns the state letter and start tick (field 22) of
+// /proc/<pid>/stat; ok is false when the pid names no task.
+func readProcState(pid int) (state byte, start uint64, ok bool) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, 0, false
+	}
+	// The command name (field 2) may hold spaces and parentheses; everything
+	// after the LAST ')' is space-separated, starting at field 3 (state).
+	end := strings.LastIndexByte(string(data), ')')
+	if end < 0 {
+		return 0, 0, false
+	}
+	fields := strings.Fields(string(data[end+1:]))
+	if len(fields) < 20 {
+		return 0, 0, false
+	}
+	start, err = strconv.ParseUint(fields[19], 10, 64)
+	if err != nil || len(fields[0]) != 1 {
+		return 0, 0, false
+	}
+	return fields[0][0], start, true
+}
+
+// workerSurvived reports whether the process captured before the kill is still
+// running: the same start tick (not a reused pid) and not a zombie. A killed
+// process leaves cgroup.procs, so its scope can be rmdir'd, before its parent
+// reaps it; an orphaned worker's parent is init, which reaps when it gets to
+// it. Until then kill(pid, 0) succeeds on the zombie, which is why a signal-0
+// probe false-failed this gate on a loaded slice (AIRA-364). A zombie has
+// exited and holds no memory: it is not a leaked worker.
+func workerSurvived(p workerProcess) bool {
+	state, start, ok := readProcState(p.pid)
+	if !ok || start != p.start {
+		return false
+	}
+	return state != 'Z' && state != 'X' && state != 'x'
+}
+
+// TestWorkerSurvivedTreatsZombieAndReusedPidAsGone pins the survivor check the
+// parent-kill gates use (AIRA-364): a running process with its captured start
+// tick survived; the same pid with another start tick (a reused pid), a killed
+// but unreaped zombie, and a reaped pid did not. The zombie case is the one a
+// signal-0 probe gets wrong, and the test asserts that precondition too.
+func TestWorkerSurvivedTreatsZombieAndReusedPidAsGone(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	reaped := false
+	defer func() {
+		if !reaped {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	pid := cmd.Process.Pid
+	_, start, ok := readProcState(pid)
+	if !ok {
+		t.Fatalf("cannot read /proc/%d/stat of a just-started child", pid)
+	}
+	captured := workerProcess{pid: pid, start: start}
+	if !workerSurvived(captured) {
+		t.Fatal("a running process with its captured start tick must count as survived")
+	}
+	if workerSurvived(workerProcess{pid: pid, start: start + 1}) {
+		t.Fatal("a pid whose start tick differs from the captured one is a reused pid, not a survivor")
+	}
+	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	deadline := testdeadline.After(10 * time.Second)
+	for {
+		if state, _, ok := readProcState(pid); ok && state == 'Z' {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the killed, unreaped child never became a zombie")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("precondition: a signal-0 probe succeeds on a zombie, got %v", err)
+	}
+	if workerSurvived(captured) {
+		t.Fatal("a killed, unreaped zombie must not count as a surviving worker")
+	}
+	_ = cmd.Wait()
+	reaped = true
+	if workerSurvived(captured) {
+		t.Fatal("a reaped pid must not count as a surviving worker")
+	}
 }
 
 // waitScopePopulated polls a worker scope's cgroup.procs until it holds at least
@@ -469,9 +565,9 @@ func waitScopePopulated(t *testing.T, dir string, timeout time.Duration) []int {
 // parent kill: its directory (WorkerScopeChildPath == <slice>/.aira-<id>) and the
 // pids it held while populated.
 type populatedWorkerScope struct {
-	id   string
-	dir  string
-	pids []int
+	id    string
+	dir   string
+	procs []workerProcess
 }
 
 // capturePopulatedWorkerScopes waits for each granted worker lease's sibling scope
@@ -482,8 +578,14 @@ func capturePopulatedWorkerScopes(t *testing.T, leases map[string]int64, slice s
 	out := make([]populatedWorkerScope, 0, len(leases))
 	for id := range leases {
 		dir := runner.WorkerScopeChildPath(slice, id)
-		pids := waitScopePopulated(t, dir, testdeadline.Wait(15*time.Second))
-		out = append(out, populatedWorkerScope{id: id, dir: dir, pids: pids})
+		var procs []workerProcess
+		for _, pid := range waitScopePopulated(t, dir, testdeadline.Wait(15*time.Second)) {
+			// A pid that is already gone cannot survive the kill; skip it.
+			if _, start, ok := readProcState(pid); ok {
+				procs = append(procs, workerProcess{pid: pid, start: start})
+			}
+		}
+		out = append(out, populatedWorkerScope{id: id, dir: dir, procs: procs})
 	}
 	return out
 }
@@ -520,9 +622,9 @@ func assertNoOrphanAfterParentKill(t *testing.T, outer string, workers []populat
 	// Corroboration: every process we saw in a worker scope is now dead. (The
 	// dir-removal above is the authoritative proof — rmdir needs an empty cgroup.)
 	for _, w := range workers {
-		for _, pid := range w.pids {
-			if processAlive(pid) {
-				t.Fatalf("worker %s process %d survived the parent kill (its scope dir was removed but the pid is still alive — pid reuse, or a real leak)", w.id, pid)
+		for _, p := range w.procs {
+			if workerSurvived(p) {
+				t.Fatalf("worker %s process %d (start tick %d) survived the parent kill: its scope dir was removed but the same process is still running, not a zombie (a real leak)", w.id, p.pid, p.start)
 			}
 		}
 	}
