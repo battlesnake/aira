@@ -81,8 +81,11 @@ def g(b):
 
 
 def booked(m, peak, b, f=0.0):
-    """The policy's booking: m x peak, at least FLOOR and at least f x B, never above B."""
-    return min(b, max(FLOOR, int(math.ceil(m * peak)), int(math.ceil(f * b))))
+    """The policy's booking: m x peak, at least FLOOR and at least f x B, never above B. A booking
+    above the AIRA-350 small-lease bound y is never lowered to y or below (the memo's lane rule), so
+    auto-resize never turns a large lease into a small one."""
+    floor = FLOOR if b <= SMALL_Y else SMALL_Y + 1
+    return min(b, max(floor, int(math.ceil(m * peak)), int(math.ceil(f * b))))
 
 
 def lab(t0, m, f):
@@ -466,8 +469,10 @@ def live_section(snaps, out):
                 if sc["scope_id"] not in fixed:
                     fixed[sc["scope_id"]] = booked(m, sc["peak_rss"], b, fr)
                 otot += max(0, b - fixed[sc["scope_id"]])
+            # the previous peak only of a lease the rule already applies to, so the first eligible tick
+            # books from the peak it reads then (as section 3c's accounting does)
             for sc in d.get("scopes", []):
-                if eligible(sc):
+                if eligible(sc) and sc["age_seconds"] >= t0 * 60:
                     prevpk[sc["scope_id"]] = sc["peak_rss"]
             rr.append(tot)
             orr.append(otot)
@@ -602,6 +607,7 @@ def live_section(snaps, out):
     p("worst case either rule adds (every freed / overbooked byte used at once) = the room column itself: the ledger")
     p("under-counts what jobs may legally use by exactly that much (memory.max unchanged in both). The difference is")
     p("whose bytes: auto-resize lends bytes a job has not touched for t0 minutes; 354 lends bytes of no particular job.")
+    return rt_room, os_room
 
 
 def coverage_section(win, snaps, t_end, out):
@@ -649,27 +655,36 @@ def selftest():
     """The policy arithmetic and the regret accounting on synthetic inputs (no data needed)."""
     import io
     b = 4 * GIB
-    assert booked(1.5, 0, b) == FLOOR                       # an idle job books the floor, never 0
+    assert booked(1.5, 0, 512 * MIB) == FLOOR               # an idle job books the floor, never 0
+    assert booked(1.5, 0, b) == SMALL_Y + 1                 # a large lease never becomes a small one
     assert booked(1.5, 1 * GIB, b) == int(1.5 * GIB)        # m x peak
     assert booked(1.5, 3 * GIB, b) == b                     # never above the booking it had
     assert booked(1.5, 0, b, 0.5) == 2 * GIB                # the bounded-shrink variant
-    # One job, booked 4 GiB under a 4.44 GiB cap (a 0.9 discount): idle at t0 (peak 0.1 GiB), later
-    # 2 GiB, finally 4.3 GiB, above its booking (the discount's own overrun, not this policy's).
+    # One job, booked 4 GiB under a 4.44 GiB cap (a 0.9 discount), seen once before t0 (age 880 s,
+    # peak 0.1 GiB), then at t0 with peak 1 GiB, later 2 GiB, finally 4.3 GiB: above its booking,
+    # which is the discount's own overrun, not this policy's.
     snaps = []
-    for i, pk in enumerate([0.1, 0.1, 2.0, 4.3]):
+    for i, pk in enumerate([0.1, 1.0, 1.0, 2.0, 4.3]):
         snaps.append((1000.0 + 20 * i, {
             "slice_reserve": {"granted_bytes": b, "ceiling_bytes": 2 * b, "jobs": 1, "queued": 1},
             "queued": [{"reserve_bytes": GIB}],
-            "scopes": [{"scope_id": "s", "name": "n", "command": "c", "age_seconds": 900 + 20 * i,
+            "scopes": [{"scope_id": "s", "name": "n", "command": "c", "age_seconds": 880 + 20 * i,
                         "peak_rss": int(pk * GIB), "rss_bytes": int(pk * GIB), "reserve_bytes": b,
                         "cap": str(int(4.44 * GIB))}]}))
     buf = io.StringIO()
-    live_section(snaps, buf)
+    rt_room, _ = live_section(snaps, buf)
     line = [ln for ln in buf.getvalue().splitlines() if ln.startswith("t0=15 m=1.50 ")][0]
-    # The one-shot books the 256 MiB floor at t0; the later peak counts only up to B, so the excess
-    # is 4 GiB - 256 MiB = 3.75 GiB (counting the overrun past B would give 4.05).
+    # The one-shot books 1.5 x 1 GiB at t0; the later peak counts only up to B, so the excess is
+    # 4 - 1.5 = 2.50 GiB (counting the overrun past B would give 2.80).
     m = re.search(r"\|\s+1/1\s+100\.0%\s+(\S+)\s+(\S+)", line)
-    assert m and m.group(1) == "3.75" and m.group(2) == "3.75", line
+    assert m and m.group(1) == "2.50" and m.group(2) == "2.50", line
+    # Ratchet: the first eligible tick books from the peak it reads (1 GiB, not the pre-t0 0.1 GiB),
+    # each later one from the PREVIOUS sample's peak: 1.5G, 1.5G, 1.5G (prev 1.0), 3G (prev 2.0).
+    # Booking from the current peak would give room 1G and 0 at the last two samples and no regret;
+    # seeding from the pre-t0 sample would give the lane floor (room 3G - 1) at t0.
+    half = 3 * GIB // 2
+    assert rt_room[(15, 1.5, 0.0)] == [0, b - half, b - half, b - half, b - 3 * GIB], rt_room[(15, 1.5, 0.0)]
+    assert re.search(r"\|\s+1 \(100\.0%\)\s+2\s+1\.00\s", line), line   # ratchet regret: 1 job, 2 events, max 1.00
     assert "0 scopes timed from their first running sighting, 1 already running" in buf.getvalue()
     # a job first seen at the second sample of a span is aged from that sighting, not from its launch
     # stamp (which includes its queue wait): 600 s of launch age at sighting, 20 s later it is 20 s old

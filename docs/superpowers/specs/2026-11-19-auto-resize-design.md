@@ -16,16 +16,17 @@ The data do not show auto-resize to be a bad rule: at its best safe setting it i
 354 at its starting factor. The recommendation rests on reach, room to grow, and simplicity.
 
 - **Comparable at the low end.** The ratchet variant at t0 = 5 min, m = 1.5:
-  - frees 3.9 GiB of ledger at the median busy instant (s3c, M);
-  - admits 0.6 queued jobs per sample (s3d, E);
-  - regret: 4.9% of long jobs later grow past their lowered booking, by at most 0.61 GiB.
+  - frees 3.4 GiB of ledger at the median busy instant (s3c, M);
+  - admits 0.4 queued jobs per sample (s3d, E);
+  - regret: 4.2% of long jobs later grow past their lowered booking, by at most 0.55 GiB.
 
   354 at k = 1.10 frees 4.7 GiB and admits 0.3 jobs per sample.
 - **It cannot grow.** Auto-resize reaches only jobs past t0 that use well below their booking. Of
   the 41.2 GiB granted (p50), workers hold 8.5 GiB and jobs younger than 5 minutes hold 9.9 GiB.
   The long jobs' summed memory.peak is 13.3 GiB of the 21.5 GiB they book (s3f). Pushing harder
-  buys little room and much regret: at m = 1.25 the one-shot regret is 20.8% of jobs, by up to
-  3.76 GiB. 354 has a measured host-safety criterion that already passes at k = 1.25 (its replay
+  buys little room and much regret. The ratchet at m = 1.25 frees 4.7 GiB (regret 6.2%, up to
+  0.75 GiB) and admits 0.7 jobs per sample. The one-shot at m = 1.25 frees 6.3 GiB, but its
+  regret is 11.1% of jobs, by up to 3.70 GiB. 354 has a measured host-safety criterion that already passes at k = 1.25 (its replay
   s4), and at 1.25 it admits 2.2 jobs per sample here.
 - **Simplicity.** Auto-resize needs a new periodic loop with per-scope cgroup reads, adds a third
   writer of the booking, and interacts with the lane (section 5). Its one exposure bound needs a
@@ -82,22 +83,23 @@ peak as the peak at t0 and see a third of the load. Its 354 figures are upper bo
 
 | Measure | 5 / 1.25 | 5 / 1.5 | 15 / 1.5 | 354 k=1.10 | 354 k=1.25 |
 |---|---|---|---|---|---|
-| Live room freed, GiB p50 / p90, ratchet | 5.5 / 8.2 | 3.9 / 6.8 | 1.6 / 4.1 | 4.7 (flat) | 11.9 (flat) |
-| Live room freed, GiB p50 / p90, one-shot | 8.0 / 11.9 | 6.4 / 10.9 | 2.7 / 5.0 | - | - |
-| Ratchet regret: share of long jobs; largest excess, GiB | 6.2%; 0.75 | 4.9%; 0.61 | 4.3%; 0.45 | n/a | n/a |
-| One-shot regret: of long jobs, of shrunk jobs; largest excess, GiB | 20.8%, 26.5%; 3.76 | 6.9%, 9.7%; 3.71 | 7.2%, 10.6%; 1.20 | n/a | n/a |
-| Queued jobs admitted per sample, mean, RAM and CPU, E (ratchet / one-shot) | 0.9 / 1.6 | 0.6 / 1.2 | 0.2 / 0.4 | 0.3 | 2.2 |
-| Samples where caps plus room pass memory.max - headroom, of 660 (ratchet / one-shot) | 4 / 26 | 0 / 0 | 0 / 0 | 0 | 0 |
-| 7-day store: mean room while a queue was visible, GiB (bounds as above) | 1.76 | 1.12 | 0.62 | 4.60 | 11.51 |
+| Live room freed, GiB p50 / p90, ratchet | 4.7 / 7.5 | 3.4 / 6.0 | 1.4 / 3.8 | 4.7 (flat) | 11.9 (flat) |
+| Live room freed, GiB p50 / p90, one-shot | 6.3 / 10.3 | 5.4 / 9.1 | 2.5 / 4.8 | - | - |
+| Ratchet regret: share of long jobs; largest excess, GiB | 6.2%; 0.75 | 4.2%; 0.55 | 4.3%; 0.27 | n/a | n/a |
+| One-shot regret: of long jobs, of shrunk jobs; largest excess, GiB | 11.1%, 14.2%; 3.70 | 6.2%, 8.7%; 3.18 | 7.2%, 10.6%; 0.94 | n/a | n/a |
+| Queued jobs admitted per sample, mean, RAM and CPU, E (ratchet / one-shot) | 0.7 / 1.2 | 0.4 / 1.0 | 0.2 / 0.3 | 0.3 | 2.2 |
+| Samples where caps plus room pass memory.max - headroom, of 660 (ratchet / one-shot) | 2 / 6 | 0 / 0 | 0 / 0 | 0 | 0 |
+| 7-day store: mean room while a queue was visible, GiB (bounds as above) | 1.70 | 1.07 | 0.60 | 4.60 | 11.51 |
 
-Column headings give t0 in minutes, then m.
+Column headings give t0 in minutes, then m. Every auto-resize figure applies the lane floor chosen
+in section 5: a lease booked above 1 GiB is never lowered to 1 GiB or below.
 
 **Regret** is a later peak above the lowered booking, counted only up to the booking B the job had
 anyway. A peak above B is the AIRA-324 discount's own overrun, which exists today. The 15/1.5
 one-shot regret jobs (s3c drill-down) are five ordinary builds and test runs:
 - peak at 15 min: 0.49-5.59 GiB;
 - later peaks: 1.17-9.00 GiB;
-- excess: 0.25-1.20 GiB.
+- excess: 0.17-0.94 GiB.
 
 Their causes were not measured. Later peak over peak at t0 (s3b): p50 1.11 and p90 2.23 at 5 min
 (64 jobs); p50 1.22 and p90 1.79 at 15 min (31 jobs).
@@ -107,7 +109,7 @@ anything at 15/1.5. It is reported, not proposed.
 
 **Concentration** is moderate:
 - In the store, the top 10% of 5-minute jobs hold 56.0% of those jobs' booked GiB-hours, and the
-  top 10 jobs get 22.7% of what 5/1.5 frees (s1).
+  top 10 jobs get 23.6% of what 5/1.5 frees (s1).
 - Live, the three largest long jobs hold 0.31 (p50) of all booked bytes (s3a).
 - Jobs older than a day are services holding 1.25 GiB in total (s3a), so there is nothing to win
   from them.
@@ -127,13 +129,20 @@ other. They are not wait-hours removed.
 **Ratchet, t0 = 5 min since the grant, m = 1.5, a 15 s tick (the cadence measured), floor
 256 MiB:**
 
-    booking = min(pinChargeFor(discountable, reserve), max(256 MiB, ceil(1.5 x memory.peak)))
+    floor   = 256 MiB, or y + 1 (1 GiB + 1 byte) when pinChargeFor(...) > y      # the lane rule
+    target  = max(floor, ceil(1.5 x memory.peak), memory.current)
+    booking = min(pinChargeFor(discountable, reserve), target)
 
 The first term is the booking the re-anchor already computes (`admit.go:2326`), so the rule only
 adds a peak-based cap. It is a pure function, recomputed each tick. It moves up as the peak grows,
-so a regret lasts at most one tick: 0.61 GiB at most in the replay. A slower tick would raise that,
-and would need its own replay. The one-shot gives more room (6.4 against 3.9 GiB), but its regret
-per job reaches 3.71 GiB.
+so a regret lasts at most one tick: 0.55 GiB at most in the replay. A slower tick would raise that,
+and would need its own replay. The one-shot gives more room (5.4 against 3.4 GiB), but its regret
+per job reaches 3.18 GiB.
+
+`memory.current` is in `target` because the two files are read at different instants: a peak read
+before a burst could otherwise put the booking below live use. Then `target` can exceed the upper
+bound only when the job already uses more than its booking (the 324 discount's overrun). The `min`
+leaves the booking at today's value in that case; it is never raised above it.
 
 The tick reads no file while holding `queue.mu` (the rule stated at `sliceceiling.go:729`):
 1. Under the lock, snapshot `(waiter pointer, scopeID, grantedAt)` for the eligible leases.
@@ -158,8 +167,8 @@ booking is the existing `charge`.
 | With | Effect | Resolution if built |
 |---|---|---|
 | AIRA-324 enforce 0.9 (live) | The rule's cap is `pinChargeFor`, the discounted booking, so the two compose by `min` | None |
-| AIRA-354 | Two over-commits: caps could reach `L + over + lent`, where lent = Σ(cap - booking). 354's term 3 bounds bookings, not caps | Run both only if 354's `over` is reduced by the lent bytes (one more term in its helper). Without that, pick one. Live, "both" at k=1.10 admits 1.2 jobs per sample, against 0.4 and 0.3 for each alone (s3d, E) |
-| AIRA-350 lane (being built; `admit.go` untouched here) | A lease is "small" when its booking is at most y = 1 GiB. A larger job resized below that would become a small lease and use lane capacity (x = 8 GiB). Median at 5/1.5: 2 such leases, 1.72 GiB (s3c) | Chosen: never lower a lease whose pin is above y to y or below (floor `max(256 MiB, y + 1)` for those). No change to 350 |
+| AIRA-354 | Two over-commits: caps could reach `L + over + lent`, where lent = Σ(cap - booking). 354's term 3 bounds bookings, not caps | Run both only if 354's `over` is reduced by the lent bytes (one more term in its helper). Without that, pick one. Live, "both" at k=1.10 admits 1.2 jobs per sample, against 0.3 for each alone (one-shot 15/1.5; s3d, E) |
+| AIRA-350 lane (being built; `admit.go` untouched here) | A lease is "small" when its booking is at most y = 1 GiB. A larger job resized below that would become a small lease and use lane capacity (x = 8 GiB). Without the rule, 2 such leases (1.72 GiB) at the median instant at 5/1.5; with it, 0 by construction (s3c) | Chosen: never lower a lease whose pin is above y to y or below (floor `max(256 MiB, y + 1)` for those). No change to 350 |
 | `--resize` (AIRA-312) | The ratchet overrides a hand resize at the next tick for jobs past t0 | Keep hand resize only for jobs younger than t0, or delete it (section 8) |
 | Restart / reconnect | Section 4. After a restart the ledger can sit above the ceiling by the lent amount, and admissions wait for releases. That is today's signed behaviour (`checkedAvailable`, `admit.go:2906-2922`) | None |
 | OOM steering (`admitScopeBudgets`, `oomsteer.go:466`) | It reads the booking, so a resized job that overruns becomes the preferred victim. Steering is off on this box | State it in the skill text |
@@ -171,10 +180,10 @@ booking is the existing `charge`.
 - **I1 Ledger only.** The rule writes no `memory.max`, so it cannot OOM-kill a job by itself.
   Under slice pressure, a job that has grown past its lowered booking is more exposed. If steering
   is on it is the victim, and lent bytes can bring the slice to pressure in the first place.
-- **I2 Bounds when written:** `max(256 MiB, memory.current read in this tick) <= booking <=
-  pinChargeFor(discountable, reserve)`. The current-use term is the `--resize` floor. The tick
-  re-reads `memory.current` beside `memory.peak` because a stale peak could otherwise put the
-  booking below live use.
+- **I2 Bounds when written:** `max(floor, memory.current read in this tick) <= booking <=
+  pinChargeFor(discountable, reserve)`. The current-use term is the `--resize` floor. A job
+  already using more than its upper bound (the 324 overrun) is not lowered, and its booking stays
+  at today's value.
 - **I3 Derived, not incremented:** `outstanding = Σ ledgerCharge`, through `rederiveLedgerLocked`.
 - **I4 Exposure bound: Σ caps of running jobs <= slice `memory.max - headroom`.** A check at
   shrink time cannot hold this, because a later grant can break it and the headroom moves. It must
@@ -188,7 +197,7 @@ booking is the existing `charge`.
 **Host exposure per freed GiB is the same as 354's.** Neither rule touches memory.max, and the
 worst case for either is every lent byte used at once. They differ in whose bytes are lent:
 - Auto-resize lends bytes a job has not touched since its grant, and takes them back within one
-  tick when the job grows (4.9% of jobs, up to 0.61 GiB).
+  tick when the job grows (4.2% of jobs, up to 0.55 GiB).
 - 354 lends a fixed fraction of the ceiling, backed by real free memory (its term 2).
 
 ## 7. Tests, each with the wrong implementation it catches
