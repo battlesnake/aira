@@ -1,0 +1,73 @@
+## A. Live hour: 180 samples
+freeze_phase counts: hold 171, idle 7, pushed 2
+first queued row's reserve GiB: p10 1.00 p50 4.00 p90 4.00 max 8.00
+10-min block 1: queued p50 8, jobs p50 27, MemAvailable p50 42.6 GiB
+10-min block 2: queued p50 10, jobs p50 30, MemAvailable p50 40.8 GiB
+10-min block 3: queued p50 21, jobs p50 32, MemAvailable p50 40.2 GiB
+10-min block 4: queued p50 11, jobs p50 27, MemAvailable p50 42.3 GiB
+10-min block 5: queued p50 16, jobs p50 30, MemAvailable p50 42.8 GiB
+10-min block 6: queued p50 19, jobs p50 30, MemAvailable p50 40.4 GiB
+use / full booking by class (scope memory.current incl. cache over pin or reserve), per sample:
+  other  booking p50 18.03 GiB; use/booking p50 0.373 max 0.501
+  pinned booking p50 14.12 GiB; use/booking p50 0.387 max 0.648
+  worker booking p50 11.00 GiB; use/booking p50 0.412 max 0.615
+share of full bookings discounted, pins: p50 0.31 min 0.05 max 0.66
+share of full bookings discounted, every non-worker scope: p50 0.77 min 0.60 max 1.00
+ledger relief against the full-pin ledger, GiB:
+  track 1 (pins at 0.9)            p50 1.41 max 3.24
+  0.9 on every non-worker scope    p50 3.50 max 4.88
+  k = 1/0.9 extra                  p50 4.95 max 5.19
+queued jobs admitted at one instant beyond what was granted (CPU-capped):
+  track 1 as deployed (queued rows at full)  fifo   p50 0 mean 0.00 max 0, none in 180 of 180
+  track 1 as deployed (queued rows at full)  budget p50 0 mean 0.38 max 3, none in 121 of 180
+  track 1 as deployed (queued rows at full)  skip   p50 0 mean 0.39 max 3, none in 121 of 180
+  k=1.100 on the full-pin ledger             fifo   p50 0 mean 0.57 max 3, none in 107 of 180
+  k=1.100 on the full-pin ledger             budget p50 2 mean 1.57 max 5, none in 37 of 180
+  k=1.100 on the full-pin ledger             skip   p50 2 mean 1.64 max 7, none in 37 of 180
+  k=1.111 on the full-pin ledger             fifo   p50 1 mean 0.73 max 4, none in 90 of 180
+  k=1.111 on the full-pin ledger             budget p50 2 mean 1.74 max 7, none in 36 of 180
+  k=1.111 on the full-pin ledger             skip   p50 2 mean 1.83 max 7, none in 36 of 180
+  k=1.150 on the full-pin ledger             fifo   p50 1 mean 1.66 max 7, none in 44 of 180
+  k=1.150 on the full-pin ledger             budget p50 2 mean 2.17 max 7, none in 34 of 180
+  k=1.150 on the full-pin ledger             skip   p50 2 mean 2.23 max 7, none in 34 of 180
+  k=1.250 on the full-pin ledger             fifo   p50 2 mean 2.79 max 8, none in 34 of 180
+  k=1.250 on the full-pin ledger             budget p50 2 mean 2.92 max 8, none in 34 of 180
+  k=1.250 on the full-pin ledger             skip   p50 2 mean 2.94 max 8, none in 34 of 180
+  0.9 on every non-worker scope              fifo   p50 0 mean 0.47 max 3, none in 119 of 180
+  0.9 on every non-worker scope              budget p50 1 mean 1.51 max 7, none in 39 of 180
+  0.9 on every non-worker scope              skip   p50 2 mean 1.63 max 7, none in 39 of 180
+
+## B. Wait-hours (replay part-5 model, 29961 grid instants, 5961 jobs that waited, 213.7 wait-hours)
+RAM     fixed room 1.41 GiB (track 1 p50): removed 14.0 h (7%)
+RAM     fixed room 3.24 GiB (track 1 max): removed 41.5 h (19%)
+RAM     fixed room 3.50 GiB (0.9 non-worker p50): removed 45.7 h (21%)
+RAM     fixed room 4.88 GiB (0.9 non-worker max): removed 61.3 h (29%)
+RAM     0.9 on every non-worker scope, net of track 1 (paired p50 rooms): 31.7 h (15%)
+RAM     0.9 on every non-worker scope, net of track 1 (paired max rooms): 19.8 h (9%)
+RAM     0.9 on every non-worker scope, net of track 1 (crossed low rooms): 4.2 h (2%)
+RAM     0.9 on every non-worker scope, net of track 1 (crossed high rooms): 47.3 h (22%)
+RAM     k=1.100: removed 59.6 h; net of track 1 18.1 to 45.7 h (8% to 21%)
+RAM     k=1.111: removed 67.2 h; net of track 1 25.7 to 53.2 h (12% to 25%)
+RAM     k=1.150: removed 88.8 h; net of track 1 47.3 to 74.8 h (22% to 35%)
+RAM     k=1.250: removed 138.4 h; net of track 1 96.9 to 124.5 h (45% to 58%)
+RAM+CPU fixed room 1.41 GiB (track 1 p50): removed 10.5 h (5%)
+RAM+CPU fixed room 3.24 GiB (track 1 max): removed 27.9 h (13%)
+RAM+CPU fixed room 3.50 GiB (0.9 non-worker p50): removed 29.7 h (14%)
+RAM+CPU fixed room 4.88 GiB (0.9 non-worker max): removed 37.1 h (17%)
+RAM+CPU 0.9 on every non-worker scope, net of track 1 (paired p50 rooms): 19.2 h (9%)
+RAM+CPU 0.9 on every non-worker scope, net of track 1 (paired max rooms): 9.2 h (4%)
+RAM+CPU 0.9 on every non-worker scope, net of track 1 (crossed low rooms): 1.8 h (1%)
+RAM+CPU 0.9 on every non-worker scope, net of track 1 (crossed high rooms): 26.6 h (12%)
+RAM+CPU k=1.100: removed 36.7 h; net of track 1 8.8 to 26.2 h (4% to 12%)
+RAM+CPU k=1.111: removed 40.4 h; net of track 1 12.5 to 29.9 h (6% to 14%)
+RAM+CPU k=1.150: removed 50.4 h; net of track 1 22.5 to 39.9 h (11% to 19%)
+RAM+CPU k=1.250: removed 72.0 h; net of track 1 44.2 to 61.6 h (21% to 29%)
+
+## C. Store rows (started_at_ms, wait_ms, wall_ms) around the 0.9 trial, 7.48 h windows
+before visible jobs 1079, waited >= 1 s 795, wait-hours 34.8 (mean 116.2 s), run-hours 41.8
+trial  visible jobs 593, waited >= 1 s 371, wait-hours 15.1 (mean 91.8 s), run-hours 29.3
+after  visible jobs 1013, waited >= 1 s 539, wait-hours 20.6 (mean 73.3 s), run-hours 42.2
+timeline rows by budget basis (started_at_ms and wall_ms present):
+  cap:operator:--memory-reserve      7091
+  cap:auto:daemon-reserve            5396
+  cap:operator:--memory-max          37

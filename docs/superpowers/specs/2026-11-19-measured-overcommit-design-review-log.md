@@ -107,12 +107,133 @@ by round count.
 | P2 Observe cannot measure yield | Yes | Same rate-limit rule. The 168 h minimum of 29.44 GiB is from replay §1 |
 | P2 Safety argument lacks a probability bound | Yes, with one correction | The cited `watchdog.go:184-189` is the run loop's disable path; the victim policy is `watchdog.go:813-818`. The prior decision is `sliceceiling.go:80-84` and `319-325` |
 
+## Round 2 (plan review, two reviewers, 11 findings; plan-fix 2026-11-19)
+
+Every finding was checked against the code or re-derived before it was taken. The reviewers'
+probe scripts (`~/tmp/aira-354-review2/`, `~/tmp/aira-354-review-r2/`) were re-run unchanged on
+the frozen inputs (exit 0). Every figure they quoted reproduced exactly. The figures the memo
+now cites are produced by the committed `docs/dev/aira-354-overcommit-round2.py`: selftest 8
+checks, exit 0; run exit 0, peak about 95 MiB under a 256 MiB reservation, no hint.
+
+### Findings, verification and disposition
+
+| # | Finding (severity, summary) | Verified against | Disposition |
+|---|---|---|---|
+| 1 | P2 Option (c) promises containment without establishing it | `paths.go:67` (2 s), `watchdog.go:27` (debounce 3), `:304`, `:28` (5 s grace) | Taken. (c) is labelled unproven; its spec must give the reaction-time and reclamation bounds (memo 4, 7) |
+| 2 | P2 Bootstrap scenarios do not bracket risk from above | replay script line 263 (independent redraw per job), the docstring LIMITS | Taken. The models are conditional scenarios and the bracketing sentence is deleted (memo 3.1) |
+| 3 | P2 "Zero yield" does not follow from a median of zero | replay §6 rows; `admit.go:2687-2699` | Taken. AC2 is unestablished; the collapse rests on AC1 alone (memo 0, 1) |
+| 4 | P2 Deleting AIRA-324 also removes resize accounting | `admit.go:160-164` (two writers of `charge`), `confine_resize.go:121-128` | Taken. `charge` stays in every option (memo 7 item 1). Moot for (a'), which deletes nothing in the daemon's booking path |
+| 5 | P1 The fork omits 0.9 on every job; two safety standards | gate report lines 264-275 and 401-405; `sliceceiling.go:76-84`, `319-325` (the refusal concerns the throttle's target state, not a worst case) | Taken as a design change: one standard (C1's line) and option (a'). Partly corrected: see "Corrections" |
+| 6 | P1 AC2 measured as a stock at one instant | probe re-run: `hold` 171 of 180; first queued row p50 4.00 GiB; the deployed ledger reads FIFO 0 in 180 of 180; wait-hour rows reproduced | Taken. One unit (wait-hours net of track 1) is primary and instant counts are secondary (memo 3.2). The thresholds are in wait-hours (memo 6) |
+| 7 | P2 The watchdog's action in the 8 GiB to 0 band is misstated | `watchdog.go:26`, `343-347`, `356-376`, `388-392`; `internal/install/assets/oomd/` | Taken. The band consequences come from the code, and the oomd/kernel ordering is marked unevaluated (memo 3.1). Corrected detail: see below |
+| 8 | P2 (c)'s risk cell is wrong | gate report lines 406-415 (OOM steering off, open P2) | Taken. The new failure class (an in-cap job killed for others' growth) is named, with a stable code required (memo 4) |
+| 9 | P2 The recommendation hides what remains with track 1 on | trend re-run (10-minute medians 8, 10, 21, 11, 16, 19); unit environment read (`enforce`, `0.9`); this plan-fix's own 45 s wait | Taken. A "still seen; who owns it" column (memo 4) and memo 3.3 |
+| 10 | P1 AC2 uses only the lower bracket | `budget.py` re-run: k = 1.10 head budget p50 2, mean 1.57, max 5, none 37 of 180 | Taken. All three brackets are shown for every row (memo 3.2) |
+| 11 | P1 The simplest risk-neutral option is missing | same as 5, plus `pins.py` re-run (pinned share 0.321) | Merged with 5. The deletion list is corrected below |
+
+### Corrections to the findings
+
+- **"Built by deleting the `discountable` predicate (client flag and wire field)"** (5, 11) is
+  partly wrong. The flag must stay, because only the client knows that the workload is inside
+  the scope, that the job is not a `--delegate-ram` parent, and that it is not exclusive
+  (`confine_linux.go:2018-2024`). The change narrows the client predicate: it removes the
+  pinned, operator-source and env-pin conjuncts and requires no `--memory-max`. It also deletes
+  the daemon's `discountable requires pinned` refusal (`admit.go:3543-3544`). The memo marks the
+  build as small. It does not claim a net deletion.
+- **Finding 11's deletion list**
+  - **`charge`.** It includes the per-waiter `charge`, which is wrong by finding 4.
+  - **Head eligibility.** "The AIRA-324 head-eligibility special case (`admit.go:2838-2844`)"
+    is a comment. The code tests `waiter.reserve` (`admit.go:2843-2846`), which is right for
+    every waiter, so there is nothing to delete.
+  - **Physical fit.** "The physical-fit rule must then apply to every job": it applies to every
+    *discounted* waiter. For an undiscounted waiter it is implied by the ledger check
+    (`admit.go:2656-2658`).
+- **Two variants were blended** (5, 11; the advisor flagged it). k = 1/0.9 on the whole ledger
+  includes aitest workers: relief p50 4.95 GiB. AIRA-324 widened keeps workers on their own
+  path (`worker_admit.go:455`): relief p50 3.50 GiB, an upper figure. The memo offers the
+  second as (a') and quotes each variant's own figures.
+- **"Jobs with history-sized reserves sit nearer their caps"** (11, caveat) is not shown in
+  aggregate.
+  - **Live hour:** non-pinned, non-worker scopes used a median 0.373 of their bookings (max
+    0.501), against 0.387 (max 0.648) for pins (round 2 §A).
+  - **History-charge spec section 2:** 20-job sums reach p99 0.51 for auto-sized jobs, against
+    0.61 for pins.
+  - **Per job:** non-pinned p99 1.00, against 0.97 for pins (`memory.current`, cache included).
+  - The owner decision is still needed, because C1 named discounted pins.
+  - "Other" is not "auto-sized": it also holds `--memory-max` jobs, `--delegate-ram` parents
+    and pins re-declared at full after the 00:10 restart (the advisor flagged this).
+- **"Above zero up to about k = 1.20"** (7) is right at L = 49.19 GiB. At the box's highest L,
+  60.4 GiB, exhaustion is reachable from about k = 1.17 (10.06 / 60.4). The memo gives both.
+- **The 7,091 rows** (6) are timeline rows, those with `started_at_ms` and `wall_ms`. All
+  retained `cap:operator:--memory-reserve` rows number 111,713.
+- **Found during this fix:** round 1's margin table mixed two definitions. Its 83-hour column
+  divided 1/k by 0.521 (0.909 / 0.521 = 1.74), while its live column divided r* by 0.441
+  (0.949 / 0.441 = 2.15). The memo keeps only r* against the live maximum.
+- **This plan-fix's own error, caught by the advisor:** the first before/after query used trial
+  epochs 26 h late (2026-11-17 18:36 UTC). It was re-run with 1794846960 to 1794873900. The
+  corrected figures are round 2 §C: wait-hours 34.8, 15.1 and 20.6 over 1,079, 593 and 1,013
+  jobs. The load differs, so they are not evidence.
+
+### New measurements (round 2 §A to §C; estimates unless stated)
+
+- **0.9 on every non-worker scope**
+  - Ledger relief against full pins: p50 3.50 GiB, max 4.88 (track 1: 1.41, 3.24).
+  - Share of full bookings discounted: p50 0.77, min 0.60, max 1.00 (pins: 0.31, 0.05, 0.66).
+  - Instant extra queued jobs: FIFO mean 0.47, head budget 1.51, skip 1.63.
+  - Wait-hours net of track 1, RAM + CPU: 9.2 to 19.2 h paired (4 to 9%), 1.8 to 26.6 h
+    crossed.
+- **Head-budget rows:** k = 1/0.9 mean 1.74; k = 1.15, 2.17; k = 1.25, 2.92.
+- **Track 1 as deployed**, the same instant metric: FIFO 0 in 180 of 180; head budget mean 0.38.
+
+### Root-cause groups (design fix first)
+
+| Group | Findings | Closed by a design change (what it deletes), or needs text or code |
+|---|---|---|
+| R1. Two safety standards: factors were judged by "the worst case must not enter the watchdog band", while track 1, already accepted, sits in that band | 5, 11, 7, 8 | **Design change:** one standard, C1's line, with the owner's question about its population. Deleted: the "recorded no" argument, the "Nothing contains its worst case" framing, (b) as a separate mechanism (now (a') at a lower factor), and (c) as the recommended route |
+| R2. Yield as a stock at one instant, quoted at the lower bracket | 3, 6, 10 | **Design change:** one unit, wait-hours net of what is deployed, with brackets and labelled as an estimate. Deleted: the AC2 collapse trigger and every "zero" or "nothing at 1.10" claim. The measurement moves to the store (memo 6) |
+| R3. Evidence-strength overclaims | 1, 2 | Text. Deleted rather than reworded: the bracketing sentence and the containment promise |
+| R4. Incomplete deletion prescription | 4 | Text. `charge` stays in every option |
+| R5. Owner-facing completeness | 9 | Text. A "still seen; who owns it" column |
+
+### Non-convergence check (the rule in the global and repo guides)
+
+- **Fix-induced:** 10 of 11 findings land on text that round 1 added. That text is option (c),
+  the "recorded no" bullet, the bracketing sentence, the section 6 deletion list, the FIFO-only
+  headline and the fork without a 0.9 row. Finding 7 is partly carried from round 0 (its line
+  292, "its victim would be an agent session").
+- **Rounds with a blocker:** rounds 1 and 2, two in a row.
+- **The "closed, then the same class again" trigger** fired for three families:
+  - yield baseline (round 1 G2, then R2);
+  - the one-mechanism deletion (round 1 G3, then 4, 5 and 11);
+  - containment (round 1 G1, then 1 and 8).
+- **Verdict:** instance-fixing is stopped. The problem was restated as "the queue waits while
+  the host has 37 GiB free". The base design that makes the three families impossible is no new
+  mechanism (AIRA-324 is the greenfield minimum), one safety standard, and one yield unit. It
+  removes the claims instead of hardening them.
+- **The independent check of that base design** is the next plan-review round, not this
+  builder. A round-3 blocker in any of these families reaches the three-round threshold: take
+  it to the owner rather than into another fix.
+
+### Advisor
+
+One call, before writing. It changed the following:
+- the recommendation is conditional on the owner's question, and AC1 is stated as unestablished
+  for (a');
+- one variant per fork row;
+- "today's mix" worst cases are given beside the named bound;
+- the epoch error above;
+- "other" is labelled as not auto-sized;
+- one pairing rule for the wait-hour rows;
+- the stale stock-unit text in sections 0, 2, 3.1 and 5 and in the ticket is removed.
+
 ## Open for the owner
 
-- The fork in memo section 4: (a) stop at track 1 (recommended), (b) 1.25 on every job,
-  replacing AIRA-324, with the worst case accepted by name, or (c) containment first, as its own
-  ticket.
-- Whether to run the 48 h no-build sample (memo section 5) before choosing.
+- **The question** (memo section 4): does C1's acceptance cover every confined job whose cap is
+  its reserve, not only pins?
+  - Yes: build (a').
+  - No: (a) stands.
+- **Whether to measure AC2 first**, on matched-load hours from the store (memo section 6),
+  before answering.
 
 ## Note on attribution
 
