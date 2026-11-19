@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# AIRA-355: the wrapper `make ci` runs its steps through.
+#
+#   ci-pass run <origin of the GO make variable> <command...>
+#
+# Runs <command...> (the sub-make that runs every `ci` step) and exits with its
+# status. After a successful run it records a pass marker for HEAD's tree (see
+# common.sh) only when ALL of the following hold, and otherwise writes nothing:
+#
+#   - the worktree was clean before the run and is clean after it, with the
+#     same HEAD tree both times (a tree edited, committed or checked out
+#     mid-run proves nothing);
+#   - make ran without a flag that stops recipes running or ignores their
+#     errors (-n, -t, -q, -i, ...): only k, s, w and the jobserver/output-sync
+#     options are accepted, anything unrecognised refuses the record;
+#   - GOFLAGS is empty (`go env GOFLAGS`), so go test ran everything;
+#   - no command-line variable override (`make ci GO=true` would pass
+#     every step without running one) and GO comes from the Makefile itself.
+#
+# Recording is best-effort: a failure to record is reported and never changes
+# the exit status. A marker is never written on any failure path.
+set -uo pipefail
+
+# shellcheck source=common.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
+
+# ci_pass_makeflags_ok succeeds only when MAKEFLAGS (the flags make handed this
+# recipe) holds nothing but harmless options. The first word, when it does not
+# start with '-', is the set of single-letter flags.
+ci_pass_makeflags_ok() {
+	local -a words
+	local word i
+	read -r -a words <<<"${MAKEFLAGS-}" || true
+	for i in "${!words[@]}"; do
+		word="${words[$i]}"
+		if [ "$i" -eq 0 ]; then
+			case "$word" in
+			-*) ;;
+			*[!ksw]*) return 1 ;;
+			*) continue ;;
+			esac
+		fi
+		case "$word" in
+		-j | -j[0-9]* | --jobserver-auth=?* | --jobserver-fds=?* | --no-print-directory | -O* | --output-sync=*) ;;
+		*) return 1 ;;
+		esac
+	done
+}
+
+if [ "${1-}" != run ] || [ "$#" -lt 3 ]; then
+	printf 'usage: ci-pass run <origin of GO> <command...>\n' >&2
+	exit 2
+fi
+go_origin="$2"
+shift 2
+root="$PWD"
+
+before=""
+why="the make invocation carries flags or variable overrides"
+if [ "$go_origin" = file ] && ci_pass_makeflags_ok; then
+	# GOFLAGS (environment or `go env -w`) can turn `go test` into a no-op
+	# (-run='^$') or a subset; neither make's flags nor GO's origin show it.
+	if goflags="$(go env GOFLAGS 2>/dev/null)" && [ -z "$goflags" ]; then
+		why="the worktree is not clean"
+		before="$(aira_ci_pass_clean_tree "$root")" || before=""
+	else
+		why="GOFLAGS is set or unreadable"
+	fi
+fi
+
+# The steps run with make's inherited flags and variable overrides removed: the
+# outer `make` (and any `MAKE=...`, `-i`, `CI_STEPS=` the caller gave it) cannot
+# reach them, so a recorded pass means the canonical steps themselves ran.
+env -u MAKEFLAGS -u MAKEOVERRIDES -u MFLAGS "$@"
+status=$?
+if [ "$status" -ne 0 ]; then
+	exit "$status"
+fi
+
+if [ -z "$before" ]; then
+	printf 'ci: passed; no pass recorded because %s (AIRA-355).\n' "$why"
+	exit 0
+fi
+after="$(aira_ci_pass_clean_tree "$root")" || after=""
+if [ "$after" != "$before" ]; then
+	printf 'ci: passed; no pass recorded because the worktree changed during the run (AIRA-355).\n'
+	exit 0
+fi
+if aira_ci_pass_record "$root" "$before"; then
+	printf 'ci: recorded a make ci pass for tree %s on this machine (AIRA-355).\n' "$before"
+else
+	printf 'ci: passed; recording the pass for tree %s failed (AIRA-355).\n' "$before" >&2
+fi
+exit 0
