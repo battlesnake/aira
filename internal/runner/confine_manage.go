@@ -328,7 +328,16 @@ type ConfineRecord struct {
 	// otherwise. Every queued row from a daemon that knows priority carries it, so
 	// misuse of `high` is observable; empty on a live (Scopes) row, where queue
 	// order no longer means anything, and on a row from an older daemon.
-	Priority          string   `json:"priority,omitempty"`
+	Priority string `json:"priority,omitempty"`
+	// AIRA-350, only while the small-job lane is on. Small marks a LIVE (Scopes)
+	// row the lane counts as a small lease (a job-level lease booking at most the
+	// lane's job maximum, however it was granted). LaneWait and HeldByHead are a
+	// QUEUED row's last-pass diagnoses: why the lane did not grant it ("full",
+	// "kept", "pushed", "no-room"; empty when the lane did not refuse it), and
+	// whether today's head rule held back a job that fits. Diagnosis only.
+	Small             bool     `json:"small,omitempty"`
+	LaneWait          string   `json:"lane_wait,omitempty"`
+	HeldByHead        bool     `json:"held_by_head,omitempty"`
 	UnevaluatedFields []string `json:"unevaluated_fields,omitempty"`
 }
 
@@ -394,6 +403,16 @@ const ConfineReserveFacet = "reserve"
 // covers: AIRA-192
 func ApplyConfineScopeReserves(scopes []ConfineRecord, reserves map[string]int64) {
 	applyConfineScopeCharge(scopes, reserves, ConfineReserveFacet, func(record *ConfineRecord) **int64 { return &record.ReserveBytes })
+}
+
+// ApplyConfineScopeSmall marks Small (AIRA-350) on the scopes the daemon's
+// locked snapshot classed as small leases, matched by scope id.
+func ApplyConfineScopeSmall(scopes []ConfineRecord, small map[string]bool) {
+	for index := range scopes {
+		if scopes[index].ScopeID != "" && small[scopes[index].ScopeID] {
+			scopes[index].Small = true
+		}
+	}
 }
 
 // ApplyConfineScopePins stamps PinBytes (AIRA-324) for the scopes the daemon's
@@ -661,6 +680,22 @@ type ConfineSliceReserve struct {
 	// nothing rather than a fabricated figure. `aira confine --list` passes no
 	// scope id, so its output is unchanged.
 	ResolvedReserveBytes int64 `json:"resolved_reserve_bytes,omitempty"`
+
+	// AIRA-350. The small-job lane, present only while it is on (every field
+	// omitted otherwise, so a daemon with the lane off adds nothing to the wire).
+	// LaneCapacityBytes is x, LaneJobMaxBytes y; LaneUsedBytes is S, the small
+	// leases' summed bookings, and LaneJobs their count, from the same locked
+	// pass as GrantedBytes and meaningful only when GrantedEstablished is.
+	// LaneUsedBytes can exceed LaneCapacityBytes (main grants of small jobs, a
+	// resize, a daemon restart re-booking pins); the lane is then shut until it
+	// falls. LaneWait and HeldByHead are the AIRA-24 probe's own waiter's
+	// last-pass diagnoses (see ConfineRecord). Diagnosis only.
+	LaneCapacityBytes int64  `json:"lane_capacity_bytes,omitempty"`
+	LaneJobMaxBytes   int64  `json:"lane_job_max_bytes,omitempty"`
+	LaneUsedBytes     int64  `json:"lane_used_bytes,omitempty"`
+	LaneJobs          int    `json:"lane_jobs,omitempty"`
+	LaneWait          string `json:"lane_wait,omitempty"`
+	HeldByHead        bool   `json:"held_by_head,omitempty"`
 
 	// AIRA-68. Jobs and GrantedBytes above are TOTALS over two structurally
 	// different populations, and only one of them can ever appear as a row in the

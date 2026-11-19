@@ -42,6 +42,10 @@ type ConfineQueuedEntry struct {
 	Pushed bool
 	// High is whether the job was launched with `--priority high` (AIRA-340).
 	High bool
+	// LaneWait and HeldByHead are the small-job lane's last-pass diagnoses
+	// (AIRA-350), set only while the lane is on.
+	LaneWait   string
+	HeldByHead bool
 }
 
 // queuedConfineRecord builds the facets of a queued row that need no live read,
@@ -71,6 +75,7 @@ func queuedConfineRecord(entry ConfineQueuedEntry, now time.Time) (ConfineRecord
 		Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid,
 		Worker:       IsAitestWorkerScopeName(name), // classified exactly as a live row is
 		ReserveBytes: &reserve, VRAMBytes: &vram, Pushed: entry.Pushed,
+		LaneWait: entry.LaneWait, HeldByHead: entry.HeldByHead,
 		Priority:          ConfinePriorityNormal,
 		UnevaluatedFields: []string{"populated", "rss", "cap", "cpu", "supervisor_live"},
 	}

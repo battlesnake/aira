@@ -282,7 +282,7 @@ func TestReexecDoesNotForwardUngivenDaemonModes(t *testing.T) {
 }
 
 func TestRenderDaemonUnitIsManagedBoundedAndIndependent(t *testing.T) {
-	unit, err := renderDaemonUnit("test-daemon.service", "/opt/aira bin", "/var/lib/aira state", "observe", 2*time.Second, "observe", "observe", "0.8", "")
+	unit, err := renderDaemonUnit("test-daemon.service", "/opt/aira bin", "/var/lib/aira state", "observe", 2*time.Second, "observe", "observe", "0.8", "8G", "1G", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +562,7 @@ func TestInstallPinChargeModeAndFactor(t *testing.T) {
 			t.Fatalf("re-exec argv %q drops %q", args, want)
 		}
 	}
-	if _, err := renderDaemonUnit("d.service", "/opt/aira", "/var/lib/aira", "observe", 2*time.Second, "observe", "observe", "0.855", ""); err == nil {
+	if _, err := renderDaemonUnit("d.service", "/opt/aira", "/var/lib/aira", "observe", 2*time.Second, "observe", "observe", "0.855", "8G", "1G", ""); err == nil {
 		t.Fatal("rendered a unit with an invalid factor")
 	}
 }

@@ -1036,7 +1036,7 @@ func parseInstallDescriptorArgs(argv []string) ([]string, map[string]string, err
 			if hasValue {
 				options[name] = value
 			}
-		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling", "cpu-slots-per-core", "pin-charge", "pin-charge-factor":
+		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling", "cpu-slots-per-core", "pin-charge", "pin-charge-factor", "small-lane", "small-lane-job-max":
 			if !hasValue {
 				if i+1 >= len(argv) || strings.HasPrefix(argv[i+1], "--") {
 					return nil, nil, fmt.Errorf("E_INSTALL_ARGUMENT_INVALID: option --%s requires a value", name)
@@ -3715,11 +3715,16 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 		if record.Worker {
 			name += " (worker)"
 		}
+		// AIRA-350: a small lease (lane on) is marked beside its reserve.
+		reserve := confineNum(record.ReserveBytes)
+		if record.Small {
+			reserve += " small"
+		}
 		_, _ = fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			name, record.Owner, confineNum(record.SupervisorPID), record.ScopeID,
 			confineLiveStatus(record),
 			confineNum(record.Populated), confineNum(record.RSSBytes), confineNum(record.PeakRSS), confineAge(record.AgeSeconds),
-			confineNum(record.ReserveBytes), confineString(record.Cap))
+			reserve, confineString(record.Cap))
 	}
 	if err := table.Flush(); err != nil {
 		return codes.ExitForCode("E_RUN_DETACH_FAILED")
@@ -3776,6 +3781,10 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 			}
 			_, _ = fmt.Fprintf(stdout, "slice queue: %d queued %s, freeze %s%s\n",
 				result.SliceReserve.Queued, waiterLabel, result.SliceReserve.FreezePhase, note)
+		}
+		// AIRA-350. The small-job lane, only while it is on.
+		if line := renderSmallLaneLine(result.SliceReserve); line != "" {
+			_, _ = fmt.Fprintln(stdout, line)
 		}
 		// AIRA-101. Why a job is waiting when the slice looks far from full: a
 		// benchmark has asked to run alone. Printed UNCONDITIONALLY, including the
@@ -4168,6 +4177,26 @@ func confinePlural(count int, singular, plural string) string {
 		return singular
 	}
 	return plural
+}
+
+// renderSmallLaneLine is the `confine --list` line for the small-job lane
+// (AIRA-350), "" while it is off. Its booked figure is the ledger's, so it is
+// stated only when the ledger is established (AIRA-220), else unevaluated.
+func renderSmallLaneLine(reserve *runner.ConfineSliceReserve) string {
+	if reserve == nil || reserve.LaneCapacityBytes <= 0 {
+		return ""
+	}
+	tail := fmt.Sprintf(" (jobs booking at most %s go first)", runner.FormatConfineBytes(reserve.LaneJobMaxBytes))
+	if !reserve.GrantedEstablished {
+		return fmt.Sprintf("small-job lane: unevaluated of %s booked%s", runner.FormatConfineBytes(reserve.LaneCapacityBytes), tail)
+	}
+	jobs := "jobs"
+	if reserve.LaneJobs == 1 {
+		jobs = "job"
+	}
+	return fmt.Sprintf("small-job lane: %.1fG of %s booked by %d %s%s",
+		float64(reserve.LaneUsedBytes)/float64(int64(1)<<30), runner.FormatConfineBytes(reserve.LaneCapacityBytes),
+		reserve.LaneJobs, jobs, tail)
 }
 
 // formatReserveBytes renders a KNOWN reserve/ceiling byte count. Unlike

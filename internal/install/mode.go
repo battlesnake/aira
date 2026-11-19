@@ -319,6 +319,7 @@ func shimDaemonEnvironment(d installDeps, record runner.InstallModeRecord) []str
 		"AIRA_DAEMON_SLICE_CEILING_MODE=off",
 		"AIRA_DAEMON_OOM_STEER_MODE=off",
 		"AIRA_DAEMON_PIN_CHARGE_MODE=off",
+		"AIRA_DAEMON_SMALL_LANE=off",
 	}
 	for _, name := range []string{"XDG_STATE_HOME", "XDG_RUNTIME_DIR", "AIRA_INSTALL_MODE_FILE"} {
 		if value := strings.TrimSpace(d.getenv(name)); value != "" {

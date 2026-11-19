@@ -28,6 +28,12 @@ type confineQueuePosition struct {
 	position   int
 	queued     int
 	aheadBytes int64
+	// AIRA-350. The small-job lane's last-pass diagnoses of THIS waiter, from the
+	// same probe reply: heldByHead (a fit the head rule held back) and laneWait
+	// (why the lane did not grant it). Empty when the lane is off or the daemon
+	// predates it.
+	laneWait   string
+	heldByHead bool
 	// AIRA-101. WHY this job is waiting, when the reason is not ordinary
 	// contention: a benchmark has asked for the slice to itself. Empty when no
 	// exclusivity is active — established by the daemon in the same locked pass as
@@ -214,8 +220,29 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// early it is evaluated, and it would hold every smaller job behind it), so the
 	// front command is withheld for it.
 	pushable := position.ceilingBytes <= 0 || position.resolvedReserve <= position.ceilingBytes
-	return fmt.Sprintf(", %d of %d queued", position.position, position.queued) +
+	return fmt.Sprintf(", %d of %d queued", position.position, position.queued) + confineLaneNote(position) +
 		confineHeldNote(position) + pressure + confineOwnReserveNote(position, clientReserve) + exclusiveNote, pushable
+}
+
+// confineLaneNote is the ONE small-job lane clause (AIRA-350): held behind the
+// head first (a fit the head rule refused), else why the lane did not take the
+// job. Nothing when the lane is off, did not refuse it, or the daemon predates
+// it.
+func confineLaneNote(position confineQueuePosition) string {
+	if position.heldByHead {
+		return ", fits but held behind the head of the queue"
+	}
+	switch position.laneWait {
+	case "full":
+		return ", small-job lane full"
+	case "kept":
+		return ", small-job lane kept back so a larger job ahead can fit"
+	case "pushed":
+		return ", small-job lane closed behind a pushed job"
+	case "no-room":
+		return ", no room or CPU slot in the slice"
+	}
+	return ""
 }
 
 // confineHeldNote states what the ADMITTED jobs hold, against the ceiling one
@@ -462,6 +489,7 @@ func confineQueuePositionFromDaemon(ctx context.Context, request ConfineRequest,
 		exclusive.resolvedReserve = reserve.ResolvedReserveBytes
 	}
 	exclusive.position, exclusive.queued, exclusive.aheadBytes = reserve.QueuePosition, queued, ahead
+	exclusive.laneWait, exclusive.heldByHead = reserve.LaneWait, reserve.HeldByHead
 	return exclusive, true
 }
 

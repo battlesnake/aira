@@ -61,6 +61,11 @@ const (
 	// install selects it. The daemon's own env default stays off.
 	defaultPinChargeMode   = "observe"
 	defaultPinChargeFactor = "0.8"
+	// AIRA-350. The small-job lane ships INSTALLED on, 8G for jobs booking at
+	// most 1G (runner.SmallLaneInstallDefault). The daemon's own env default is
+	// off, and a CI (ci-shim) install renders off (shimDaemonEnvironment).
+	defaultSmallLane       = runner.SmallLaneInstallDefault
+	defaultSmallLaneJobMax = runner.SmallLaneJobMaxInstallDefault
 
 	// minimumCeilingGiB is the MemoryMax floor validateSize enforces. Named so
 	// that --ci, which must refuse a snapshot it cannot express, refers to the
@@ -110,6 +115,8 @@ var (
 	installedSliceCeilingModeRE = installedEnvironmentRE("AIRA_DAEMON_SLICE_CEILING_MODE")
 	installedPinChargeModeRE    = installedEnvironmentRE("AIRA_DAEMON_PIN_CHARGE_MODE")
 	installedPinChargeFactorRE  = installedEnvironmentRE("AIRA_DAEMON_PIN_CHARGE_FACTOR")
+	installedSmallLaneRE        = installedEnvironmentRE("AIRA_DAEMON_SMALL_LANE")
+	installedSmallLaneJobMaxRE  = installedEnvironmentRE("AIRA_DAEMON_SMALL_LANE_JOB_MAX")
 )
 
 const procInotifyMaxUserInstances = "/proc/sys/fs/inotify/max_user_instances"
@@ -156,6 +163,10 @@ type installOpts struct {
 	// installed unit declares (the AIRA-106 rule), else the ship default.
 	pinCharge       string
 	pinChargeFactor string
+	// AIRA-350. smallLane is --small-lane SIZE|off and smallLaneJobMax
+	// --small-lane-job-max SIZE; "" means NOT GIVEN, on the pin-charge rule.
+	smallLane       string
+	smallLaneJobMax string
 
 	// AIRA-120. --ci: size the slice's STATIC ceiling to MemAvailable as measured
 	// once, right now, with ZERO headroom subtracted, for a box dedicated entirely
@@ -217,6 +228,8 @@ func (o installOpts) watchdogIntervalGiven() bool { return o.watchdogInterval !=
 func (o installOpts) sliceCeilingGiven() bool     { return o.sliceCeiling != "" }
 func (o installOpts) pinChargeGiven() bool        { return o.pinCharge != "" }
 func (o installOpts) pinChargeFactorGiven() bool  { return o.pinChargeFactor != "" }
+func (o installOpts) smallLaneGiven() bool        { return o.smallLane != "" }
+func (o installOpts) smallLaneJobMaxGiven() bool  { return o.smallLaneJobMax != "" }
 
 type installTarget struct {
 	uid      int
@@ -468,7 +481,7 @@ func parseInstallArgs(args []string) (installOpts, error) {
 				return opts, argumentInvalid("--stage must be build or start")
 			}
 			opts.stage = value
-		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling", "cpu-slots-per-core", "pin-charge", "pin-charge-factor":
+		case "memory-max", "memory-high", "watchdog", "watchdog-interval", "slice-ceiling", "cpu-slots-per-core", "pin-charge", "pin-charge-factor", "small-lane", "small-lane-job-max":
 			if !hasValue {
 				if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 					return opts, argumentInvalid(fmt.Sprintf("option --%s requires a value", name))
@@ -476,7 +489,9 @@ func parseInstallArgs(args []string) (installOpts, error) {
 				i++
 				value = args[i]
 			}
-			if value == "" {
+			// strings.TrimSpace: a whitespace-only value is no value. Several
+			// parsers below trim, so " " would otherwise read as "not given".
+			if strings.TrimSpace(value) == "" {
 				return opts, argumentInvalid(fmt.Sprintf("option --%s requires a value", name))
 			}
 			switch name {
@@ -490,6 +505,18 @@ func parseInstallArgs(args []string) (installOpts, error) {
 					return opts, argumentInvalid(fmt.Sprintf("--pin-charge-factor must be a decimal from 0.5 to 1 with at most two places, such as 0.8, got %q", value))
 				}
 				opts.pinChargeFactor = strings.TrimSpace(value)
+			case "small-lane":
+				// AIRA-350. The pair is checked together once both are resolved
+				// (resolveDaemonModes); here, the value alone must be a lane.
+				if _, _, problem := runner.ParseSmallLane(value, runner.SmallLaneJobMaxMinBytesText); problem != "" {
+					return opts, argumentInvalid(fmt.Sprintf("--small-lane must be off or a size such as 8G, got %q", value))
+				}
+				opts.smallLane = strings.TrimSpace(value)
+			case "small-lane-job-max":
+				if _, _, problem := runner.ParseSmallLane(runner.SmallLaneMaxBytesText, value); problem != "" {
+					return opts, argumentInvalid(fmt.Sprintf("--small-lane-job-max must be a size of at least 1M such as 1G, got %q", value))
+				}
+				opts.smallLaneJobMax = strings.TrimSpace(value)
 			case "cpu-slots-per-core":
 				// AIRA-283. R < 1 would make every CPU request E_ADMIT_TOO_LARGE
 				// (invariant 3); 64 keeps R x NumCPU far below 2^31.
@@ -549,7 +576,7 @@ func parseInstallArgs(args []string) (installOpts, error) {
 	if opts.status && (opts.memoryMax != "" || opts.memoryHigh != "" || opts.allowOvercommit || opts.dryRun || opts.ci ||
 		opts.ciValue != "" || opts.stage != "" ||
 		seen["watchdog"] || seen["watchdog-interval"] || seen["slice-ceiling"] || seen["cpu-slots-per-core"] || seen["claude-usage-mod"] ||
-		seen["pin-charge"] || seen["pin-charge-factor"]) {
+		seen["pin-charge"] || seen["pin-charge-factor"] || seen["small-lane"] || seen["small-lane-job-max"]) {
 		return opts, argumentInvalid("--status cannot be combined with mutation options")
 	}
 	// AIRA-283 (E8). The start stage never rewrites the install-mode record, so a
@@ -649,6 +676,27 @@ func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOp
 			}
 		}
 	}
+	// AIRA-350. An installed lane value that is invalid alone is ignored, never
+	// propagated (the rule above); a pair that is invalid only together is
+	// handled after the defaults below. A CI install (--ci in any form) does not
+	// inherit the lane: the owner's lane is default mode only, so CI renders
+	// `off`, whatever --small-lane says (spec §2.5).
+	laneGiven, jobMaxGiven := opts.smallLaneGiven(), opts.smallLaneJobMaxGiven()
+	ciInstall := opts.ci || opts.ciValue != ""
+	if !laneGiven && !ciInstall {
+		if value := installedEnvironmentValue(installedDaemonUnit, installedSmallLaneRE); value != "" {
+			if _, _, problem := runner.ParseSmallLane(value, runner.SmallLaneJobMaxMinBytesText); problem == "" {
+				opts.smallLane = value
+			}
+		}
+	}
+	if !jobMaxGiven {
+		if value := installedEnvironmentValue(installedDaemonUnit, installedSmallLaneJobMaxRE); value != "" {
+			if _, _, problem := runner.ParseSmallLane(runner.SmallLaneMaxBytesText, value); problem == "" {
+				opts.smallLaneJobMax = value
+			}
+		}
+	}
 	if !opts.watchdogIntervalGiven() {
 		if value := installedEnvironmentValue(installedDaemonUnit, installedWatchdogIntervalRE); value != "" {
 			if interval, err := time.ParseDuration(value); err == nil && interval >= time.Second && interval < 30*time.Second {
@@ -703,6 +751,28 @@ func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOp
 	}
 	if _, ok := runner.ParsePinChargeFactor(opts.pinChargeFactor); !ok {
 		return opts, errors.New("pin charge factor must be a decimal from 0.5 to 1 with at most two places")
+	}
+	// AIRA-350: on (8G, 1G) unless an operator chose otherwise; always off for
+	// CI, a typed --small-lane included (spec §2.5: "CI renders off").
+	if !opts.smallLaneGiven() {
+		opts.smallLane = defaultSmallLane
+	}
+	if ciInstall {
+		opts.smallLane = runner.SmallLaneOff
+	}
+	if !opts.smallLaneJobMaxGiven() {
+		opts.smallLaneJobMax = defaultSmallLaneJobMax
+	}
+	// A pair that is invalid only together (a job maximum above the lane). With
+	// no lane flag typed it can only come from the installed unit, so both fall
+	// back to the defaults: a flagless re-install never fails on what an earlier
+	// install left behind. With either flag typed it is refused, never repaired:
+	// repairing would silently change the value the operator did not type.
+	if _, _, problem := runner.ParseSmallLane(opts.smallLane, opts.smallLaneJobMax); problem != "" && !laneGiven && !jobMaxGiven {
+		opts.smallLane, opts.smallLaneJobMax = defaultSmallLane, defaultSmallLaneJobMax
+	}
+	if _, _, problem := runner.ParseSmallLane(opts.smallLane, opts.smallLaneJobMax); problem != "" {
+		return opts, fmt.Errorf("small-job lane %s with a job maximum of %s: the job maximum must not exceed the lane (an omitted --small-lane or --small-lane-job-max keeps the installed value; give both)", opts.smallLane, opts.smallLaneJobMax)
 	}
 	if !validDaemonMode(opts.watchdog) {
 		return opts, errors.New("watchdog mode must be off, observe, or enforce")
@@ -893,6 +963,12 @@ func reexecRequestFor(executable string, target installTarget, opts installOpts)
 	if opts.pinChargeFactorGiven() {
 		args = append(args, "--pin-charge-factor", opts.pinChargeFactor)
 	}
+	if opts.smallLaneGiven() {
+		args = append(args, "--small-lane", opts.smallLane)
+	}
+	if opts.smallLaneJobMaxGiven() {
+		args = append(args, "--small-lane-job-max", opts.smallLaneJobMax)
+	}
 	if opts.allowOvercommit {
 		args = append(args, "--allow-overcommit")
 	}
@@ -1060,7 +1136,7 @@ func runUserInstall(d installDeps, opts installOpts) error {
 	if err != nil {
 		return unavailable(fmt.Errorf("resolve daemon paths: %w", err))
 	}
-	daemonUnit, err := renderDaemonUnit(d.daemonUnit, executable, paths.StateHome, opts.watchdog, opts.watchdogInterval, opts.sliceCeiling, opts.pinCharge, opts.pinChargeFactor, d.daemonRuntimeDir)
+	daemonUnit, err := renderDaemonUnit(d.daemonUnit, executable, paths.StateHome, opts.watchdog, opts.watchdogInterval, opts.sliceCeiling, opts.pinCharge, opts.pinChargeFactor, opts.smallLane, opts.smallLaneJobMax, d.daemonRuntimeDir)
 	if err != nil {
 		return argumentInvalid(err.Error())
 	}
@@ -1137,10 +1213,12 @@ func runUserInstall(d installDeps, opts installOpts) error {
 		}
 		if lockedOpts.watchdog != opts.watchdog || lockedOpts.sliceCeiling != opts.sliceCeiling ||
 			lockedOpts.watchdogInterval != opts.watchdogInterval ||
-			lockedOpts.pinCharge != opts.pinCharge || lockedOpts.pinChargeFactor != opts.pinChargeFactor {
+			lockedOpts.pinCharge != opts.pinCharge || lockedOpts.pinChargeFactor != opts.pinChargeFactor ||
+			lockedOpts.smallLane != opts.smallLane || lockedOpts.smallLaneJobMax != opts.smallLaneJobMax {
 			opts = lockedOpts
 			daemonUnit, err = renderDaemonUnit(d.daemonUnit, executable, paths.StateHome,
-				opts.watchdog, opts.watchdogInterval, opts.sliceCeiling, opts.pinCharge, opts.pinChargeFactor, d.daemonRuntimeDir)
+				opts.watchdog, opts.watchdogInterval, opts.sliceCeiling, opts.pinCharge, opts.pinChargeFactor,
+				opts.smallLane, opts.smallLaneJobMax, d.daemonRuntimeDir)
 			if err != nil {
 				return argumentInvalid(err.Error())
 			}
@@ -1629,7 +1707,7 @@ func renderUnits(sliceUnit, anchorUnit, executable, maximum, high string, accept
 	return slice, anchor, nil
 }
 
-func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval time.Duration, sliceCeiling, pinCharge, pinChargeFactor, runtimeDir string) (string, error) {
+func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval time.Duration, sliceCeiling, pinCharge, pinChargeFactor, smallLane, smallLaneJobMax, runtimeDir string) (string, error) {
 	if strings.ContainsAny(unit, "\r\n/") || !strings.HasSuffix(unit, ".service") {
 		return "", errors.New("daemon unit name must end in .service and contain no path separators")
 	}
@@ -1651,6 +1729,9 @@ func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval tim
 	if _, ok := runner.ParsePinChargeFactor(pinChargeFactor); !ok {
 		return "", errors.New("pin charge factor must be a decimal from 0.5 to 1 with at most two places")
 	}
+	if _, _, problem := runner.ParseSmallLane(smallLane, smallLaneJobMax); problem != "" || strings.TrimSpace(smallLaneJobMax) == "" {
+		return "", errors.New("small-job lane must be off or a size, with a job maximum from 1M to it")
+	}
 	template, err := assets.ReadFile("assets/aira-daemon.service.in")
 	if err != nil {
 		return "", err
@@ -1668,6 +1749,7 @@ func renderDaemonUnit(unit, executable, stateHome, watchdog string, interval tim
 		"@WATCHDOG_MODE@": watchdog, "@WATCHDOG_INTERVAL@": interval.String(),
 		"@SLICE_CEILING_MODE@": sliceCeiling, "@RUNTIME_ENV@": runtimeEnvironment,
 		"@PIN_CHARGE_MODE@": pinCharge, "@PIN_CHARGE_FACTOR@": strings.TrimSpace(pinChargeFactor),
+		"@SMALL_LANE@": strings.TrimSpace(smallLane), "@SMALL_LANE_JOB_MAX@": strings.TrimSpace(smallLaneJobMax),
 	}
 	for placeholder, value := range replacements {
 		unitContent = strings.ReplaceAll(unitContent, placeholder, value)
@@ -2506,6 +2588,9 @@ func statusDaemonFacet(d installDeps, uid int, content []byte, unitErr error) {
 	// checking whether enforce is on reads it here.
 	reportDaemonMode(d, "daemon pin charge", "AIRA_DAEMON_PIN_CHARGE_MODE", string(liveEnvironment), liveErr, string(content))
 	reportDaemonMode(d, "daemon pin charge factor", "AIRA_DAEMON_PIN_CHARGE_FACTOR", string(liveEnvironment), liveErr, string(content))
+	// AIRA-350. The small-job lane: size and job maximum.
+	reportDaemonMode(d, "daemon small-job lane", "AIRA_DAEMON_SMALL_LANE", string(liveEnvironment), liveErr, string(content))
+	reportDaemonMode(d, "daemon small-job lane job max", "AIRA_DAEMON_SMALL_LANE_JOB_MAX", string(liveEnvironment), liveErr, string(content))
 	paths, pathsErr := d.daemonPaths()
 	if pathsErr != nil {
 		d.logf("daemon reachable: unevaluated (%v)", pathsErr)

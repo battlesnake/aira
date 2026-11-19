@@ -310,6 +310,24 @@ type admitWaiter struct {
 	// push, which the restart drops).
 	high bool
 
+	// AIRA-350. laneKind is whether this job is the KIND of job the small-job lane
+	// serves (small_lane.go): a signed request whose signature is not a
+	// --delegate-ram suite parent's. A property of the REQUEST, frozen in the
+	// enqueue literal and never written again. A re-established lease (ARDR, whose
+	// record carries no signature) gets false; it is granted and never re-queued,
+	// so no lane decision ever reads it there.
+	laneKind bool
+
+	// AIRA-350. DIAGNOSIS ONLY, on the AIRA-149 terms above: no admission or grant
+	// decision reads either, both are written only by an evaluator pass under
+	// queue.mu (cleared at its start, rewritten by the lane pre-pass and the head
+	// rule), and the snapshot is their only reader (T27,
+	// small_lane_guard_test.go). laneWait is why the lane did not grant this
+	// waiter in the last pass ("", full, kept, pushed, no-room); heldByHead is
+	// whether today's head rule turned a fit into a refusal in that pass.
+	laneWait   string
+	heldByHead bool
+
 	// S8 (restart/anchor state — design §3 compare-and-release, §4 restart).
 	//
 	// anchor is the connection that CURRENTLY owns this lease (design §3 Inv 4): a
@@ -1186,11 +1204,16 @@ type admitSnapshot struct {
 	// as every total above, so rows and totals always describe one instant, and
 	// reconciling: over one snapshot the values sum to scopeBytes.
 	//
-	// It is deliberately NOT the scope's memory.max: a delegate scope's
-	// memory.max is an AIRA-15 containment ceiling many times its declared
-	// reserve, and publishing it is how `aira top` came to draw 93 GiB of claims
-	// against a 40 GiB ledger. For a connection-held waiter this equals its
-	// declared reserve.
+	// It is deliberately NOT the scope's memory.max. The AIRA-15 delegate
+	// containment ceiling, sized many times the reserve, was retired when
+	// `--delegate-ram` became an ordinary confine job (protocol.go, the dropped
+	// scope_ceiling): a scope's memory.max is now its granted reserve, the pin
+	// (confine_linux.go writes it from --memory-reserve or the grant). But the
+	// ledger books a discounted pin (AIRA-324) or a resized lease (AIRA-312)
+	// BELOW that pin, so memory.max can still exceed what this map carries;
+	// scopePins below publishes the pin beside such a booking. (Publishing the old
+	// containment ceiling is how `aira top` once drew 93 GiB of claims against a
+	// 40 GiB ledger.)
 	//
 	// A scope ABSENT from the map is one this ledger charges nothing for and knows
 	// nothing about; the wire renders that as unevaluated, never as a cap.
@@ -1202,6 +1225,21 @@ type admitSnapshot struct {
 	// ledger books BELOW it (see the snapshot walk). Same guard and same locked
 	// walk as scopeReserves.
 	scopePins map[string]int64
+
+	// AIRA-350. The small-job lane, in the SAME locked walk, and only while the
+	// lane is on (laneOn false leaves every field below zero, and the wire omits
+	// them). laneUsed and laneJobs are S and J_s (smallLeasesLocked); scopeSmall
+	// marks each granted scope that is a small lease; queuedLaneWait and
+	// queuedHeldByHead are the matched queued waiter's last-pass diagnoses (the
+	// AIRA-24 probe), taken at the same match as queuedReserveBytes.
+	laneOn           bool
+	laneCapacity     int64
+	laneJobMax       int64
+	laneUsed         int64
+	laneJobs         int
+	scopeSmall       map[string]bool
+	queuedLaneWait   string
+	queuedHeldByHead bool
 }
 
 // boundedAdmitSignature bounds the DIAGNOSTIC copy of a client-supplied
@@ -1318,8 +1356,14 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// ledger was never built or holds nothing". present stays false here precisely so a caller
 		// reports the granted pair unevaluated rather than as a fabricated empty
 		// slice (AIRA-220). CeilingBytes is an independent memory read and is
-		// unaffected.
-		return admitSnapshot{phase: phase}
+		// unaffected. The lane's configuration is published here too (AIRA-350),
+		// so `confine --list` shows the lane before the first admission; S and
+		// J_s stay absent, and the caller renders them unevaluated.
+		snapshot := admitSnapshot{phase: phase}
+		if s.smallLaneOn() {
+			snapshot.laneOn, snapshot.laneCapacity, snapshot.laneJobMax = true, s.smallLaneCap, s.smallLaneJobMax
+		}
+		return snapshot
 	}
 	queue.mu.Lock()
 	snapshot := admitSnapshot{
@@ -1329,6 +1373,14 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		scopePins:       map[string]int64{},
 		vramOutstanding: queue.vramOutstanding, // AIRA-269: the re-derived VRAM ledger total
 		scopeVRAM:       make(map[string]int64, len(queue.waiters)),
+		scopeSmall:      map[string]bool{},
+	}
+	// AIRA-350, diagnosis only: the lane's occupancy from the same walk the
+	// evaluator derives it with, never a stored counter.
+	if s.smallLaneOn() {
+		occ := smallLeasesLocked(queue, s.smallLaneJobMax)
+		snapshot.laneOn, snapshot.laneCapacity, snapshot.laneJobMax = true, s.smallLaneCap, s.smallLaneJobMax
+		snapshot.laneUsed, snapshot.laneJobs = occ.booked, occ.jobs
 	}
 	queuedBytes := int64(0)
 	// ONE reading of the clock for the whole walk (AIRA-108): ages taken per-row
@@ -1361,16 +1413,23 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 			// the reserve the client sent (did the daemon resolve a different
 			// number?), and both questions are about the pin.
 			snapshot.queuedReserveBytes = waiter.reserve
+			if snapshot.laneOn {
+				snapshot.queuedLaneWait, snapshot.queuedHeldByHead = waiter.laneWait, waiter.heldByHead
+			}
 		}
 		// AIRA-324: what is AHEAD is counted in booking bytes, the quantity that
 		// will occupy the ledger when those waiters are granted.
 		queuedBytes = addClamp(queuedBytes, waiter.ledgerCharge())
 		if waiter.scopeID != "" && len(snapshot.queuedEntries) < runner.ConfineQueuedRowLimit {
 			// Values, never the waiter: the entry outlives queue.mu.
-			snapshot.queuedEntries = append(snapshot.queuedEntries, runner.ConfineQueuedEntry{
+			entry := runner.ConfineQueuedEntry{
 				ScopeID: waiter.scopeID, ReserveBytes: waiter.reserve, VRAMBytes: waiter.vram,
 				Pushed: waiter.pushSeq > 0, High: waiter.high,
-			})
+			}
+			if snapshot.laneOn {
+				entry.LaneWait, entry.HeldByHead = waiter.laneWait, waiter.heldByHead
+			}
+			snapshot.queuedEntries = append(snapshot.queuedEntries, entry)
 		}
 	}
 	for _, waiter := range queue.waiters {
@@ -1432,6 +1491,9 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// not a GPU job"), so every scope row gets an established VRAMBytes rather
 		// than an unevaluated one. Same match, same guard as scopeReserves.
 		snapshot.scopeVRAM[waiter.scopeID] = waiter.vram
+		if snapshot.laneOn && smallLease(waiter, s.smallLaneJobMax) {
+			snapshot.scopeSmall[waiter.scopeID] = true
+		}
 	}
 	snapshot.phase = s.admitReportedPhaseLocked(queue, now)
 	// AIRA-101, in the same locked pass as the counts above.
@@ -2415,7 +2477,7 @@ func (s *Server) enqueueAdmitInternal(path string, reserve int64, basis string, 
 	// mode and factor are fixed for the daemon's lifetime, so this is also the
 	// booking at grant. Off and observe give charge 0 (the booking is reserve).
 	charge := bookingField(s.pinChargeFor(request.discountable, reserve), reserve)
-	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, charge: charge, discountable: request.discountable, cpu: request.cpu, vram: request.vram, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, high: request.high}
+	waiter := &admitWaiter{seq: queue.seq, reserve: reserve, charge: charge, discountable: request.discountable, cpu: request.cpu, vram: request.vram, basis: basis, state: admitQueued, grantedCh: make(chan struct{}), enqueued: s.admitNowTime(), scopeID: request.scopeID, name: request.name, owner: request.owner, signature: boundedAdmitSignature(request.signature), exclusive: request.exclusive, exclusiveReason: request.exclusiveReason, exclusiveHolder: request.exclusiveHolder, parentScopeID: request.parentScopeID, high: request.high, laneKind: laneKindOf(request.signature)}
 	// Anchor the fresh lease to its connection through the same helper a re-declare
 	// uses, so the anchor identity is set uniformly. The connection's EOF release
 	// compares its own conn against this anchor.
@@ -2566,7 +2628,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// fresh every pass and never stored: the first waiter in admitOrderLocked order
 	// that the exclusivity gate lets through, that is job-level work (not a
 	// sub-reservation), that is refused on capacity, and that could fit an EMPTY
-	// slice at the current ceilings (admitCouldFitEmptyLocked). Every later
+	// slice at the current ceilings (admitCouldFitBesideLocked at zero occupancy). Every later
 	// job-level waiter is judged against it below.
 	var head *admitWaiter
 	// S11 restart freeze (design §4): a per-pass fact like `phase`. While active, NO
@@ -2575,6 +2637,21 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// do NOT come through here: they SET/establish directly under queue.mu in
 	// enqueueAdmitInternal, so they are never frozen (Invariant 6).
 	restartFrozen := s.restartFrozenAt(now)
+	// AIRA-350. The lane diagnoses describe THIS pass: cleared on every queued
+	// waiter, then rewritten by the pre-pass (laneWait) and the head rule below
+	// (heldByHead). Diagnosis only.
+	for _, waiter := range queue.waiters {
+		if waiter != nil && waiter.state == admitQueued {
+			waiter.laneWait, waiter.heldByHead = "", false
+		}
+	}
+	// AIRA-350. The small-job lane's grant-only pre-pass (small_lane.go), before
+	// today's walk and after every per-pass fact it reads is derived. Skipped
+	// during the restart freeze, as every new admission is; a no-op while the
+	// lane is off, so the walk below is then exactly today's.
+	if !restartFrozen {
+		s.smallLanePassLocked(queue, gate, current, effectiveMaximum, reclaimable, now)
+	}
 	// AIRA-149. Still-queued waiters already examined in THIS pass, i.e.
 	// genuinely AHEAD of any waiter reached later in it. Diagnosis only.
 	queuedAhead := 0
@@ -2619,59 +2696,11 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			queuedAhead++
 			continue
 		}
-		jobs := addJobCountClamp(queue.outstandingJobs, 1)
-		headroom := s.admitSliceHeadroom(jobs)
-		// S4 (D4): the LEDGER check (ceiling − Σleases, signed) applies in BOTH
-		// modes; the physical current/reclaimable floor is DEV-only. CI drops it
-		// (ledger-only) because nothing runs outside the container; DEV keeps it,
-		// so a slice already over its declared reserve is gated on the real bytes,
-		// alongside the MemAvailable-aware effectiveMaximum above.
-		//
-		// S12: a single accounting — the connection-held ledger (queue.outstanding).
-		// The AIRA-74 scan-adoption addend is gone; a post-restart survivor is
-		// counted ONCE via S11's reload + re-declare, never a second time via a
-		// parallel scan-reconstructed reserve.
-		outstanding := queue.outstanding
-		var available int64
-		if s.shimMode() {
-			available = ledgerAvailable(effectiveMaximum, outstanding, headroom)
-		} else {
-			available = checkedAvailable(current, effectiveMaximum, reclaimable, outstanding, headroom)
-		}
-		// S5 CONJUNCTIVE FIT (design §7): admit only if EVERY resource fits — RAM
-		// AND CPU. Both are PER-SLICE ledgers: `available` is RAM (ceiling − Σreserve),
-		// and CPU is this queue's own cpuOutstanding against the R×NumCPU ceiling. CPU
-		// is treated per slice on the one-slice (aira.slice) assertion (D1); cores are
-		// machine-wide, so if concurrent slices are ever introduced this must become a
-		// sum across slices. grantedAt marks "the daemon just decided this job may
-		// proceed", deliberately separate from enqueued (a long queue wait is not launch
-		// abandonment — the AIRA-49 v3 defect); nothing but the grant below sets it.
-		// AIRA-324. The ledger is checked in BOOKING bytes (ledgerCharge: a
-		// discounted waiter's charge, else its reserve). A discounted waiter is
-		// also granted only if its FULL pin fits the slice's real free memory —
-		// ceiling − headroom − effectiveCurrent, the physical half of
-		// checkedAvailable with no ledger term — so as real use climbs a large
-		// pin stops being admitted before the discount can overcommit it. Never
-		// in ci-shim mode (no physical reading, and pinChargeFor never discounts
-		// there). For an undiscounted waiter the rule is implied by the ledger
-		// check above (available <= ceiling − effectiveCurrent), so it is not
-		// re-evaluated, and off/observe decide exactly as before.
-		physicalFree := int64(0)
-		if !s.shimMode() {
-			physicalFree = checkedAvailable(current, effectiveMaximum, reclaimable, 0, headroom)
-		}
-		ramFits := waiter.ledgerCharge() <= available
-		if waiter.discounted() && !s.shimMode() && waiter.reserve > physicalFree {
-			ramFits = false
-		}
-		cpuFits := waiter.cpu <= cpuAvailable(s.cpuCeiling(), queue.cpuOutstanding)
-		// AIRA-268. The third conjunctive resource. A vram==0 job fits vacuously
-		// (ungated). A vram>0 job fits only against a FRESH ceiling snapshot (read
-		// off-lock by the sampler — never a fork here under queue.mu); an
-		// unevaluated/stale snapshot returns false, so the waiter HOLDS in the queue
-		// (transient contention, unbounded-fair), never a fabricated fit.
-		vramFits := waiter.vram == 0 || s.vramWaiterFitsLocked(waiter.vram, queue.vramOutstanding)
-		fits := ramFits && cpuFits && vramFits
+		// The fit (RAM ledger and physical floor, CPU, VRAM) is admitFitLocked, the
+		// ONE fit every grant faces, the small-job lane's included (AIRA-350).
+		fit := s.admitFitLocked(queue, waiter, current, effectiveMaximum, reclaimable)
+		available, physicalFree, ramFits := fit.available, fit.physicalFree, fit.ramFits
+		fits := fit.all()
 		// AIRA-307/309. The head's protection, applied to every LATER job-level
 		// waiter. A sub-reservation is exempt from every form of it and judged on
 		// fit alone, on exclusiveGate.blocks' drain argument: it is an admitted
@@ -2690,38 +2719,22 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			switch {
 			case head.pushSeq > 0:
 				fits = false
+				waiter.heldByHead = true // AIRA-350 diagnosis
 			case phase == admitFreezeYield:
 			case addClamp(head.bypassed, waiter.ledgerCharge()) > admitBypassBudget(head):
 				fits = false
 				budgetWithheld = true
+				waiter.heldByHead = true // AIRA-350 diagnosis
 			}
 		}
 		if fits {
-			waiter.state = admitGranted
-			waiter.grantedAt = s.admitNowTime()
-			waiter.accounted = true
-			// The ledger is DERIVED, not incremented: this waiter is now granted &&
-			// accounted, so re-deriving over the waiter set folds in BOTH its RAM
-			// ledgerCharge() and its cores. Done here, before the next queued waiter is
-			// evaluated, so a later grant in this same pass reads this one at the
-			// fit-check above — exactly as the old `outstanding +=` did, now for two
-			// resources at once.
-			queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+			s.grantWaiterLocked(queue, waiter, physicalFree)
 			if protected {
 				// Every job-level grant past an unpushed head counts against its
 				// budget, the backstop pass's included (a pushed head grants nothing
 				// past itself, so it never reaches here).
 				head.bypassed = addClamp(head.bypassed, waiter.ledgerCharge())
 			}
-			// AIRA-324: the observe/enforce record of a discountable grant.
-			s.logPinChargeGrantLocked(waiter, physicalFree)
-			if waiter.waited {
-				waiter.outcome = "waited"
-				waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
-			} else {
-				waiter.outcome = "immediate"
-			}
-			close(waiter.grantedCh)
 			continue
 		}
 		// Refused on capacity (RAM, CPU or VRAM short), or held behind the head.
@@ -2767,7 +2780,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 			queue.freezeArmedAt = now
 			phase = admitFreezeHold
 		}
-		if head == nil && !waiter.isSubReservation() && s.admitCouldFitEmptyLocked(waiter, effectiveMaximum) {
+		if head == nil && !waiter.isSubReservation() && s.admitCouldFitBesideLocked(waiter, effectiveMaximum, laneOccupancy{}) {
 			// This waiter becomes the head. A waiter that could not fit even an
 			// EMPTY slice at the current (possibly throttled) ceilings is never a
 			// head: freezing others cannot help it, and a pushed one would otherwise
@@ -2820,31 +2833,146 @@ func (s *Server) admitReportedPhaseLocked(queue *sliceQueue, now time.Time) stri
 	return admitFreezePhaseAt(queue.freezeArmedAt, now, s.admitFreezeMaxHold).String()
 }
 
-// admitCouldFitEmptyLocked is the AIRA-307/309 empty-slice clause of "who is the
-// head": whether this waiter could be granted on an EMPTY ledger at the CURRENT
-// ceilings, in every resource. queue.mu must be held.
+// admitFit is one waiter's fit at one instant of a pass: each conjunct, and the
+// two RAM figures the diagnosis and the AIRA-324 grant log need.
+type admitFit struct {
+	available    int64 // the signed RAM ledger room (the AIRA-149 grantable figure)
+	physicalFree int64 // ceiling − headroom − effectiveCurrent; 0 in ci-shim mode
+	ramFits      bool
+	cpuFits      bool
+	vramFits     bool
+}
+
+func (f admitFit) all() bool { return f.ramFits && f.cpuFits && f.vramFits }
+
+// admitFitLocked is THE fit: whether this waiter could be granted now, in every
+// resource, against the ledger as it stands (every earlier grant of this pass
+// already folded in by rederiveLedgerLocked). It is the main walk's fit, moved
+// here verbatim so that the small-job lane's pre-pass (AIRA-350) calls the same
+// function and a lane grant faces exactly the RAM ledger, physical, CPU and VRAM
+// fit of a main grant (spec T23: no lane-only copy). queue.mu must be held.
+func (s *Server) admitFitLocked(queue *sliceQueue, waiter *admitWaiter, current, effectiveMaximum, reclaimable int64) admitFit {
+	jobs := addJobCountClamp(queue.outstandingJobs, 1)
+	headroom := s.admitSliceHeadroom(jobs)
+	// S4 (D4): the LEDGER check (ceiling − Σleases, signed) applies in BOTH
+	// modes; the physical current/reclaimable floor is DEV-only. CI drops it
+	// (ledger-only) because nothing runs outside the container; DEV keeps it,
+	// so a slice already over its declared reserve is gated on the real bytes,
+	// alongside the MemAvailable-aware effectiveMaximum above.
+	//
+	// S12: a single accounting — the connection-held ledger (queue.outstanding).
+	// The AIRA-74 scan-adoption addend is gone; a post-restart survivor is
+	// counted ONCE via S11's reload + re-declare, never a second time via a
+	// parallel scan-reconstructed reserve.
+	outstanding := queue.outstanding
+	var available int64
+	if s.shimMode() {
+		available = ledgerAvailable(effectiveMaximum, outstanding, headroom)
+	} else {
+		available = checkedAvailable(current, effectiveMaximum, reclaimable, outstanding, headroom)
+	}
+	// S5 CONJUNCTIVE FIT (design §7): admit only if EVERY resource fits — RAM
+	// AND CPU. Both are PER-SLICE ledgers: `available` is RAM (ceiling − Σreserve),
+	// and CPU is this queue's own cpuOutstanding against the R×NumCPU ceiling. CPU
+	// is treated per slice on the one-slice (aira.slice) assertion (D1); cores are
+	// machine-wide, so if concurrent slices are ever introduced this must become a
+	// sum across slices.
+	// AIRA-324. The ledger is checked in BOOKING bytes (ledgerCharge: a
+	// discounted waiter's charge, else its reserve). A discounted waiter is
+	// also granted only if its FULL pin fits the slice's real free memory —
+	// ceiling − headroom − effectiveCurrent, the physical half of
+	// checkedAvailable with no ledger term — so as real use climbs a large
+	// pin stops being admitted before the discount can overcommit it. Never
+	// in ci-shim mode (no physical reading, and pinChargeFor never discounts
+	// there). For an undiscounted waiter the rule is implied by the ledger
+	// check above (available <= ceiling − effectiveCurrent), so it is not
+	// re-evaluated, and off/observe decide exactly as before.
+	physicalFree := int64(0)
+	if !s.shimMode() {
+		physicalFree = checkedAvailable(current, effectiveMaximum, reclaimable, 0, headroom)
+	}
+	ramFits := waiter.ledgerCharge() <= available
+	if waiter.discounted() && !s.shimMode() && waiter.reserve > physicalFree {
+		ramFits = false
+	}
+	cpuFits := waiter.cpu <= cpuAvailable(s.cpuCeiling(), queue.cpuOutstanding)
+	// AIRA-268. The third conjunctive resource. A vram==0 job fits vacuously
+	// (ungated). A vram>0 job fits only against a FRESH ceiling snapshot (read
+	// off-lock by the sampler — never a fork here under queue.mu); an
+	// unevaluated/stale snapshot returns false, so the waiter HOLDS in the queue
+	// (transient contention, unbounded-fair), never a fabricated fit.
+	vramFits := waiter.vram == 0 || s.vramWaiterFitsLocked(waiter.vram, queue.vramOutstanding)
+	return admitFit{available: available, physicalFree: physicalFree, ramFits: ramFits, cpuFits: cpuFits, vramFits: vramFits}
+}
+
+// grantWaiterLocked grants one queued waiter that fits: today's grant body,
+// shared by the main walk and the small-job lane (AIRA-350). It writes no head
+// bookkeeping (bypassed, budgetWithheld, the fairness anchor): the main walk adds
+// head.bypassed itself, and a lane grant writes none (spec I5). queue.mu must be
+// held.
 //
-//   - RAM: reserve <= effectiveMaximum − headroom(1), the possibly
-//     pressure-throttled ceiling this pass gates on.
-//   - CPU: cpu <= cpuCeiling().
-//   - VRAM: vram == 0, or a FRESH evaluated snapshot whose ceiling (the
-//     configured budget, or the card's total, less headroom) holds it. This is
-//     deliberately NOT the current free figure: other AIRA GPU jobs hold free
-//     VRAM, and a pushed GPU head must still drain them. An unevaluated or stale
-//     reading means NOT a head — without this arm a pushed GPU job would freeze
-//     the whole machine for as long as nvidia-smi was failing, and a pushed head
-//     has no backstop.
+// grantedAt marks "the daemon just decided this job may proceed", deliberately
+// separate from enqueued (a long queue wait is not launch abandonment — the
+// AIRA-49 v3 defect); nothing but this grant sets it.
+func (s *Server) grantWaiterLocked(queue *sliceQueue, waiter *admitWaiter, physicalFree int64) {
+	waiter.state = admitGranted
+	waiter.grantedAt = s.admitNowTime()
+	waiter.accounted = true
+	// The ledger is DERIVED, not incremented: this waiter is now granted &&
+	// accounted, so re-deriving over the waiter set folds in BOTH its RAM
+	// ledgerCharge() and its cores. Done here, before the next queued waiter is
+	// evaluated, so a later grant in this same pass reads this one at the
+	// fit-check — exactly as the old `outstanding +=` did, now for every
+	// resource at once.
+	queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+	// AIRA-324: the observe/enforce record of a discountable grant.
+	s.logPinChargeGrantLocked(waiter, physicalFree)
+	if waiter.waited {
+		waiter.outcome = "waited"
+		waiter.waitedMS = elapsedMilliseconds(waiter.enqueued, s.admitNowTime())
+	} else {
+		waiter.outcome = "immediate"
+	}
+	close(waiter.grantedCh)
+}
+
+// admitCouldFitBesideLocked is whether this waiter could be granted on a ledger
+// holding only `occ` (and nothing else), at the CURRENT ceilings, in every
+// resource. queue.mu must be held. It is ONE function with two callers, so head
+// eligibility and the small-job lane's guard G cannot drift (AIRA-350 §2.3):
+//
+//   - at zero occupancy it is the AIRA-307/309 empty-slice clause of "who is the
+//     head" (and of the lane's reference waiter);
+//   - with occ the small leases plus the waiter the lane is about to grant, it is
+//     guard G: the reference must still fit beside them.
+//
+// Per resource:
+//
+//   - RAM, on the PIN: reserve <= effectiveMaximum − headroom(occ.jobs+1) −
+//     occ.pins, the possibly pressure-throttled ceiling this pass gates on. Pins,
+//     not bookings: a scoped small lease uses at most its pin (memory.max).
+//   - CPU: cpu <= cpuCeiling() − occ.cpu.
+//   - VRAM: vram == 0, or a FRESH evaluated snapshot with vram <=
+//     vramAdmitAvailable(budget, total, total − occ.vram, headroom, occ.vram).
+//     At zero occupancy this is the configured budget, or the card's total, less
+//     headroom: deliberately NOT the current free figure, since other AIRA GPU
+//     jobs hold free VRAM and a pushed GPU head must still drain them. With
+//     occupancy each lease in occ is assumed to use its whole declaration, which
+//     today's fit charges twice (in the card's free and in the ledger). An
+//     unevaluated or stale reading means NOT a head (and no lane grant past it) —
+//     without this arm a pushed GPU job would freeze the whole machine for as
+//     long as nvidia-smi was failing, and a pushed head has no backstop.
 //
 // AIRA-324. RAM is judged on the PIN (reserve), never the booking: a discounted
 // waiter is head-eligible only if charge AND pin fit an empty slice, and since
 // charge <= pin the pin alone decides. A charge-only test would make a pin above
 // the throttled ceiling a head that the physical-fit rule can never grant, and
 // a pushed one would freeze the queue (TestPinChargeHeadEligibilityIsOnThePin).
-func (s *Server) admitCouldFitEmptyLocked(waiter *admitWaiter, effectiveMaximum int64) bool {
-	if waiter.reserve > subtractFloor(effectiveMaximum, s.admitSliceHeadroom(1)) {
+func (s *Server) admitCouldFitBesideLocked(waiter *admitWaiter, effectiveMaximum int64, occ laneOccupancy) bool {
+	if waiter.reserve > subtractFloor(effectiveMaximum, s.admitSliceHeadroom(addJobCountClamp(occ.jobs, 1)))-occ.pins {
 		return false
 	}
-	if waiter.cpu > s.cpuCeiling() {
+	if waiter.cpu > s.cpuCeiling()-occ.cpu {
 		return false
 	}
 	if waiter.vram == 0 {
@@ -2854,7 +2982,7 @@ func (s *Server) admitCouldFitEmptyLocked(waiter *admitWaiter, effectiveMaximum 
 	if !snap.evaluated {
 		return false
 	}
-	return waiter.vram <= vramAdmitAvailable(s.vramBudgetBytes, snap.total, snap.total, s.vramHeadroomBytes(), 0)
+	return waiter.vram <= vramAdmitAvailable(s.vramBudgetBytes, snap.total, snap.total-occ.vram, s.vramHeadroomBytes(), occ.vram)
 }
 
 // logAdmitFreezeTransition reports ONLY phase transitions, never a steady state:
