@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -395,9 +394,6 @@ func newTestRunInputPlane(t *testing.T, owner string) *runInputPlane {
 	base := newRunInputRuntimeDir(t)
 	plane, err := prepareRunInputPlane(base, "RUN-1", owner)
 	if err != nil {
-		if errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EROFS) {
-			skipOrFailRunInputSocket(t, "Unix socket unavailable: %v", err)
-		}
 		t.Fatal(err)
 	}
 	t.Cleanup(plane.closeTerminal)
@@ -416,9 +412,6 @@ func newRunInputRuntimeDir(t *testing.T) string {
 	}
 	root := filepath.Join(home, "tmp", "aira-d6-run-input-tests")
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		if errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS) {
-			skipOrFailRunInputSocket(t, "run-input test directory unavailable: %v", err)
-		}
 		t.Fatal(err)
 	}
 	base, err := os.MkdirTemp(root, "case-")
@@ -431,14 +424,6 @@ func newRunInputRuntimeDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return absolute
-}
-
-func skipOrFailRunInputSocket(t *testing.T, format string, args ...any) {
-	t.Helper()
-	if os.Getenv("AIRA_REAL_SOCKET") == "1" {
-		t.Fatalf(format, args...)
-	}
-	t.Skipf(format, args...)
 }
 
 // dialRunInputRawHello dials and sends HELLO without reading the reply. The

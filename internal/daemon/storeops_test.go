@@ -290,9 +290,6 @@ func TestDaemonOwnedHeavyDeadlineFiresAndReleasesOperation(t *testing.T) {
 }
 
 func TestExchangeStoreOpPostWriteDisconnectIsOutcomeUnknown(t *testing.T) {
-	if os.Getenv("AIRA_REAL_SOCKET") != "1" {
-		t.Skip("real Unix socket requires AIRA_REAL_SOCKET=1")
-	}
 	paths := testPaths(t)
 	if err := os.MkdirAll(filepath.Dir(paths.SocketPath), 0o700); err != nil {
 		t.Fatal(err)

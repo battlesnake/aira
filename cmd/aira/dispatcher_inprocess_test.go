@@ -67,12 +67,8 @@ func TestTimeCLIExitPassthroughHumanSuppressionAndStructuredRead(t *testing.T) {
 	}
 }
 
-// This discriminator needs a real AF_UNIX listener. The Codex sandbox cannot
-// bind it; AIRA_REAL_SOCKET=1 is the Opus real-hardware mode and fails closed.
+// This discriminator needs a real AF_UNIX listener.
 func TestCommandsRoutedDaemonParityAndPairedDrillRealSocket(t *testing.T) {
-	if os.Getenv("AIRA_REAL_SOCKET") != "1" {
-		t.Skip("real Unix-socket parity requires AIRA_REAL_SOCKET=1")
-	}
 	root := t.TempDir()
 	gitInit(t, root)
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
@@ -1383,9 +1379,6 @@ func TestStoreFreeRealCLIRegistersOnlyThroughDaemon(t *testing.T) {
 }
 
 func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
-	if os.Getenv("AIRA_REAL_SOCKET") != "1" {
-		t.Skip("real Unix-socket D7b e2e requires AIRA_REAL_SOCKET=1")
-	}
 	root := t.TempDir()
 	gitInit(t, root)
 	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("launch\n"), 0o644); err != nil {

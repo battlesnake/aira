@@ -490,13 +490,6 @@ func TestDiscoveryDoesNotResurrectMarkdownIntent(t *testing.T) {
 	}
 }
 
-func requireRealSocket(t *testing.T) {
-	t.Helper()
-	if os.Getenv("AIRA_REAL_SOCKET") != "1" {
-		t.Skip("real Unix-socket daemon lifecycle requires AIRA_REAL_SOCKET=1")
-	}
-}
-
 func writeDiscoveryRegistry(t *testing.T, path string, entries ...store.RegistryEntry) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -528,7 +521,6 @@ func serveForDiscoveryTest(t *testing.T, server *Server) (context.CancelFunc, <-
 }
 
 func TestServeSignalsReadyBeforeRegistryDiscoveryCompletes(t *testing.T) {
-	requireRealSocket(t)
 	paths := testPaths(t)
 	scope := independentScope(t, paths, "slow-ready", "SLOWREADY")
 	project := projectForDiscoveryScope(scope)
@@ -572,7 +564,6 @@ func TestServeSignalsReadyBeforeRegistryDiscoveryCompletes(t *testing.T) {
 }
 
 func TestServeDrainsRegistryDiscoveryBeforeClosingDB(t *testing.T) {
-	requireRealSocket(t)
 	paths := testPaths(t)
 	scope := independentScope(t, paths, "drain", "DRAIN")
 	project := projectForDiscoveryScope(scope)
@@ -629,7 +620,6 @@ func TestServeDrainsRegistryDiscoveryBeforeClosingDB(t *testing.T) {
 }
 
 func TestServeDiscoveryDrainTimeoutRetainsInstance(t *testing.T) {
-	requireRealSocket(t)
 	t.Setenv("AIRA_DAEMON_REAP_INTERVAL", "disabled")
 	t.Setenv("AIRA_DAEMON_JOURNAL_FLUSH_INTERVAL", "disabled")
 	paths := testPaths(t)
@@ -691,7 +681,6 @@ func TestServeDiscoveryDrainTimeoutRetainsInstance(t *testing.T) {
 }
 
 func TestServeDiscoveryReapsPriorLifetimeProjectWithoutRequest(t *testing.T) {
-	requireRealSocket(t)
 	paths := testPaths(t)
 	root := filepath.Join(filepath.Dir(paths.StateHome), "prior-project")
 	if err := os.MkdirAll(root, 0o755); err != nil {
