@@ -1282,6 +1282,8 @@ func TestRealProcObserveSelectsClaudeChildWithoutSignalling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Killing the helper alone would leave its sleep child running for 30 s.
+	t.Cleanup(func() { _ = unix.Kill(childPID, unix.SIGKILL) })
 	mount, mountErr := runner.UnifiedCgroupMount()
 	var procs map[int]watchdogProc
 	foundTree := false

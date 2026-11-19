@@ -201,7 +201,7 @@ bodies themselves (they already iterate `s.scopes`).
 - **Discovery populates scopes:** a registry with project P (built by a prior "daemon",
   i.e. registered then the scope cache cleared) — after `Serve` + discovery, `s.scopes`
   contains P and P's expired lease is reaped without any client request to P. (real
-  socket / real store, `AIRA_REAL_SOCKET`-gated.)
+  socket / real store; runs in every test run since AIRA-362.)
 - **Skip-not-fail — missing worktree:** a registry entry whose `Root` was deleted →
   discovery skips it, logs, and still discovers the sibling valid entries; the daemon
   serves normally.
