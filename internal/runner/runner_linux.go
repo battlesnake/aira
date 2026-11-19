@@ -1332,6 +1332,9 @@ func finishLiveStreams(ctx context.Context, liveStreams map[string]*liveStream, 
 		}
 		close(writersDone)
 	}()
+	if liveJoinHook != nil {
+		liveJoinHook()
+	}
 	select {
 	case <-writersDone:
 	case <-ctx.Done():
