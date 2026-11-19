@@ -116,14 +116,15 @@ func newHookFixture(t *testing.T) hookFixture {
 	}
 
 	// `make` records the -C directory it was told to build and the GIT_*
-	// variables still visible to it, then succeeds.
+	// variables still visible to it, then succeeds (or exits with
+	// AIRA_TEST_MAKE_SHIM_EXIT, for a test of a failing step).
 	writeShim(t, filepath.Join(binDir, "make"), `#!/usr/bin/env bash
 {
   echo "make argv: $*"
   echo "make cwd: $PWD"
   for v in ${!GIT_@}; do echo "make leaked-git-env: $v"; done
 } >> "`+logPath+`"
-exit 0
+exit "${AIRA_TEST_MAKE_SHIM_EXIT:-0}"
 `)
 	// `aira` records that it was asked to confine, then runs the real command
 	// so the hook's end-to-end shape (confine wrapping make) is exercised.
@@ -473,8 +474,9 @@ func TestHooksQueuePriority(t *testing.T) {
 		expect(t, fx, "aira argv: confine -- make -C "+fx.worktree+" ci", "high")
 	})
 	t.Run("every pre-push step is normal", func(t *testing.T) {
-		// Both pre-push forms are long (`make ci`; the store tests measured
-		// minutes on a busy box), so neither may ever be high.
+		// Every pre-push form stays normal: `make ci` is long, and AIRA-359's
+		// narrowed runs (test-docs, test-store, both) go through the same
+		// single call, at the priority the store tier always had.
 		data, err := os.ReadFile(filepath.Join(hookSourceDir(t), "pre-push"))
 		if err != nil {
 			t.Fatal(err)
@@ -490,8 +492,8 @@ func TestHooksQueuePriority(t *testing.T) {
 				t.Fatalf("pre-push step %q is not normal priority", line)
 			}
 		}
-		if calls != 2 {
-			t.Fatalf("found %d aira_hook_run_make calls in pre-push, want 2 (ci, test-store)", calls)
+		if calls != 1 {
+			t.Fatalf("found %d aira_hook_run_make calls in pre-push, want 1 (ci or the narrowed targets)", calls)
 		}
 	})
 }

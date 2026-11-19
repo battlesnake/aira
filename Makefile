@@ -5,7 +5,7 @@ GO ?= go
 GO_BIN := $(shell $(GO) env GOROOT 2>/dev/null)/bin
 export PATH := $(GO_BIN):$(HOME)/.local/bin:$(PATH)
 
-.PHONY: fmt fmt-check vet lint build dist test test-store race cover fuzz tidy ci ci-steps install-hooks claude-mod-check
+.PHONY: fmt fmt-check vet lint build dist test test-store test-docs race cover fuzz tidy ci ci-steps install-hooks claude-mod-check
 
 # AIRA-205. The file set every gofmt-driving target shares, defined ONCE. It was
 # previously spelled out at three sites, and a nested-worktree exclusion added to
@@ -89,11 +89,17 @@ TEST_TMPDIR := bash .githooks/test-tmpdir
 test:
 	$(TEST_TMPDIR) $(GO) test ./... -count=1 -timeout 20m
 
-# AIRA-315. Called by .githooks/pre-push when every pushed path is under docs/
-# or .aira/tickets/: internal/store is the package that parses the repository's
-# own ticket files (TestTheRepositorysOwnTicketFilesAreReadable).
+# AIRA-315, AIRA-359. The pre-push hook's narrowed targets, each ONE named test
+# (pinned by TestMakefileNarrowedPrePushTargets). Neither goes through
+# .githooks/ci-pass, so neither records a tree-pass marker: only `make ci` does.
+# test-store: a push touching .aira/tickets/ runs the one test that parses the
+# repository's own ticket files. test-docs: a push touching docs/ runs the one
+# whole-tree text test that reads documents.
 test-store:
-	$(TEST_TMPDIR) $(GO) test ./internal/store -count=1 -timeout 20m
+	$(TEST_TMPDIR) $(GO) test ./internal/store -run '^TestTheRepositorysOwnTicketFilesAreReadable$$' -count=1 -timeout 20m
+
+test-docs:
+	$(TEST_TMPDIR) $(GO) test ./internal/daemon -run '^TestNoLiveCodeOrDocNamesTheDeletedPrior$$' -count=1 -timeout 20m
 
 race:
 	$(TEST_TMPDIR) $(GO) test ./... -race -count=1 -timeout 40m

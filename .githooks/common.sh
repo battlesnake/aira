@@ -136,7 +136,7 @@ aira_ci_pass_marker() {
 # untracked (non-ignored) change. --untracked-files=all overrides a user's
 # status.showUntrackedFiles=no, which would otherwise hide untracked files.
 aira_ci_pass_clean_tree() {
-	local root="$1" top status tree
+	local root="$1" top status tree listing hidden rc
 	top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" || return 1
 	[ -n "$top" ] || return 1
 	[ "$(cd -- "$root" && pwd -P)" = "$(cd -- "$top" && pwd -P)" ] || return 1
@@ -144,7 +144,14 @@ aira_ci_pass_clean_tree() {
 	[ -z "$status" ] || return 1
 	# assume-unchanged / skip-worktree files hide edits from `status`: any index
 	# entry not in the plain cached state ('H') refuses the clean verdict.
-	if git -C "$root" --no-optional-locks ls-files -v 2>/dev/null | grep -q -v '^H '; then return 1; fi
+	# Read the whole listing first: `ls-files -v | grep -q -v` makes grep exit at the
+	# first hidden entry, ls-files then dies of SIGPIPE on a large index, and under
+	# the hooks' pipefail that status reads as "no hidden entry" (a false clean).
+	listing="$(git -C "$root" --no-optional-locks ls-files -v 2>/dev/null)" || return 1
+	rc=0
+	hidden="$(grep -v '^H ' <<<"$listing")" || rc=$?
+	[ "$rc" -le 1 ] || return 1
+	[ -z "$hidden" ] || return 1
 	tree="$(git -C "$root" rev-parse --verify --quiet 'HEAD^{tree}')" || return 1
 	aira_ci_pass_is_hash "$tree" || return 1
 	printf '%s\n' "$tree"

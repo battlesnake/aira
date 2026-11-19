@@ -66,9 +66,14 @@ that order. A ticket file's `status` is never hand-edited. A refused transition
 The pre-push hook runs the full `make ci` on every push except three proven
 cases. Two are path-based (AIRA-315), judged only when the pushed commit sits on
 top of the `origin/master` tip and measured from that tip: when every pushed
-path is Markdown under `docs/` (`docs/**/*.md`) it skips `make ci`; when every
-path is Markdown under `docs/` or `.aira/tickets/` it runs only `make
-test-store` (the package that parses the repository's own tickets). The third
+path is a non-Go file under `docs/` or Markdown under `.aira/tickets/`, it runs,
+instead of `make ci`, only the named test that reads those files (AIRA-359):
+`make test-docs` (`TestNoLiveCodeOrDocNamesTheDeletedPrior`, the whole-tree
+text test) when the push touches `docs/`, `make test-store`
+(`TestTheRepositorysOwnTicketFilesAreReadable`) when it touches
+`.aira/tickets/`, both when it touches both. Like `make ci` these test the
+checked-out tree, so the refusal below applies to them too, and they never
+record a tree-pass marker. The third
 is a recorded pass (AIRA-355): `make ci` that passes every step from a clean
 worktree (no staged, unstaged, untracked or assume-unchanged/skip-worktree
 file, the same HEAD tree before and after, no stop-or-ignore make flag
@@ -82,7 +87,8 @@ merge or conflict resolution that produces a new tree runs in full, but a rebase
 that leaves the tree identical skips. Markers expire after 14 days or beyond the
 newest 200, after which the push runs in full. Any doubt
 (a tag, a deletion, a missing `origin/master`, a branch behind it, any other
-path or file type, such as a `.go` or `.sh` file under `docs/`, a tree with no
+path or file type, such as a `.go` file under `docs/` or a non-Markdown file
+under `.aira/tickets/`, a tree with no
 marker) runs the full `make ci`. Because `make ci` tests the checked-out tree,
 a push of a branch whose tree is neither checked out nor recorded is refused at
 once: run `make ci` in a clean worktree at that commit, or push from there.
