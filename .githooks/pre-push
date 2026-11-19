@@ -195,7 +195,11 @@ fi
 # only tree ids, so an uncommitted, untracked or hidden (assume-unchanged,
 # skip-worktree) change would change what is tested without changing any id: a
 # committed bad document passes once its fix sits uncommitted, a clean one fails
-# on an uncommitted edit. So a scope narrows only from a CLEAN worktree whose
+# on an uncommitted edit.
+# Accepted limits (the same as the full gate's, not new here): a git clean/eol
+# filter can make a clean worktree's bytes differ from the committed ones, and a
+# file edited and restored again DURING the run is not seen by the after-run
+# check, which compares only the final state. So a scope narrows only from a CLEAN worktree whose
 # tree is HEAD's (the AIRA-355 clean-tree check), re-checked after the run;
 # otherwise the push runs the full `make ci`, as before AIRA-315.
 if [ "$scope" != full ]; then
