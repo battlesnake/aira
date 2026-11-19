@@ -1643,6 +1643,12 @@ func topFooter(result runner.ConfineListResult) string {
 		grantedClause = fmt.Sprintf("granted unevaluated / ceiling %s",
 			runner.FormatConfineMegabytes(reserve.CeilingBytes))
 	}
+	// AIRA-361. The ceiling marker is drawn only when the ceiling sits below the
+	// hard limit, so the held (last known) qualifier must also live in the footer,
+	// which is always drawn: a held ceiling equal to the hard limit still says so.
+	if reserve.CeilingHeld {
+		grantedClause += " (ceiling last known)"
+	}
 	populationClause := fmt.Sprintf("%d %s, %d scope-less %s",
 		reserve.ScopeJobs, confinePlural(reserve.ScopeJobs, "scope", "scopes"),
 		reserve.ReservationJobs, confinePlural(reserve.ReservationJobs, "reservation", "reservations"))

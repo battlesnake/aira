@@ -349,6 +349,33 @@ func TestTopCeilingMarkerNamesItsCause(t *testing.T) {
 	}
 }
 
+// A HELD ceiling says "last known" in the footer even when the effective ceiling
+// equals the hard limit (no ceiling marker is drawn then); a live one does not.
+//
+// Mutation: dropping the footer qualifier (held cases red).
+func TestTopFooterQualifiesAHeldCeiling(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		effective int64
+		held      bool
+	}{
+		{"held below hard", 20 * gib, true},
+		{"held at hard limit", 32 * gib, true},
+		{"live at hard limit", 32 * gib, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			reserve := topTestFrame()
+			reserve.SliceMaxBytes = 32 * gib
+			reserve.CeilingEffectiveBytes = testCase.effective
+			reserve.CeilingMode, reserve.CeilingState, reserve.CeilingHeld = "enforce", "unthrottled", testCase.held
+			footer := topFooter(runner.ConfineListResult{SliceReserve: reserve})
+			if got := strings.Contains(footer, "(ceiling last known)"); got != testCase.held {
+				t.Fatalf("footer=%q: has qualifier=%v, want %v", footer, got, testCase.held)
+			}
+		})
+	}
+}
+
 // topScreenDispatcher answers `aira top`'s confine-list with one fixed listing.
 type topScreenDispatcher struct{ listing runner.ConfineListResult }
 
