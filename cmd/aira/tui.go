@@ -679,6 +679,9 @@ func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel pan
 		out.WriteString("loading…")
 	case !bar.Evaluated:
 		fmt.Fprintf(&out, "UNEVALUATED: %s", bar.Reason)
+		if bar.Lane != "" {
+			out.WriteString("\n" + bar.Lane)
+		}
 	default:
 		_, _, width, _ := target.GetInnerRect()
 		if width < topBarMinColumns {
@@ -714,6 +717,9 @@ func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel pan
 		}
 		for _, note := range bar.Notes {
 			out.WriteString("\n" + note)
+		}
+		if bar.Lane != "" {
+			out.WriteString("\n" + bar.Lane)
 		}
 	}
 	target.SetText(out.String())

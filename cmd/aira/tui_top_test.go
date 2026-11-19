@@ -659,12 +659,19 @@ func (d *topSmokeDispatcher) Dispatch(_ context.Context, scope daemon.WorktreeSc
 		SliceCurrentBytes: 8 * gib, SliceMaxBytes: 32 * gib,
 		SliceHighBytes: 28 * gib, SliceHighState: runner.ConfineSliceHighSet,
 		GrantedBytes: 10 * gib, CeilingBytes: 20 * gib, Jobs: 2, ScopeJobs: 2, FreezePhase: "idle",
+		// AIRA-361: the small-job lane is on and holds bravo.
+		GrantedEstablished: true, LaneCapacityBytes: 8 * gib, LaneJobMaxBytes: gib, LaneUsedBytes: gib, LaneJobs: 1,
 	}, topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 3*gib),
-		topTestRecord("CONFINE-bravo-102-bb", "bravo", 6*gib, 5*gib)))
+		topSmallRecord(topTestRecord("CONFINE-bravo-102-bb", "bravo", gib, gib/2))))
 	if err != nil {
 		return core.Response{Code: "E_INTERNAL", Error: err.Error()}
 	}
 	return core.Response{OK: true, Code: "OK", RawData: raw}
+}
+
+func topSmallRecord(record runner.ConfineRecord) runner.ConfineRecord {
+	record.Small = true
+	return record
 }
 
 func (d *topSmokeDispatcher) snapshot() (int, []string) {
@@ -728,6 +735,13 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 	}
 	if count := onUI(t, runtime, func() int { return runtime.tables[viewTop].GetRowCount() }); count != 3 { // one header plus two scopes
 		t.Fatalf("table rows=%d, want a header and two scopes", count)
+	}
+	// AIRA-361: the lane gauge and the small-lease marker reach the terminal.
+	if want := "small-job lane: 1024M / 8192M used, 1 job (max 1024M each)"; !strings.Contains(rendered, want) {
+		t.Fatalf("bar text=%q, want the lane line %q", rendered, want)
+	}
+	if cell := onUI(t, runtime, func() string { return runtime.tables[viewTop].GetCell(2, 5).Text }); !strings.Contains(cell, "1024M lane") {
+		t.Fatalf("bravo RESERVATION cell=%q, want the small-lease marker", cell)
 	}
 	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
 	select {
