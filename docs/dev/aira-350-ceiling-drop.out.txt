@@ -1,0 +1,22 @@
+window 2026-11-15 00:00 .. 2026-11-18 21:11 local (93.2 h)
+throttled samples 4731 of about 5592 minutes (84.6%); bound-by {'system-pressure': 4731}
+daemon starts (warm-up lines) 10; fairness-freeze hold lines 520
+
+## E, the effective ceiling while throttled (GiB)
+min 38.00  p10 46.75  p50 48.75  p90 50.25  max 52.50
+
+## MemAvailable while throttled (GiB): the realistic host floor today
+min 29.44  p1 36.41  p5 39.81  p50 47.28
+samples below the watchdog's 8 GiB trip: 0
+
+## E below its trailing peak (share of throttled samples; an ESTIMATE of how often a
+## partition lane gated on W could be shut, IF main was full when the drop began)
+window | drop >= d GiB | all samples | samples within 5 min after a hold line
+   2 min | 2.88 |  4.61% |  4.96% (of 2519)
+   2 min | 4.00 |  0.68% |  0.91% (of 2519)
+  10 min | 2.88 | 10.91% | 12.03% (of 2519)
+  10 min | 4.00 |  2.45% |  2.86% (of 2519)
+  60 min | 2.88 | 18.22% | 20.80% (of 2519)
+  60 min | 4.00 |  6.02% |  7.46% (of 2519)
+
+minute-to-minute falls (consecutive samples): p99 3.25 GiB, max 8.50 GiB
