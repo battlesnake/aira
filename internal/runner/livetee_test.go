@@ -590,8 +590,18 @@ func TestLiveTeeCancelDuringNormalJoinKeepsCaptureComplete(t *testing.T) {
 			}
 			t.Fatalf("cancel join launch err=%v complete=%v forced=%v codes=%v", item.err, item.record.CaptureComplete, item.record.CaptureForcedClosed, item.record.ErrorCodes)
 		}
-		if item.record.OutputRefs["out"].Digest == "" {
+		ref := item.record.OutputRefs["out"]
+		if ref.Digest == "" {
 			t.Fatal("cancel join lost capture digest")
+		}
+		// A complete flag says the drain saw EOF; only the bytes on disk prove
+		// the capture holds every byte the child wrote.
+		data, err := os.ReadFile(ref.Path)
+		if err != nil {
+			t.Fatalf("read capture %q: %v", ref.Path, err)
+		}
+		if string(data) != "cancel-join" {
+			t.Fatalf("cancel join capture = %q, want %q", data, "cancel-join")
 		}
 	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("cancel during normal live join did not return")
