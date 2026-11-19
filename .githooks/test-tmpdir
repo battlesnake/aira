@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# AIRA-357: run a Go test command with TMPDIR on tmpfs (local runs only).
+#
+#   test-tmpdir <command...>
+#
+# The store opens SQLite with synchronous(FULL), and nearly every store, daemon
+# and core test opens a fresh database under t.TempDir(). On this WSL box the
+# disk is an ext4 virtual disk with slow fsync, so those tests spend most of
+# their time in fsync (measured: internal/store 656 s on disk against 124 s on
+# /dev/shm, internal/daemon 343 s against 132 s). On tmpfs fsync is free.
+#
+# The command runs with TMPDIR set to a fresh per-run directory
+# <root>/t.XXXX (root /dev/shm), and the directory is removed when it ends.
+# The name is as short as mktemp allows because tests bind unix sockets under
+# t.TempDir(), and Linux limits a socket path to 107 bytes. t.TempDir() is
+# $TMPDIR/<test name, cut to 64 bytes><up to 10 digits>/001, so a socket
+# directly in it is len($TMPDIR) + 80 + len(name) bytes: /dev/shm/t.XXXX (15
+# bytes) fits any socket name up to 12 bytes (the tests use 6 to 11). The
+# longer /dev/shm/t.XXXXXX failed exactly that way (108 bytes, daemon.sock in
+# TestConfineQueueNoteDistinguishesAnUngrantableReserveFromContention).
+#
+# The command runs unchanged (normal TMPDIR) when:
+#   - CI is set (GitHub Actions sets CI=true; its runners have fast disks and
+#     the workflow must test what it always tested);
+#   - AIRA_TEST_TMPFS=0 (an explicit opt-out for one run);
+#   - the root is not a writable directory, or it has less than
+#     AIRA_TEST_TMPFS_MIN_KB kilobytes available (default below).
+# Either way the command and its exit status are the same: this wrapper only
+# chooses where the test temp files live, so a `make ci` pass recorded by
+# .githooks/ci-pass (AIRA-355) means the same full suite passed.
+#
+# Two more variables are exported for the tests:
+#   - GOTMPDIR keeps the go tool's build work directory (compiled test
+#     binaries) where it was, on disk, so it does not take RAM;
+#   - AIRA_TEST_DISK_TMPDIR names that disk directory for the few tests that
+#     must write real page cache (the daemon's SliceCeiling real-cgroup
+#     fixture: a file on tmpfs is shared memory, not reclaimable page cache).
+#
+# Leak sweep. A confined job has no graceful shutdown: a hard kill leaves the
+# run directory behind, and a file on tmpfs holds RAM until it is deleted or the
+# box reboots. Each run therefore first removes the directories that earlier
+# runs left. A directory is removed only when ALL of these hold:
+#   - its name is t.<4 characters>, it is a real directory (not a symlink) and
+#     the current user owns it;
+#   - it holds an owner file .aira-test-owner whose first line is the version
+#     line below, naming the pid, the pid's start time (field 22 of
+#     /proc/<pid>/stat) and the pid namespace of the run that made it;
+#   - that pid namespace is ours (in another one the pid means nothing here);
+#   - that pid is gone, or is now a different process (another start time);
+#   - the owner file is more than 10 minutes old, a margin on top of the
+#     liveness proof.
+# Anything else is left alone: a directory without a readable owner file, a
+# live run of another session, anything that is not ours.
+set -uo pipefail
+
+AIRA_TEST_TMPFS_OWNER_VERSION='aira-test-tmpdir v1'
+
+# "Too small" is under 1 GiB available. Measured (AIRA-357): the run directory
+# of a full local `make test` peaked at 113,372 KiB (du every 2 s, so a short
+# spike could be missed), with the go build directory and the SliceCeiling
+# fixture's files on disk. 1 GiB is about 9 times that, so a run neither fills
+# /dev/shm (failing tests for a reason unrelated to the code) nor takes the
+# last of the box's shared memory. AIRA_TEST_TMPFS_MIN_KB overrides it.
+AIRA_TEST_TMPFS_DEFAULT_MIN_KB=1048576
+
+# aira_test_proc_start <pid> prints the start time of <pid> (field 22 of
+# /proc/<pid>/stat), and fails when there is no such process. The command name
+# (field 2) may contain spaces and parentheses, so the fields are counted from
+# after its LAST ')'.
+aira_test_proc_start() {
+	local stat rest
+	local -a f
+	stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+	rest="${stat##*) }"
+	[ "$rest" != "$stat" ] || return 1
+	read -r -a f <<<"$rest" || return 1
+	# rest starts at field 3, so field 22 is index 19.
+	[ -n "${f[19]-}" ] || return 1
+	printf '%s\n' "${f[19]}"
+}
+
+aira_test_pidns() {
+	readlink "/proc/$1/ns/pid" 2>/dev/null
+}
+
+# aira_test_sweep <root> removes stale run directories (see the header).
+aira_test_sweep() {
+	local root="$1" ourns dir owner line pid start ns now_start
+	ourns="$(aira_test_pidns $$)" || return 0
+	[ -n "$ourns" ] || return 0
+	for dir in "$root"/t.????; do
+		[ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ] || continue
+		owner="$dir/.aira-test-owner"
+		[ -f "$owner" ] && [ ! -L "$owner" ] || continue
+		# Younger than the margin: leave it, whatever it says.
+		[ -n "$(find "$owner" -maxdepth 0 -mmin +10 2>/dev/null)" ] || continue
+		{ IFS= read -r line && read -r pid start ns; } <"$owner" || continue
+		[ "$line" = "$AIRA_TEST_TMPFS_OWNER_VERSION" ] || continue
+		case "$pid" in "" | *[!0-9]*) continue ;; esac
+		case "$start" in "" | *[!0-9]*) continue ;; esac
+		[ "$ns" = "$ourns" ] || continue
+		if now_start="$(aira_test_proc_start "$pid")" && [ "$now_start" = "$start" ]; then
+			continue
+		fi
+		rm -rf -- "$dir" && printf 'test-tmpdir: removed %s, left by a run (pid %s) that is gone (AIRA-357).\n' "$dir" "$pid" >&2
+	done
+	return 0
+}
+
+if [ "$#" -lt 1 ]; then
+	printf 'usage: test-tmpdir <command...>\n' >&2
+	exit 2
+fi
+
+if [ -n "${CI-}" ] || [ "${AIRA_TEST_TMPFS-}" = 0 ]; then
+	exec "$@"
+fi
+
+root="${AIRA_TEST_TMPFS_ROOT:-/dev/shm}"
+min_kb="${AIRA_TEST_TMPFS_MIN_KB:-$AIRA_TEST_TMPFS_DEFAULT_MIN_KB}"
+case "$min_kb" in "" | *[!0-9]*) min_kb="$AIRA_TEST_TMPFS_DEFAULT_MIN_KB" ;; esac
+
+if [ ! -d "$root" ] || [ ! -w "$root" ]; then
+	printf 'test-tmpdir: %s is not a writable directory; tests use the normal TMPDIR (AIRA-357).\n' "$root" >&2
+	exec "$@"
+fi
+
+aira_test_sweep "$root"
+
+avail_kb="$(df -Pk -- "$root" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+case "$avail_kb" in "" | *[!0-9]*) avail_kb=0 ;; esac
+if [ "$avail_kb" -lt "$min_kb" ]; then
+	printf 'test-tmpdir: %s has %s KiB available, under the %s KiB a run needs; tests use the normal TMPDIR (AIRA-357).\n' "$root" "$avail_kb" "$min_kb" >&2
+	exec "$@"
+fi
+
+if ! start="$(aira_test_proc_start $$)" || ! ns="$(aira_test_pidns $$)" || [ -z "$ns" ]; then
+	printf 'test-tmpdir: cannot read this process in /proc; tests use the normal TMPDIR (AIRA-357).\n' >&2
+	exec "$@"
+fi
+if ! run="$(mktemp -d "$root/t.XXXX")"; then
+	printf 'test-tmpdir: cannot create a run directory in %s; tests use the normal TMPDIR (AIRA-357).\n' "$root" >&2
+	exec "$@"
+fi
+trap 'rm -rf -- "$run"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if ! printf '%s\n%s %s %s\n' "$AIRA_TEST_TMPFS_OWNER_VERSION" "$$" "$start" "$ns" >"$run/.aira-test-owner"; then
+	printf 'test-tmpdir: cannot write the owner file in %s; tests use the normal TMPDIR (AIRA-357).\n' "$run" >&2
+	rm -rf -- "$run"
+	trap - EXIT
+	exec "$@"
+fi
+
+disk="${TMPDIR:-/tmp}"
+export AIRA_TEST_DISK_TMPDIR="$disk"
+export GOTMPDIR="${GOTMPDIR:-$disk}"
+export TMPDIR="$run"
+"$@"
+exit $?
