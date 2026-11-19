@@ -1,0 +1,165 @@
+# AIRA-356 auto-resize replay
+store rows 13916; AIRA-324 enforce first seen 1794847004; FLOOR 256 MiB; policies t0 [5, 15] min x m [1.25, 1.5, 2.0]
+
+## 1. Store: finished jobs, last 7 days (1794471106 .. 1795075906 unix s)
+visible jobs 13916; booked GiB-hours (all jobs, running time in window) 1409.9; mean visible booking 8.39 GiB
+
+### jobs that ran >= 5 min: 1201 (47 OOM), 85.5% of visible booked GiB-hours
+booking GiB p50 1.12 p90 9.00 max 25.32; wall min p50 10.0 p90 35.9 max 141.4
+final peak / booking: p10 0.14 p50 0.60 p90 1.00; share with peak >= booking/1.25 32%, /1.5 44%, /2 59%
+concentration of these jobs' booked GiB-hours: top 1 job 1.5%, top 5 5.4%, top 10 9.4%, top 20 16.7%, top 10% of jobs (120) 56.0%
+policy (t0=5 min)   freed GiB-h  mean GiB  share of long GiB-h  top-10 jobs' share of freed  jobs freed>0
+  m=1.25                 136.7     0.81      11.3%               19.8%                      771
+  m=1.50                  88.6     0.53       7.4%               22.7%                      627
+  m=2.00                  51.0     0.30       4.2%               29.7%                      447
+
+### jobs that ran >= 15 min: 402 (16 OOM), 66.2% of visible booked GiB-hours
+booking GiB p50 2.29 p90 10.25 max 12.60; wall min p50 27.7 p90 63.7 max 141.4
+final peak / booking: p10 0.14 p50 0.65 p90 1.00; share with peak >= booking/1.25 35%, /1.5 49%, /2 68%
+concentration of these jobs' booked GiB-hours: top 1 job 2.0%, top 5 7.0%, top 10 12.2%, top 20 21.6%, top 10% of jobs (40) 36.6%
+policy (t0=15 min)   freed GiB-h  mean GiB  share of long GiB-h  top-10 jobs' share of freed  jobs freed>0
+  m=1.25                  77.3     0.46       8.3%               28.3%                      248
+  m=1.50                  48.4     0.29       5.2%               32.1%                      193
+  m=2.00                  25.8     0.15       2.8%               45.6%                      119
+
+## 2. Store timeline (30 s grid, 7 days): ledger room each rule frees, visible jobs only
+visible queue present at 32% of instants
+rule                         room GiB p50   p90    max    mean   mean-when-queued   queue wait-hours removed (static FIFO, RAM only, ESTIMATE)
+auto-resize t0= 5 m=1.25         0.00   2.74  10.33   0.81     1.76               28.9 of 254.8 (11%)
+auto-resize t0= 5 m=1.50         0.00   1.83   7.94   0.53     1.12               15.6 of 254.8 (6%)
+auto-resize t0= 5 m=2.00         0.00   1.00   7.04   0.30     0.62                8.6 of 254.8 (3%)
+auto-resize t0=15 m=1.25         0.00   1.68   8.59   0.46     1.03               15.8 of 254.8 (6%)
+auto-resize t0=15 m=1.50         0.00   0.96   6.30   0.29     0.62                8.7 of 254.8 (3%)
+auto-resize t0=15 m=2.00         0.00   0.50   4.61   0.15     0.32                4.9 of 254.8 (2%)
+AIRA-354 k=1.10 ('k only')       4.74   5.19   6.04   4.80     4.60               82.9 of 254.8 (33%)
+AIRA-354 k=1.25 ('k only')      11.86  12.98  15.11  11.99    11.51              178.4 of 254.8 (70%)
+(354's room X = (k-1)(E - H0) from the journal's effective ceiling E; its spec adds two min() bounds that only
+ lower X. Both columns assume the queue was RAM-bound at that instant; the live section tests that.)
+
+## 3. Live `aira confine --list` samples: every running job, per-job memory.peak trajectories
+samples 660 in 2 spans (60 min, 120 min); gap p50 15 s
+
+### 3a. what the long jobs hold, per sample
+age >=  5 min: jobs p50 19 max 28; their share of all booked bytes p50 0.71 p90 0.90; top-3 long jobs' share p50 0.39 p90 0.42
+age >= 15 min: jobs p50 13 max 23; their share of all booked bytes p50 0.48 p90 0.65; top-3 long jobs' share p50 0.31 p90 0.40
+jobs older than 1 day (services; absent from the store): 5, booking 1.25 GiB, peak 0.25 GiB
+
+### 3b. trajectories: peak at t0 vs the largest peak seen later (jobs seen both at <= t0+2 min and later)
+t0= 5 min: 60 jobs observed from t0 for >= 5 min; later peak / peak at t0: p50 1.28 p90 4.50 p99 17.11 max 25.24; grew > 1.25x 30, > 1.5x 21, > 2x 12
+t0=15 min: 44 jobs observed from t0 for >= 5 min; later peak / peak at t0: p50 1.14 p90 4.14 p99 19.01 max 19.01; grew > 1.25x 13, > 1.5x 9, > 2x 7
+
+### 3c. policies on the live samples
+one-shot: shrink once at the first sample with age >= t0; ratchet: booking = min(B, max(FLOOR, m x peak at the previous sample))
+regret jobs = jobs whose peak later exceeded the booking in force; bytes = the largest excess per job
+policy            room GiB p50  p90   max   | one-shot regret: jobs/of  excess GiB p50 max  sum-at-worst | ratchet regret: jobs  events  excess GiB max | <=1GiB from >1GiB pins: n p50 GiB p50 | no-shrink (peak>=B/m)
+t0=5 m=1.25        9.14 14.74 23.24 |  148/358   41.3%    0.27  5.86   116.17       |  100 (27.9%)   149    4.68     |   3    2.01           | 63 of 358
+    one-shot room p50 16.90 p90 23.42 GiB (the left column is the ratchet's)
+t0=5 m=1.50        6.68 12.16 22.13 |  115/358   32.1%    0.55  5.86   101.67       |   73 (20.4%)    92    4.38     |   3    2.23           | 77 of 358
+    one-shot room p50 16.05 p90 22.49 GiB (the left column is the ratchet's)
+t0=5 m=2.00        4.06  9.15 19.89 |   85/358   23.7%    0.75  5.86    82.75       |   45 (12.6%)    50    3.78     |   1    0.91           | 100 of 358
+    one-shot room p50 13.01 p90 20.90 GiB (the left column is the ratchet's)
+t0=15 m=1.25       4.25  8.57 15.60 |   29/121   24.0%    0.75  3.76    28.48       |   21 (17.4%)    36    1.35     |   1    0.83           | 24 of 121
+    one-shot room p50 6.46 p90 10.95 GiB (the left column is the ratchet's)
+t0=15 m=1.50       2.84  6.94 14.37 |   23/121   19.0%    0.91  3.71    22.75       |   18 (14.9%)    27    1.04     |   1    0.81           | 32 of 121
+    one-shot room p50 5.68 p90 9.55 GiB (the left column is the ratchet's)
+t0=15 m=2.00       1.37  3.71 12.59 |   19/121   15.7%    0.92  3.60    17.95       |   15 (12.4%)    18    0.75     |   0    0.00           | 54 of 121
+    one-shot room p50 3.23 p90 8.87 GiB (the left column is the ratchet's)
+t0=15 m=1.50 min 0.5B  2.66  6.34  9.86 |   18/121   14.9%    0.59  1.48     9.88       |    9 ( 7.4%)     9    1.04     |   1    0.79           | 32 of 121
+    one-shot room p50 4.09 p90 7.02 GiB (the left column is the ratchet's)
+t0=5 m=1.25 min 0.5B  7.67 11.24 16.35 |  114/358   31.8%    0.17  3.15    45.99       |   49 (13.7%)    54    3.02     |   2    1.51           | 63 of 358
+    one-shot room p50 11.41 p90 15.82 GiB (the left column is the ratchet's)
+
+one-shot regret jobs at t0=15 m=1.50 (excess GiB, name, command, booking B, peak at t0, later peak, age at t0 and last seen, min):
+  3.71  scoped-doc-readers     make doc-readers                         B 6.28  p(t0) 0.21  later 4.02  age 15..42
+  2.10  bl3730-r5-mutation     /home/mark/tmp/wt-bl3730/fastest_ee/libs B 2.70  p(t0) 0.07  later 2.35  age 22..46
+  2.02  e3b-census-build       cargo build --release -p fs-solve --exam B 10.80  p(t0) 1.79  later 4.70  age 27..32
+  1.62  gate-dup-ratchet       make dup-ratchet                         B 3.60  p(t0) 0.13  later 1.87  age 22..26
+  1.48  cb-gate-ing            /proc/self/exe __confine-supervise --con B 3.34  p(t0) 1.24  later 3.34  age 20..23
+  1.48  docs-pool-a            uv run --frozen --python 3.14 --project  B 2.70  p(t0) 0.33  later 1.97  age 15..48
+  1.29  docs-pool-a2           uv run --frozen --python 3.14 --project  B 2.70  p(t0) 0.19  later 1.57  age 15..39
+  1.27  pn-r5-docreaders3      make doc-readers CHANGED=REQUIREMENTS.md B 4.00  p(t0) 0.40  later 1.86  age 15..26
+  1.24  bl3730-r5-docreaders   make doc-readers                         B 2.28  p(t0) 0.47  later 1.94  age 15..36
+  1.10  aira350-mut1           python3 docs/dev/aira-350-mutation-check B 1.35  p(t0) 0.07  later 1.35  age 20..27
+  0.92  kv-t1-full             go test ./...                            B 1.17  p(t0) 0.04  later 1.17  age 21..23
+  0.91  vr210r5-abboards       fastest_ee/libs/engine/.venv/bin/python  B 8.00  p(t0) 3.60  later 6.30  age 15..72
+  0.75  a4run1                 python3 -I a4_run.py                     B 1.00  p(t0) 0.03  later 1.00  age 19..20
+  0.62  a2-jlcc                python3 -I a2/jlc_a2c.py                 B 1.00  p(t0) 0.25  later 1.00  age 18..19
+  0.61  e3b-t3                 cargo test -p fs-solve --lib pdn::core:: B 9.00  p(t0) 5.59  later 9.00  age 15..23
+  0.43  b2-prof-grid2          timeout 900 target/release/fk-hostapi    B 2.70  p(t0) 0.15  later 0.68  age 25..39
+  0.38  pn-r5-docreaders2      make doc-readers CHANGED=REQUIREMENTS.md B 1.50  p(t0) 0.52  later 1.17  age 15..43
+  0.30  fem-refine-lib4        cargo test --release -p fs-solve --lib - B 6.30  p(t0) 2.90  later 4.66  age 15..18
+  0.17  codex-sol              codex exec --ephemeral --skip-git-repo-c B 1.00  p(t0) 0.30  later 0.63  age 23..25
+  0.16  gate-pool-hot          make pool-hot                            B 0.44  p(t0) 0.04  later 0.41  age 15..19
+  0.11  pr5-proof-script       python3 dev/benchmarks/plane_family_muta B 1.00  p(t0) 0.05  later 0.36  age 19..21
+  0.07  testaudit-shm-1        go test ./internal/store ./internal/daem B 1.00  p(t0) 0.33  later 0.56  age 19..21
+  0.03  bl3383-svc             make test-services TEST_PATHS=/home/mark B 1.00  p(t0) 0.06  later 0.28  age 22..22
+
+### 3d. head to head on the same samples: queued jobs that would be admitted at that instant
+room = ceiling - headroom - granted + extra (extra = ratchet room, or 354's (k-1)L); FIFO over the real queue;
+CPU: free slots = 32 - running jobs (1 slot each by default). ESTIMATE, static per sample.
+samples with a queue 659 of 660; of them CPU slots full (jobs >= 32) 84
+rule (jobs admitted per sample)    RAM-only p50 max mean | RAM+CPU p50 max mean | queued GiB admitted p50 (RAM+CPU)
+today (no change)                    0   0  mean  0.0 |   0   0  mean  0.0 | 0.00
+ratchet t0=5 m=1.25                  2  17  mean  2.7 |   1   9  mean  2.1 | 4.50
+ratchet t0=5 m=1.50                  1  14  mean  1.8 |   1   9  mean  1.5 | 2.00
+ratchet t0=5 m=2.00                  0  13  mean  0.8 |   0   9  mean  0.7 | 0.00
+ratchet t0=15 m=1.25                 0   8  mean  0.9 |   0   7  mean  0.7 | 0.00
+ratchet t0=15 m=1.50                 0   7  mean  0.5 |   0   6  mean  0.4 | 0.00
+ratchet t0=15 m=2.00                 0   6  mean  0.1 |   0   6  mean  0.1 | 0.00
+ratchet t0=15 m=1.50 min 0.5B        0   5  mean  0.4 |   0   5  mean  0.4 | 0.00
+ratchet t0=5 m=1.25 min 0.5B         1  17  mean  2.1 |   1   8  mean  1.6 | 3.00
+one-shot t0=5 m=1.25                 6  23  mean  6.7 |   3  13  mean  3.7 | 7.50
+one-shot t0=5 m=1.50                 6  21  mean  6.1 |   3  13  mean  3.5 | 7.00
+one-shot t0=5 m=2.00                 5  21  mean  5.2 |   2  13  mean  3.2 | 6.21
+one-shot t0=15 m=1.25                1  13  mean  1.8 |   1  13  mean  1.5 | 2.28
+one-shot t0=15 m=1.50                1  13  mean  1.3 |   0  13  mean  1.2 | 0.00
+one-shot t0=15 m=2.00                0  12  mean  0.8 |   0  12  mean  0.7 | 0.00
+one-shot t0=15 m=1.50 min 0.5B       0   9  mean  0.8 |   0   9  mean  0.7 | 0.00
+one-shot t0=5 m=1.25 min 0.5B        3  17  mean  3.7 |   2  10  mean  2.6 | 6.00
+AIRA-354 k=1.10                      0   3  mean  0.3 |   0   3  mean  0.3 | 0.00
+AIRA-354 k=1.25                      2  12  mean  2.9 |   2   9  mean  2.2 | 6.00
+both: 354 k=1.10 + one-shot 15/1.5   2  15  mean  3.0 |   2  14  mean  2.3 | 5.28
+both: 354 k=1.25 + one-shot 15/1.5   5  20  mean  5.9 |   3  15  mean  3.7 | 8.75
+
+### 3f. where the booked bytes go, per sample (GiB, p50 over samples)
+granted = workers + jobs younger than t0 + long jobs; long = kept (min(B, m x peak)) + room;
+peak = memory.peak (page cache included, held); current = memory.current (cache included); real = slice current - reclaimable
+t0= 5 m=1.25: granted 41.21  workers 8.50  young 0.19  long 29.99  kept 20.44  room 8.96  long_peak 16.63  long_cur 11.26  all_cur 14.71  real 12.21
+t0=15 m=1.50: granted 41.21  workers 8.50  young 12.03  long 19.50  kept 16.74  room 2.82  long_peak 13.10  long_cur 7.68  all_cur 14.71  real 12.21
+
+### 3e. host exposure on the same samples
+host MemAvailable GiB min 30.94 p50 41.95; slice real use (current - reclaimable) GiB p50 12.21 max 21.62; granted GiB p50 41.21
+sum of running caps GiB p50 43.38 max 49.05; slice memory.max GiB 64.00; caps above memory.max - H0 today: 0 of 660 samples
+if each rule's room were filled at full booking, caps would exceed memory.max - H0 in (samples):
+  auto-resize ratchet  t0=5 m=1.25: 34 (caps + room p50 52.43 GiB)
+  auto-resize one-shot t0=5 m=1.25: 264 (caps + room p50 60.74 GiB)
+  auto-resize ratchet  t0=5 m=1.50: 3 (caps + room p50 50.33 GiB)
+  auto-resize one-shot t0=5 m=1.50: 207 (caps + room p50 59.69 GiB)
+  auto-resize ratchet  t0=5 m=2.00: 2 (caps + room p50 47.85 GiB)
+  auto-resize one-shot t0=5 m=2.00: 117 (caps + room p50 57.35 GiB)
+  auto-resize ratchet  t0=15 m=1.25: 0 (caps + room p50 47.37 GiB)
+  auto-resize one-shot t0=15 m=1.25: 13 (caps + room p50 50.48 GiB)
+  auto-resize ratchet  t0=15 m=1.50: 0 (caps + room p50 46.16 GiB)
+  auto-resize one-shot t0=15 m=1.50: 12 (caps + room p50 49.21 GiB)
+  auto-resize ratchet  t0=15 m=2.00: 0 (caps + room p50 45.14 GiB)
+  auto-resize one-shot t0=15 m=2.00: 0 (caps + room p50 47.50 GiB)
+  auto-resize ratchet  t0=15 m=1.50 min 0.5B: 0 (caps + room p50 46.00 GiB)
+  auto-resize one-shot t0=15 m=1.50 min 0.5B: 0 (caps + room p50 47.56 GiB)
+  auto-resize ratchet  t0=5 m=1.25 min 0.5B: 14 (caps + room p50 50.98 GiB)
+  auto-resize one-shot t0=5 m=1.25 min 0.5B: 53 (caps + room p50 55.05 GiB)
+  AIRA-354 k=1.10 ('k only', before its memory.max bound): 0
+  AIRA-354 k=1.25 ('k only', before its memory.max bound): 0
+worst case either rule adds (every freed / overbooked byte used at once) = the room column itself: the ledger
+under-counts what jobs may legally use by exactly that much (memory.max unchanged in both). The difference is
+whose bytes: auto-resize lends bytes a job has not touched for t0 minutes; 354 lends bytes of no particular job.
+
+## 4. Hand resizes in the journal (AIRA-312, `aira confine --resize`)
+resizes 17 over 4.6 days; GiB handed back per resize p50 0.06 max 1.00, total 2.85; new/old p50 0.50; usage/new p50 0.00
+distinct scopes 9
+
+## 5. Store coverage: store-visible running bookings / live granted, at live samples inside the store window
+samples 180: ratio p10 0.24 p50 0.33 p90 0.52 (the store sections see this share of the real load;
+ aitest workers are kind=pytest-worker and excluded by design, as the policy excludes them)
+
+LIMITS: see the module docstring (no store timeline: final peak used as P(t0); page cache in memory.peak;
+20-row retention and absent running jobs; a few hours of live trajectories; static queue estimates).
