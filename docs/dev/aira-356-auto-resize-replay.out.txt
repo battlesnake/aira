@@ -38,61 +38,44 @@ AIRA-354 k=1.25 ('k only')      11.86  12.98  15.11  11.99    11.51             
 
 ## 3. Live `aira confine --list` samples: every running job, per-job memory.peak trajectories
 samples 660 in 2 spans (60 min, 120 min); gap p50 15 s
+age = time since grant: 1120 scopes timed from their first running sighting, 44 already running at a span's start keep their launch age (includes queue wait; an upper bound)
 
 ### 3a. what the long jobs hold, per sample
-age >=  5 min: jobs p50 19 max 28; their share of all booked bytes p50 0.71 p90 0.90; top-3 long jobs' share p50 0.39 p90 0.42
-age >= 15 min: jobs p50 13 max 23; their share of all booked bytes p50 0.48 p90 0.65; top-3 long jobs' share p50 0.31 p90 0.40
+age >=  5 min: jobs p50 15 max 24; their share of all booked bytes p50 0.53 p90 0.71; top-3 long jobs' share p50 0.31 p90 0.40
+age >= 15 min: jobs p50 11 max 18; their share of all booked bytes p50 0.35 p90 0.54; top-3 long jobs' share p50 0.26 p90 0.38
 jobs older than 1 day (services; absent from the store): 5, booking 1.25 GiB, peak 0.25 GiB
 
 ### 3b. trajectories: peak at t0 vs the largest peak seen later (jobs seen both at <= t0+2 min and later)
-t0= 5 min: 60 jobs observed from t0 for >= 5 min; later peak / peak at t0: p50 1.28 p90 4.50 p99 17.11 max 25.24; grew > 1.25x 30, > 1.5x 21, > 2x 12
-t0=15 min: 44 jobs observed from t0 for >= 5 min; later peak / peak at t0: p50 1.14 p90 4.14 p99 19.01 max 19.01; grew > 1.25x 13, > 1.5x 9, > 2x 7
+t0= 5 min: 64 jobs observed from t0 for >= 5 min; later peak / peak at t0: p50 1.11 p90 2.23 p99 8.23 max 19.01; grew > 1.25x 20, > 1.5x 9, > 2x 7
+t0=15 min: 31 jobs observed from t0 for >= 5 min; later peak / peak at t0: p50 1.22 p90 1.79 p99 3.95 max 3.95; grew > 1.25x 12, > 1.5x 6, > 2x 3
 
 ### 3c. policies on the live samples
 one-shot: shrink once at the first sample with age >= t0; ratchet: booking = min(B, max(FLOOR, m x peak at the previous sample))
 regret jobs = jobs whose peak later exceeded the booking in force; bytes = the largest excess per job
-policy            room GiB p50  p90   max   | one-shot regret: jobs/of  excess GiB p50 max  sum-at-worst | ratchet regret: jobs  events  excess GiB max | <=1GiB from >1GiB pins: n p50 GiB p50 | no-shrink (peak>=B/m)
-t0=5 m=1.25        9.14 14.74 23.24 |  148/358   41.3%    0.27  5.86   116.17       |  100 (27.9%)   149    4.68     |   3    2.01           | 63 of 358
-    one-shot room p50 16.90 p90 23.42 GiB (the left column is the ratchet's)
-t0=5 m=1.50        6.68 12.16 22.13 |  115/358   32.1%    0.55  5.86   101.67       |   73 (20.4%)    92    4.38     |   3    2.23           | 77 of 358
-    one-shot room p50 16.05 p90 22.49 GiB (the left column is the ratchet's)
-t0=5 m=2.00        4.06  9.15 19.89 |   85/358   23.7%    0.75  5.86    82.75       |   45 (12.6%)    50    3.78     |   1    0.91           | 100 of 358
-    one-shot room p50 13.01 p90 20.90 GiB (the left column is the ratchet's)
-t0=15 m=1.25       4.25  8.57 15.60 |   29/121   24.0%    0.75  3.76    28.48       |   21 (17.4%)    36    1.35     |   1    0.83           | 24 of 121
-    one-shot room p50 6.46 p90 10.95 GiB (the left column is the ratchet's)
-t0=15 m=1.50       2.84  6.94 14.37 |   23/121   19.0%    0.91  3.71    22.75       |   18 (14.9%)    27    1.04     |   1    0.81           | 32 of 121
-    one-shot room p50 5.68 p90 9.55 GiB (the left column is the ratchet's)
-t0=15 m=2.00       1.37  3.71 12.59 |   19/121   15.7%    0.92  3.60    17.95       |   15 (12.4%)    18    0.75     |   0    0.00           | 54 of 121
-    one-shot room p50 3.23 p90 8.87 GiB (the left column is the ratchet's)
-t0=15 m=1.50 min 0.5B  2.66  6.34  9.86 |   18/121   14.9%    0.59  1.48     9.88       |    9 ( 7.4%)     9    1.04     |   1    0.79           | 32 of 121
-    one-shot room p50 4.09 p90 7.02 GiB (the left column is the ratchet's)
-t0=5 m=1.25 min 0.5B  7.67 11.24 16.35 |  114/358   31.8%    0.17  3.15    45.99       |   49 (13.7%)    54    3.02     |   2    1.51           | 63 of 358
-    one-shot room p50 11.41 p90 15.82 GiB (the left column is the ratchet's)
+policy            room GiB p50  p90   max   | one-shot regret: jobs/of  excess GiB p50 max  sum-at-worst | ratchet regret: jobs  events  excess GiB max | <=1GiB from >1GiB pins: n p50 GiB p50 | no-shrink (peak>=B/m) | one-shot regret of shrunk
+t0=5 m=1.25        5.54  8.19 16.94 |   30/144   20.8%    0.09  3.76    18.52       |    9 ( 6.2%)    19    0.75     |   2    1.63           | 31 of 144 | 30/113 26.5%
+    one-shot room p50 7.99 p90 11.92 GiB (the left column is the ratchet's)
+t0=5 m=1.50        3.91  6.84 13.97 |   10/144    6.9%    1.27  3.71    13.95       |    7 ( 4.9%)    13    0.61     |   2    1.72           | 41 of 144 | 10/103 9.7%
+    one-shot room p50 6.37 p90 10.88 GiB (the left column is the ratchet's)
+t0=5 m=2.00        2.21  4.36  8.46 |    8/144    5.6%    1.19  3.60    10.86       |    6 ( 4.2%)     7    0.41     |   1    0.64           | 66 of 144 | 8/78 10.3%
+    one-shot room p50 5.08 p90 9.14 GiB (the left column is the ratchet's)
+t0=15 m=1.25       2.41  5.69 12.33 |   12/69    17.4%    0.53  2.01     7.97       |    5 ( 7.2%)     6    0.59     |   1    0.61           | 19 of 69 | 12/50 24.0%
+    one-shot room p50 4.04 p90 6.38 GiB (the left column is the ratchet's)
+t0=15 m=1.50       1.59  4.08  9.30 |    5/69     7.2%    0.61  1.20     3.35       |    3 ( 4.3%)     3    0.45     |   0    0.00           | 22 of 69 | 5/47 10.6%
+    one-shot room p50 2.67 p90 5.03 GiB (the left column is the ratchet's)
+t0=15 m=2.00       0.70  2.06  3.85 |    2/69     2.9%    0.96  0.96     1.08       |    2 ( 2.9%)     2    0.18     |   0    0.00           | 41 of 69 | 2/28 7.1%
+    one-shot room p50 1.31 p90 3.17 GiB (the left column is the ratchet's)
+t0=15 m=1.50 min 0.5B  1.59  3.95  9.30 |    5/69     7.2%    0.61  0.91     2.95       |    3 ( 4.3%)     3    0.38     |   0    0.00           | 22 of 69 | 5/47 10.6%
+    one-shot room p50 2.59 p90 4.92 GiB (the left column is the ratchet's)
+t0=5 m=1.25 min 0.5B  4.72  7.59 15.06 |   26/144   18.1%    0.09  2.30     9.78       |    5 ( 3.5%)     6    0.75     |   2    1.47           | 31 of 144 | 26/113 23.0%
+    one-shot room p50 6.25 p90 9.70 GiB (the left column is the ratchet's)
 
 one-shot regret jobs at t0=15 m=1.50 (excess GiB, name, command, booking B, peak at t0, later peak, age at t0 and last seen, min):
-  3.71  scoped-doc-readers     make doc-readers                         B 6.28  p(t0) 0.21  later 4.02  age 15..42
-  2.10  bl3730-r5-mutation     /home/mark/tmp/wt-bl3730/fastest_ee/libs B 2.70  p(t0) 0.07  later 2.35  age 22..46
-  2.02  e3b-census-build       cargo build --release -p fs-solve --exam B 10.80  p(t0) 1.79  later 4.70  age 27..32
-  1.62  gate-dup-ratchet       make dup-ratchet                         B 3.60  p(t0) 0.13  later 1.87  age 22..26
-  1.48  cb-gate-ing            /proc/self/exe __confine-supervise --con B 3.34  p(t0) 1.24  later 3.34  age 20..23
-  1.48  docs-pool-a            uv run --frozen --python 3.14 --project  B 2.70  p(t0) 0.33  later 1.97  age 15..48
-  1.29  docs-pool-a2           uv run --frozen --python 3.14 --project  B 2.70  p(t0) 0.19  later 1.57  age 15..39
-  1.27  pn-r5-docreaders3      make doc-readers CHANGED=REQUIREMENTS.md B 4.00  p(t0) 0.40  later 1.86  age 15..26
-  1.24  bl3730-r5-docreaders   make doc-readers                         B 2.28  p(t0) 0.47  later 1.94  age 15..36
-  1.10  aira350-mut1           python3 docs/dev/aira-350-mutation-check B 1.35  p(t0) 0.07  later 1.35  age 20..27
-  0.92  kv-t1-full             go test ./...                            B 1.17  p(t0) 0.04  later 1.17  age 21..23
+  1.20  bl3730-r5-docreaders   make doc-readers                         B 2.28  p(t0) 0.49  later 1.94  age 15..28
   0.91  vr210r5-abboards       fastest_ee/libs/engine/.venv/bin/python  B 8.00  p(t0) 3.60  later 6.30  age 15..72
-  0.75  a4run1                 python3 -I a4_run.py                     B 1.00  p(t0) 0.03  later 1.00  age 19..20
-  0.62  a2-jlcc                python3 -I a2/jlc_a2c.py                 B 1.00  p(t0) 0.25  later 1.00  age 18..19
   0.61  e3b-t3                 cargo test -p fs-solve --lib pdn::core:: B 9.00  p(t0) 5.59  later 9.00  age 15..23
-  0.43  b2-prof-grid2          timeout 900 target/release/fk-hostapi    B 2.70  p(t0) 0.15  later 0.68  age 25..39
-  0.38  pn-r5-docreaders2      make doc-readers CHANGED=REQUIREMENTS.md B 1.50  p(t0) 0.52  later 1.17  age 15..43
-  0.30  fem-refine-lib4        cargo test --release -p fs-solve --lib - B 6.30  p(t0) 2.90  later 4.66  age 15..18
-  0.17  codex-sol              codex exec --ephemeral --skip-git-repo-c B 1.00  p(t0) 0.30  later 0.63  age 23..25
-  0.16  gate-pool-hot          make pool-hot                            B 0.44  p(t0) 0.04  later 0.41  age 15..19
-  0.11  pr5-proof-script       python3 dev/benchmarks/plane_family_muta B 1.00  p(t0) 0.05  later 0.36  age 19..21
-  0.07  testaudit-shm-1        go test ./internal/store ./internal/daem B 1.00  p(t0) 0.33  later 0.56  age 19..21
-  0.03  bl3383-svc             make test-services TEST_PATHS=/home/mark B 1.00  p(t0) 0.06  later 0.28  age 22..22
+  0.38  pn-r5-docreaders2      make doc-readers CHANGED=REQUIREMENTS.md B 1.50  p(t0) 0.52  later 1.17  age 15..30
+  0.25  docs-pool-a            uv run --frozen --python 3.14 --project  B 2.70  p(t0) 1.15  later 1.97  age 15..34
 
 ### 3d. head to head on the same samples: queued jobs that would be admitted at that instant
 room = ceiling - headroom - granted + extra (extra = ratchet room, or 354's (k-1)L); FIFO over the real queue;
@@ -100,53 +83,53 @@ CPU: free slots = 32 - running jobs (1 slot each by default). ESTIMATE, static p
 samples with a queue 659 of 660; of them CPU slots full (jobs >= 32) 84
 rule (jobs admitted per sample)    RAM-only p50 max mean | RAM+CPU p50 max mean | queued GiB admitted p50 (RAM+CPU)
 today (no change)                    0   0  mean  0.0 |   0   0  mean  0.0 | 0.00
-ratchet t0=5 m=1.25                  2  17  mean  2.7 |   1   9  mean  2.1 | 4.50
-ratchet t0=5 m=1.50                  1  14  mean  1.8 |   1   9  mean  1.5 | 2.00
-ratchet t0=5 m=2.00                  0  13  mean  0.8 |   0   9  mean  0.7 | 0.00
-ratchet t0=15 m=1.25                 0   8  mean  0.9 |   0   7  mean  0.7 | 0.00
-ratchet t0=15 m=1.50                 0   7  mean  0.5 |   0   6  mean  0.4 | 0.00
-ratchet t0=15 m=2.00                 0   6  mean  0.1 |   0   6  mean  0.1 | 0.00
-ratchet t0=15 m=1.50 min 0.5B        0   5  mean  0.4 |   0   5  mean  0.4 | 0.00
-ratchet t0=5 m=1.25 min 0.5B         1  17  mean  2.1 |   1   8  mean  1.6 | 3.00
-one-shot t0=5 m=1.25                 6  23  mean  6.7 |   3  13  mean  3.7 | 7.50
-one-shot t0=5 m=1.50                 6  21  mean  6.1 |   3  13  mean  3.5 | 7.00
-one-shot t0=5 m=2.00                 5  21  mean  5.2 |   2  13  mean  3.2 | 6.21
-one-shot t0=15 m=1.25                1  13  mean  1.8 |   1  13  mean  1.5 | 2.28
-one-shot t0=15 m=1.50                1  13  mean  1.3 |   0  13  mean  1.2 | 0.00
-one-shot t0=15 m=2.00                0  12  mean  0.8 |   0  12  mean  0.7 | 0.00
-one-shot t0=15 m=1.50 min 0.5B       0   9  mean  0.8 |   0   9  mean  0.7 | 0.00
-one-shot t0=5 m=1.25 min 0.5B        3  17  mean  3.7 |   2  10  mean  2.6 | 6.00
+ratchet t0=5 m=1.25                  0  12  mean  1.2 |   0   8  mean  0.9 | 0.00
+ratchet t0=5 m=1.50                  0   9  mean  0.7 |   0   8  mean  0.6 | 0.00
+ratchet t0=5 m=2.00                  0   6  mean  0.1 |   0   5  mean  0.1 | 0.00
+ratchet t0=15 m=1.25                 0   8  mean  0.4 |   0   7  mean  0.4 | 0.00
+ratchet t0=15 m=1.50                 0   5  mean  0.2 |   0   5  mean  0.2 | 0.00
+ratchet t0=15 m=2.00                 0   1  mean  0.0 |   0   1  mean  0.0 | 0.00
+ratchet t0=15 m=1.50 min 0.5B        0   5  mean  0.2 |   0   5  mean  0.2 | 0.00
+ratchet t0=5 m=1.25 min 0.5B         0  11  mean  0.9 |   0   8  mean  0.7 | 0.00
+one-shot t0=5 m=1.25                 1  17  mean  2.1 |   1   8  mean  1.6 | 4.00
+one-shot t0=5 m=1.50                 1  12  mean  1.7 |   1   8  mean  1.2 | 2.50
+one-shot t0=5 m=2.00                 0   8  mean  0.9 |   0   7  mean  0.8 | 0.00
+one-shot t0=15 m=1.25                0  12  mean  0.7 |   0   7  mean  0.6 | 0.00
+one-shot t0=15 m=1.50                0   8  mean  0.4 |   0   6  mean  0.4 | 0.00
+one-shot t0=15 m=2.00                0   1  mean  0.0 |   0   1  mean  0.0 | 0.00
+one-shot t0=15 m=1.50 min 0.5B       0   8  mean  0.4 |   0   6  mean  0.3 | 0.00
+one-shot t0=5 m=1.25 min 0.5B        1  12  mean  1.4 |   0   8  mean  1.1 | 0.00
 AIRA-354 k=1.10                      0   3  mean  0.3 |   0   3  mean  0.3 | 0.00
 AIRA-354 k=1.25                      2  12  mean  2.9 |   2   9  mean  2.2 | 6.00
-both: 354 k=1.10 + one-shot 15/1.5   2  15  mean  3.0 |   2  14  mean  2.3 | 5.28
-both: 354 k=1.25 + one-shot 15/1.5   5  20  mean  5.9 |   3  15  mean  3.7 | 8.75
+both: 354 k=1.10 + one-shot 15/1.5   1  12  mean  1.6 |   1   7  mean  1.2 | 1.00
+both: 354 k=1.25 + one-shot 15/1.5   4  17  mean  4.1 |   2  10  mean  2.7 | 7.00
 
 ### 3f. where the booked bytes go, per sample (GiB, p50 over samples)
 granted = workers + jobs younger than t0 + long jobs; long = kept (min(B, m x peak)) + room;
 peak = memory.peak (page cache included, held); current = memory.current (cache included); real = slice current - reclaimable
-t0= 5 m=1.25: granted 41.21  workers 8.50  young 0.19  long 29.99  kept 20.44  room 8.96  long_peak 16.63  long_cur 11.26  all_cur 14.71  real 12.21
-t0=15 m=1.50: granted 41.21  workers 8.50  young 12.03  long 19.50  kept 16.74  room 2.82  long_peak 13.10  long_cur 7.68  all_cur 14.71  real 12.21
+t0= 5 m=1.25: granted 41.21  workers 8.50  young 9.93  long 21.52  kept 15.94  room 5.51  long_peak 13.34  long_cur 8.27  all_cur 14.71  real 12.21
+t0=15 m=1.50: granted 41.21  workers 8.50  young 16.38  long 14.45  kept 12.94  room 1.54  long_peak 9.83  long_cur 6.07  all_cur 14.71  real 12.21
 
 ### 3e. host exposure on the same samples
 host MemAvailable GiB min 30.94 p50 41.95; slice real use (current - reclaimable) GiB p50 12.21 max 21.62; granted GiB p50 41.21
 sum of running caps GiB p50 43.38 max 49.05; slice memory.max GiB 64.00; caps above memory.max - H0 today: 0 of 660 samples
 if each rule's room were filled at full booking, caps would exceed memory.max - H0 in (samples):
-  auto-resize ratchet  t0=5 m=1.25: 34 (caps + room p50 52.43 GiB)
-  auto-resize one-shot t0=5 m=1.25: 264 (caps + room p50 60.74 GiB)
-  auto-resize ratchet  t0=5 m=1.50: 3 (caps + room p50 50.33 GiB)
-  auto-resize one-shot t0=5 m=1.50: 207 (caps + room p50 59.69 GiB)
-  auto-resize ratchet  t0=5 m=2.00: 2 (caps + room p50 47.85 GiB)
-  auto-resize one-shot t0=5 m=2.00: 117 (caps + room p50 57.35 GiB)
-  auto-resize ratchet  t0=15 m=1.25: 0 (caps + room p50 47.37 GiB)
-  auto-resize one-shot t0=15 m=1.25: 13 (caps + room p50 50.48 GiB)
-  auto-resize ratchet  t0=15 m=1.50: 0 (caps + room p50 46.16 GiB)
-  auto-resize one-shot t0=15 m=1.50: 12 (caps + room p50 49.21 GiB)
-  auto-resize ratchet  t0=15 m=2.00: 0 (caps + room p50 45.14 GiB)
-  auto-resize one-shot t0=15 m=2.00: 0 (caps + room p50 47.50 GiB)
-  auto-resize ratchet  t0=15 m=1.50 min 0.5B: 0 (caps + room p50 46.00 GiB)
-  auto-resize one-shot t0=15 m=1.50 min 0.5B: 0 (caps + room p50 47.56 GiB)
-  auto-resize ratchet  t0=5 m=1.25 min 0.5B: 14 (caps + room p50 50.98 GiB)
-  auto-resize one-shot t0=5 m=1.25 min 0.5B: 53 (caps + room p50 55.05 GiB)
+  auto-resize ratchet  t0=5 m=1.25: 4 (caps + room p50 48.64 GiB)
+  auto-resize one-shot t0=5 m=1.25: 26 (caps + room p50 51.08 GiB)
+  auto-resize ratchet  t0=5 m=1.50: 0 (caps + room p50 47.37 GiB)
+  auto-resize one-shot t0=5 m=1.50: 0 (caps + room p50 49.70 GiB)
+  auto-resize ratchet  t0=5 m=2.00: 0 (caps + room p50 45.92 GiB)
+  auto-resize one-shot t0=5 m=2.00: 0 (caps + room p50 48.18 GiB)
+  auto-resize ratchet  t0=15 m=1.25: 0 (caps + room p50 45.67 GiB)
+  auto-resize one-shot t0=15 m=1.25: 0 (caps + room p50 47.12 GiB)
+  auto-resize ratchet  t0=15 m=1.50: 0 (caps + room p50 44.85 GiB)
+  auto-resize one-shot t0=15 m=1.50: 0 (caps + room p50 45.91 GiB)
+  auto-resize ratchet  t0=15 m=2.00: 0 (caps + room p50 44.26 GiB)
+  auto-resize one-shot t0=15 m=2.00: 0 (caps + room p50 44.60 GiB)
+  auto-resize ratchet  t0=15 m=1.50 min 0.5B: 0 (caps + room p50 44.83 GiB)
+  auto-resize one-shot t0=15 m=1.50 min 0.5B: 0 (caps + room p50 45.61 GiB)
+  auto-resize ratchet  t0=5 m=1.25 min 0.5B: 2 (caps + room p50 47.76 GiB)
+  auto-resize one-shot t0=5 m=1.25 min 0.5B: 4 (caps + room p50 49.20 GiB)
   AIRA-354 k=1.10 ('k only', before its memory.max bound): 0
   AIRA-354 k=1.25 ('k only', before its memory.max bound): 0
 worst case either rule adds (every freed / overbooked byte used at once) = the room column itself: the ledger

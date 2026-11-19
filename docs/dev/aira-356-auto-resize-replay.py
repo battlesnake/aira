@@ -267,6 +267,32 @@ def load_live(paths):
     return out
 
 
+def apply_grant_age(snaps, spans):
+    # AGE SINCE GRANT. The list's age_seconds counts from the scope id's launch stamp, so it includes
+    # the queue wait; the policy keys on grantedAt. A job first seen running after a span's first
+    # sample was granted within one gap before that sighting: its grant time is the sighting. A job
+    # already running at a span's first sample keeps its launch age (an upper bound on its age since
+    # grant: it can only make the rule act early, the pessimistic direction for regret).
+    first_t = {a for a, _ in spans}
+    grant_t, launch_aged = {}, set()
+    for t, d in snaps:
+        for sc in d.get("scopes", []):
+            sid = sc.get("scope_id")
+            if sid in grant_t or sc.get("age_seconds") is None:
+                continue
+            if t in first_t:
+                grant_t[sid] = t - sc["age_seconds"]
+                launch_aged.add(sid)
+            else:
+                grant_t[sid] = t
+    for t, d in snaps:
+        for sc in d.get("scopes", []):
+            if sc.get("scope_id") in grant_t:
+                sc["launch_age_seconds"] = sc["age_seconds"]
+                sc["age_seconds"] = max(0, int(t - grant_t[sc["scope_id"]]))
+    return len(grant_t) - len(launch_aged), len(launch_aged)
+
+
 def eligible(sc):
     return (not sc.get("worker")) and sc.get("reserve_bytes") and sc.get("peak_rss") is not None \
         and sc.get("age_seconds") is not None
@@ -289,6 +315,10 @@ def live_section(snaps, out):
     spans.append(cur)
     p("samples %d in %d spans (%s); gap p50 %.0f s" % (
         len(snaps), len(spans), ", ".join("%.0f min" % ((b - a) / 60) for a, b in spans), q(gaps, .5)))
+
+    n_seen, n_launch = apply_grant_age(snaps, spans)
+    p("age = time since grant: %d scopes timed from their first running sighting, %d already running at a span's"
+      " start keep their launch age (includes queue wait; an upper bound)" % (n_seen, n_launch))
 
     # per-scope series: (t, age, peak, current, booking, cap)
     series = {}
@@ -351,7 +381,7 @@ def live_section(snaps, out):
     p("one-shot: shrink once at the first sample with age >= t0; ratchet: booking = min(B, max(FLOOR, m x peak at the previous sample))")
     p("regret jobs = jobs whose peak later exceeded the booking in force; bytes = the largest excess per job")
     hdr = ("policy            room GiB p50  p90   max   | one-shot regret: jobs/of  excess GiB p50 max  sum-at-worst | "
-           "ratchet regret: jobs  events  excess GiB max | <=1GiB from >1GiB pins: n p50 GiB p50 | no-shrink (peak>=B/m)")
+           "ratchet regret: jobs  events  excess GiB max | <=1GiB from >1GiB pins: n p50 GiB p50 | no-shrink (peak>=B/m) | one-shot regret of shrunk")
     p(hdr)
     tindex = {t: i for i, (t, _) in enumerate(snaps)}
     drill = []
@@ -401,12 +431,13 @@ def live_section(snaps, out):
             if jr:
                 rt_reg += 1
                 rt_exc.append(worst)
-        p("%-17s %5s %5s %5s | %4d/%-4d %5.1f%%   %5s %5s   %6s       | %4d (%4.1f%%) %5d  %6s     | %3d   %5s           | %d of %d" % (
+        p("%-17s %5s %5s %5s | %4d/%-4d %5.1f%%   %5s %5s   %6s       | %4d (%4.1f%%) %5d  %6s     | %3d   %5s           | %d of %d | %d/%d %.1f%%" % (
             lab(t0, m, fr), g(q(room_rt, .5)), g(q(room_rt, .9)), g(max(room_rt)),
             os_reg, os_n, 100 * os_reg / os_n if os_n else 0,
             g(q(os_exc, .5)) if os_exc else "-", g(max(os_exc)) if os_exc else "-", g(sum(os_exc)),
             rt_reg, 100 * rt_reg / os_n if os_n else 0, rt_ev, g(max(rt_exc)) if rt_exc else "-",
-            q(small_n, .5), g(q(small_b, .5)), noshrink, considered))
+            q(small_n, .5), g(q(small_b, .5)), noshrink, considered,
+            os_reg, considered - noshrink, 100 * os_reg / max(1, considered - noshrink)))
         p("    one-shot room p50 %s p90 %s GiB (the left column is the ratchet's)" % (g(q(room_os, .5)), g(q(room_os, .9))))
     p("")
     p("one-shot regret jobs at t0=15 m=1.50 (excess GiB, name, command, booking B, peak at t0, later peak, age at t0 and last seen, min):")
@@ -423,17 +454,21 @@ def live_section(snaps, out):
     rt_room, os_room = {}, {}
     for t0, m, fr in LIVE_POLS:
         rr, orr = [], []
-        fixed = {}
+        fixed, prevpk = {}, {}
         for t, d in snaps:
             tot = otot = 0
             for sc in d.get("scopes", []):
                 if not eligible(sc) or sc["age_seconds"] < t0 * 60:
                     continue
                 b = sc["reserve_bytes"]
-                tot += b - booked(m, sc["peak_rss"], b, fr)
+                # ratchet: booked from the PREVIOUS sample's peak, as its regret accounting is
+                tot += b - booked(m, prevpk.get(sc["scope_id"], sc["peak_rss"]), b, fr)
                 if sc["scope_id"] not in fixed:
                     fixed[sc["scope_id"]] = booked(m, sc["peak_rss"], b, fr)
                 otot += max(0, b - fixed[sc["scope_id"]])
+            for sc in d.get("scopes", []):
+                if eligible(sc):
+                    prevpk[sc["scope_id"]] = sc["peak_rss"]
             rr.append(tot)
             orr.append(otot)
         rt_room[(t0, m, fr)] = rr
@@ -635,6 +670,16 @@ def selftest():
     # is 4 GiB - 256 MiB = 3.75 GiB (counting the overrun past B would give 4.05).
     m = re.search(r"\|\s+1/1\s+100\.0%\s+(\S+)\s+(\S+)", line)
     assert m and m.group(1) == "3.75" and m.group(2) == "3.75", line
+    assert "0 scopes timed from their first running sighting, 1 already running" in buf.getvalue()
+    # a job first seen at the second sample of a span is aged from that sighting, not from its launch
+    # stamp (which includes its queue wait): 600 s of launch age at sighting, 20 s later it is 20 s old
+    late = [(1000.0, {"slice_reserve": {}, "queued": [], "scopes": []}),
+            (1020.0, {"slice_reserve": {}, "queued": [], "scopes": [{"scope_id": "q", "age_seconds": 600,
+                                                                      "peak_rss": GIB, "reserve_bytes": b}]}),
+            (1040.0, {"slice_reserve": {}, "queued": [], "scopes": [{"scope_id": "q", "age_seconds": 620,
+                                                                      "peak_rss": GIB, "reserve_bytes": b}]})]
+    assert apply_grant_age(late, [[1000.0, 1040.0]]) == (1, 0)
+    assert late[2][1]["scopes"][0]["age_seconds"] == 20, late[2][1]["scopes"][0]
     print("selftest: pass")
 
 
