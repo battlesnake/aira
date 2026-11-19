@@ -502,6 +502,111 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 	}
 }
 
+// TestPrePushNarrowsOnlyFromACleanWorktree (AIRA-359): the narrowed targets
+// read the WORKING files, but every check before them compares tree ids, so a
+// change that is not committed would change what they test without changing
+// any id. Every docs-only push below is one the classifier narrows; each dirty
+// case must instead run the full make ci (the scope falls back, it is not
+// refused), and the clean control must still narrow and leave no marker. The
+// document names the deleted prior (the text test's needle, assembled so this
+// file does not match it) in one of the two states, as in the reported
+// counterexample.
+func TestPrePushNarrowsOnlyFromACleanWorktree(t *testing.T) {
+	t.Parallel()
+	const doc = "docs/dev/names.md"
+	bad := "names the " + "p90" + "-prior\n"
+	good := "names nothing\n"
+	cases := []struct {
+		name string
+		want string
+		run  func(t *testing.T, fx pushFixture) (string, error)
+	}{
+		{"clean-committed-doc", "test-docs", func(t *testing.T, fx pushFixture) (string, error) {
+			fx.write(t, doc, good)
+			fx.commitAll(t, "doc")
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"needle-only-in-unstaged-working-file", "ci", func(t *testing.T, fx pushFixture) (string, error) {
+			fx.write(t, doc, good)
+			fx.commitAll(t, "doc")
+			fx.write(t, doc, bad)
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"needle-removed-uncommitted", "ci", func(t *testing.T, fx pushFixture) (string, error) {
+			fx.write(t, doc, bad)
+			fx.commitAll(t, "doc naming the prior")
+			fx.write(t, doc, good)
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"needle-removed-staged-only", "ci", func(t *testing.T, fx pushFixture) (string, error) {
+			fx.write(t, doc, bad)
+			fx.commitAll(t, "doc naming the prior")
+			fx.write(t, doc, good)
+			fx.git(t, fx.worktree, "add", doc)
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"needle-in-untracked-file", "ci", func(t *testing.T, fx pushFixture) (string, error) {
+			fx.write(t, doc, good)
+			fx.commitAll(t, "doc")
+			fx.write(t, "docs/dev/untracked.md", bad)
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"needle-removed-under-assume-unchanged", "ci", func(t *testing.T, fx pushFixture) (string, error) {
+			fx.write(t, doc, bad)
+			fx.commitAll(t, "doc naming the prior")
+			fx.git(t, fx.worktree, "update-index", "--assume-unchanged", doc)
+			fx.write(t, doc, good)
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"needle-removed-under-skip-worktree", "ci", func(t *testing.T, fx pushFixture) (string, error) {
+			fx.write(t, doc, bad)
+			fx.commitAll(t, "doc naming the prior")
+			fx.git(t, fx.worktree, "update-index", "--skip-worktree", doc)
+			fx.write(t, doc, good)
+			return fx.push(t, "origin", "linked-branch")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fx := newPushFixture(t)
+			output, err := tc.run(t, fx)
+			fx.expectScope(t, output, err, tc.want)
+			if fallback := strings.Contains(output, "running make ci (AIRA-359)"); fallback != (tc.want == "ci") {
+				t.Fatalf("clean-worktree fallback notice printed=%v, want %v\noutput:\n%s", fallback, tc.want == "ci", output)
+			}
+		})
+	}
+}
+
+// TestPrePushNarrowedRunRefusesAWorktreeChangedDuringIt (AIRA-359): a narrowed
+// run that starts clean but whose working files change while it runs may have
+// read the changed ones, so the push is refused. The make shim here edits the
+// committed document after logging its argv.
+func TestPrePushNarrowedRunRefusesAWorktreeChangedDuringIt(t *testing.T) {
+	t.Parallel()
+	fx := newPushFixture(t)
+	const doc = "docs/dev/names.md"
+	fx.write(t, doc, "names the "+"p90"+"-prior\n")
+	fx.commitAll(t, "doc naming the prior")
+	writeShim(t, filepath.Join(filepath.Dir(fx.log), "bin", "make"), `#!/usr/bin/env bash
+echo "make argv: $*" >> "`+fx.log+`"
+echo "names nothing" > "`+filepath.Join(fx.worktree, doc)+`"
+`)
+	output, err := fx.push(t, "origin", "linked-branch")
+	if err == nil {
+		t.Fatalf("the worktree changed during the narrowed run but the push succeeded\noutput:\n%s", output)
+	}
+	wantLine := "make argv: -C " + fx.worktree + " test-docs"
+	if makes := fx.makeLines(t); len(makes) != 1 || makes[0] != wantLine {
+		t.Fatalf("hook ran %q, want exactly %q\noutput:\n%s", makes, wantLine, output)
+	}
+	if !strings.Contains(output, "the worktree changed during make test-docs") {
+		t.Fatalf("the push failed without the changed-worktree refusal\noutput:\n%s", output)
+	}
+	fx.expectNoCIPassMarker(t)
+}
+
 // twoBranches creates two local branches off the base, each adding the given
 // file plus a docs/ file of its own. The docs file matters: a branch whose only
 // change is a code file is refused by the empty-path-set check alone, which

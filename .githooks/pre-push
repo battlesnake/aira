@@ -19,7 +19,8 @@ set -euo pipefail
 # tree-pass marker (its targets do not go through .githooks/ci-pass). Like
 # `make ci`, it tests the CHECKED-OUT tree, so it runs only after the AIRA-355
 # checks below have refused a pushed branch whose tree is neither that tree nor
-# recorded as passed, and under the same HEAD re-check. Design: invariant I5 of
+# recorded as passed, under the same HEAD re-check, and only from a clean
+# worktree (it reads the working files, see below). Design: invariant I5 of
 # docs/superpowers/specs/2026-10-25-rant-small-batch-design.md.
 #
 # No .go file: the Go toolchain walks docs/ (a .go file there is a package
@@ -189,6 +190,21 @@ fi
 # here, after the AIRA-355 checks above: it too tests the checked-out tree, so
 # a pushed branch whose tree is neither that tree nor recorded as passed has
 # already been refused, and the HEAD re-check below covers it as well.
+#
+# The narrowed targets read the WORKING files, while every check above compares
+# only tree ids, so an uncommitted, untracked or hidden (assume-unchanged,
+# skip-worktree) change would change what is tested without changing any id: a
+# committed bad document passes once its fix sits uncommitted, a clean one fails
+# on an uncommitted edit. So a scope narrows only from a CLEAN worktree whose
+# tree is HEAD's (the AIRA-355 clean-tree check), re-checked after the run;
+# otherwise the push runs the full `make ci`, as before AIRA-315.
+if [ "$scope" != full ]; then
+	clean_tree=""
+	if ! clean_tree="$(aira_ci_pass_clean_tree "$root")" || [ "$clean_tree" != "$head_tree" ]; then
+		printf 'pre-push: the worktree has uncommitted, untracked or hidden changes, so a narrowed run would not test the pushed files; running make ci (AIRA-359).\n' >&2
+		scope=full
+	fi
+fi
 targets=(ci)
 case "$scope" in
 docs)
@@ -224,5 +240,14 @@ if [ -n "$root" ]; then
 	if ! unproven="$(aira_prepush_unproven "$root" "$head_after" <<<"$input")"; then
 		printf 'pre-push: refusing the push: %s has no make ci pass after the run (AIRA-355).\n' "$unproven" >&2
 		exit 1
+	fi
+	# A narrowed run tested the working files: refuse if they stopped matching
+	# HEAD during it, since the run may have read the changed ones (AIRA-359).
+	if [ "$scope" != full ]; then
+		clean_after=""
+		if ! clean_after="$(aira_ci_pass_clean_tree "$root")" || [ "$clean_after" != "$head_after" ]; then
+			printf 'pre-push: refusing the push: the worktree changed during make %s, so the run proves nothing about the pushed files (AIRA-359).\n' "${targets[*]}" >&2
+			exit 1
+		fi
 	fi
 fi
