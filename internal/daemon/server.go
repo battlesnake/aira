@@ -438,14 +438,14 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	if pinMode != pinChargeOff {
 		log.Printf("aira daemon: pinned-job charge discount %s (factor %s)", pinMode, runner.FormatPinChargeFactor(pinPercent))
 	}
-	// AIRA-350. The small-job lane: default mode only, never ci-shim.
+	// AIRA-350. The small-job lane: default mode only, never ci-shim
+	// (smallLaneOn is off in ci-shim mode whatever is configured).
 	laneCap, laneJobMax, err := smallLaneConfigFromEnv()
 	if err != nil {
 		return err
 	}
-	laneCap, laneJobMax = smallLaneForMode(s.shimMode(), laneCap, laneJobMax)
 	s.smallLaneCap, s.smallLaneJobMax = laneCap, laneJobMax
-	log.Print(smallLaneStartupLine(laneCap, laneJobMax))
+	log.Print(s.smallLaneStartupLine())
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one

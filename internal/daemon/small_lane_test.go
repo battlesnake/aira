@@ -1169,8 +1169,9 @@ func TestSmallLaneT16ScopeLess(t *testing.T) {
 	requireHeldByHead(t, scopeless, true)
 }
 
-// verifies: AIRA-350 T17 — ci-shim: no lane grant, and Serve's mode rule forces
-// the lane off and reports it off.
+// verifies: AIRA-350 T17 — ci-shim: no lane grant, and a lane configured in
+// ci-shim mode is off everywhere it is read: the startup line, and the snapshot
+// before the first admission (no `small-job lane:` line in CI).
 func TestSmallLaneT17CIShim(t *testing.T) {
 	now := time.Unix(351900, 0)
 	current := int64(0)
@@ -1186,15 +1187,17 @@ func TestSmallLaneT17CIShim(t *testing.T) {
 	requireLaneGranted(t, small, false)
 	requireLaneWait(t, small, "")
 
-	capacity, jobMax := smallLaneForMode(true, 8192*mib, 1024*mib)
-	if capacity != 0 || jobMax != 0 {
-		t.Fatalf("shim mode kept the lane: %d %d", capacity, jobMax)
+	// The lane stays configured (x 8G, y 1G); only the mode turns it off.
+	if line := server.smallLaneStartupLine(); line != "aira daemon: small-job lane off" {
+		t.Fatalf("shim startup line %q", line)
 	}
-	if line := smallLaneStartupLine(capacity, jobMax); line != "aira daemon: small-job lane off" {
-		t.Fatalf("startup line %q", line)
+	if snapshot := server.admitSliceSnapshotFor("/no-queue", ""); snapshot.present || snapshot.laneOn ||
+		snapshot.laneCapacity != 0 || snapshot.laneJobMax != 0 {
+		t.Fatalf("shim no-queue snapshot published the lane: %+v", snapshot)
 	}
-	if line := smallLaneStartupLine(smallLaneForMode(false, 8192*mib, 1024*mib)); line != "aira daemon: small-job lane 8G, jobs booking at most 1G" {
-		t.Fatalf("startup line %q", line)
+	server.confineMode = runner.ConfineModeReal
+	if line := server.smallLaneStartupLine(); line != "aira daemon: small-job lane 8G, jobs booking at most 1G" {
+		t.Fatalf("default startup line %q", line)
 	}
 }
 
@@ -1265,13 +1268,15 @@ func TestSmallLaneT19DerivedProperty(t *testing.T) {
 	server.admitFreezeMaxHold = time.Minute
 	rng := rand.New(rand.NewSource(350))
 	laneGrants := 0
-	server.smallLaneGrantObserver = func(queue *sliceQueue, granted, reference *admitWaiter, occ laneOccupancy, effectiveMaximum int64) {
+	server.smallLaneGrantObserver = func(queue *sliceQueue, granted, reference *admitWaiter, _ laneOccupancy, effectiveMaximum int64) {
 		laneGrants++
+		// Every check reads `after`, a walk of the queue taken here, after the
+		// grant: never the occupancy the code under test hands the observer.
 		after := smallLeasesLocked(queue, server.smallLaneJobMax)
 		if after.booked > server.smallLaneCap {
 			t.Fatalf("lane grant %d left S=%d above x", granted.seq, after.booked)
 		}
-		if reference != nil && reference != granted && !server.admitCouldFitBesideLocked(reference, effectiveMaximum, occ) {
+		if reference != nil && reference != granted && !server.admitCouldFitBesideLocked(reference, effectiveMaximum, after) {
 			t.Fatalf("lane grant %d past reference %d without G", granted.seq, reference.seq)
 		}
 		if queue.outstanding+server.admitSliceHeadroom(queue.outstandingJobs) > effectiveMaximum {
@@ -1749,6 +1754,183 @@ func TestSmallLaneT26SubReservation(t *testing.T) {
 		requireLaneWait(t, small, "")
 		requireLaneGranted(t, w, true)
 	})
+	t.Run("a worker that fits RAM but has no CPU slot does not", func(t *testing.T) {
+		// The main lease takes 61 cores: 1 + 61 = 62 of 64 slots booked, so the
+		// 3-core worker fits the 1100 of RAM room but no CPU slot; the 1-core
+		// small waiter fits both. A skip on RAM alone would leave the small
+		// waiter held behind the spent head. The worker is a sub-reservation,
+		// never lane-eligible: no lane diagnosis.
+		now := time.Unix(352830, 0)
+		server, queue, parent := build(t, now)
+		queue.waiters[1].cpu = 61
+		queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
+		if free := cpuAvailable(server.cpuCeiling(), queue.cpuOutstanding); free != 2 {
+			t.Fatalf("fixture CPU slots free=%d, want 2", free)
+		}
+		head, w, small := laneJob(3, 4096*mib, now), worker(4, 1024*mib, parent, now), laneJob(5, 1024*mib, now)
+		w.cpu = 3
+		addWaiters(queue, head, w, small)
+		spendBudget(queue, head, now)
+		server.evaluateAdmitQueue(queue)
+		requireLaneGranted(t, small, true)
+		requireLaneWait(t, small, "")
+		requireLaneGranted(t, w, false)
+		requireLaneWait(t, w, "")
+		requireLaneGranted(t, head, false)
+	})
+	t.Run("a gated worker that fits does not", func(t *testing.T) {
+		// An exclusive holder (2048) and another parent (2048) beside a 37556
+		// main lease: room 45056 − H(4) − 41652 = 1100. The other parent's
+		// fitting worker is gated (only the holder's own sub-reservations pass);
+		// the head and the small waiter carry the holder's token, so neither is.
+		// A skip that ignored the gate would leave the small waiter held.
+		now := time.Unix(352840, 0)
+		current := int64(0)
+		server := laneServer(t, laneE, &current, &now)
+		holder, other := laneLease(1, 2048*mib), laneLease(2, 2048*mib)
+		holder.exclusive = true
+		queue := queueOf(server, holder, other, laneLease(3, 37556*mib))
+		if room := laneRoom(server, queue, laneE); room != 1100*mib {
+			t.Fatalf("fixture room=%dM, want 1100M", room/mib)
+		}
+		head, w, small := laneJob(4, 4096*mib, now), worker(5, 1024*mib, other, now), laneJob(6, 1024*mib, now)
+		head.exclusiveHolder, small.exclusiveHolder = holder.scopeID, holder.scopeID
+		addWaiters(queue, head, w, small)
+		spendBudget(queue, head, now)
+		if gate := exclusiveGateLocked(queue); !gate.blocks(queue, w) || gate.blocks(queue, small) || gate.blocks(queue, head) {
+			t.Fatal("fixture: the worker must be gated, the head and the small waiter not")
+		}
+		server.evaluateAdmitQueue(queue)
+		requireLaneGranted(t, small, true)
+		requireLaneWait(t, small, "")
+		requireLaneGranted(t, w, false)
+		requireLaneGranted(t, head, false)
+	})
+}
+
+// verifies: AIRA-350 §2.1, §2.6, through the real enqueue path
+// (enqueueResolvedConfineAdmit, pushQueuedConfine, releaseAdmitWaiterLocked)
+// and the real snapshot (admitSliceSnapshotFor), over five passes: the lane's
+// configuration is published before the first admission (the `small-job lane:`
+// line of `confine --list`), each pass's diagnoses replace the last pass's
+// (cleared, not merely overwritten), and S and J_s follow the grants and
+// releases. Mutations: the no-queue snapshot drops the lane fields; the per-pass
+// clearing deleted, or clearing only one of laneWait / heldByHead.
+func TestSmallLaneRealPathMultiPass(t *testing.T) {
+	now := time.Unix(353100, 0)
+	current := int64(0)
+	server := laneServer(t, laneE, &current, &now)
+	server.admitManualEvaluation = true
+	const path = "/slice"
+	enqueue := func(name string, pid int, reserve int64, exclusive bool) *admitWaiter {
+		t.Helper()
+		request := admitRequest{scopeID: reserveScopeID(t, name, pid), name: name, owner: "session-a",
+			signature: "sig-" + name, cpu: 1, peerSameUID: true, exclusive: exclusive}
+		_, waiter, code, err := server.enqueueResolvedConfineAdmit(path, reserve, "pinned:client", laneE, request)
+		if err != nil {
+			t.Fatalf("enqueue %s: %s %v", name, code, err)
+		}
+		return waiter
+	}
+	pass := func() {
+		t.Helper()
+		queue := server.admitQueue
+		server.evaluateAdmitQueue(queue)
+		now = now.Add(time.Second)
+	}
+	release := func(waiter *admitWaiter) {
+		t.Helper()
+		queue := server.admitQueue
+		queue.mu.Lock()
+		released := releaseAdmitWaiterLocked(queue, waiter)
+		queue.mu.Unlock()
+		if !released {
+			t.Fatalf("release of %s", waiter.scopeID)
+		}
+	}
+	diagnoses := func(waiter *admitWaiter, laneWait string, held bool) {
+		t.Helper()
+		snapshot := server.admitSliceSnapshotFor(path, waiter.scopeID)
+		if snapshot.queuedLaneWait != laneWait || snapshot.queuedHeldByHead != held {
+			t.Fatalf("probe diagnoses %q %v, want %q %v", snapshot.queuedLaneWait, snapshot.queuedHeldByHead, laneWait, held)
+		}
+		for _, entry := range snapshot.queuedEntries {
+			if entry.ScopeID == waiter.scopeID && (entry.LaneWait != laneWait || entry.HeldByHead != held) {
+				t.Fatalf("queued row diagnoses %q %v, want %q %v", entry.LaneWait, entry.HeldByHead, laneWait, held)
+			}
+		}
+	}
+	occupancy := func(used int64, jobs int) admitSnapshot {
+		t.Helper()
+		snapshot := server.admitSliceSnapshotFor(path, "")
+		if !snapshot.present || !snapshot.laneOn || snapshot.laneCapacity != 8192*mib || snapshot.laneUsed != used || snapshot.laneJobs != jobs {
+			t.Fatalf("lane figures present=%v on=%v x=%dM S=%dM J=%d, want S=%dM J=%d", snapshot.present, snapshot.laneOn,
+				snapshot.laneCapacity/mib, snapshot.laneUsed/mib, snapshot.laneJobs, used/mib, jobs)
+		}
+		return snapshot
+	}
+
+	// Before the first admission: no queue, so no ledger (present false, S
+	// unevaluated), but the lane's configuration is published.
+	if snapshot := server.admitSliceSnapshotFor(path, ""); snapshot.present || !snapshot.laneOn ||
+		snapshot.laneCapacity != 8192*mib || snapshot.laneJobMax != 1024*mib || snapshot.laneUsed != 0 {
+		t.Fatalf("no-queue snapshot %+v, want the lane's x and y with no ledger", snapshot)
+	}
+
+	// Pass 1: a 30000 main job and seven 1024 small jobs; all fit
+	// (45056 − H(8) − 37168 = 5328 >= 0), S = 7168 over 7 jobs.
+	mainJob := enqueue("mainjob", 6001, 30000*mib, false)
+	var smalls []*admitWaiter
+	for i := 0; i < 7; i++ {
+		smalls = append(smalls, enqueue(fmt.Sprintf("smalljob%d", i), 6010+i, 1024*mib, false))
+	}
+	pass()
+	requireLaneGranted(t, mainJob, true)
+	for _, small := range smalls {
+		requireLaneGranted(t, small, true)
+	}
+	snapshot := occupancy(7168*mib, 7)
+	if !snapshot.scopeSmall[smalls[0].scopeID] || snapshot.scopeSmall[mainJob.scopeID] {
+		t.Fatalf("small marks %v", snapshot.scopeSmall)
+	}
+
+	// Pass 2: an 8192 head, pushed, refused (room 45056 − H(9) − 37168 = 5264),
+	// and a 1024 small job that fits: the lane is closed behind the pushed
+	// reference ("pushed") and the walk holds it behind the head.
+	head := enqueue("headjob", 6020, 8192*mib, false)
+	x := enqueue("xjob", 6021, 1024*mib, false)
+	if _, err := server.pushQueuedConfine(path, head.scopeID, "session-a", false); err != nil {
+		t.Fatal(err)
+	}
+	pass()
+	requireLaneGranted(t, head, false)
+	requireLaneGranted(t, x, false)
+	diagnoses(x, laneWaitPushed, true)
+
+	// Pass 3: an exclusive request drains the slice, so the lane skips x and the
+	// walk never reaches its head rule: neither writes a diagnosis, and the
+	// pass-2 pair must be gone.
+	exclusive := enqueue("exclusivejob", 6022, 512*mib, true)
+	pass()
+	requireLaneGranted(t, x, false)
+	requireLaneGranted(t, exclusive, false)
+	diagnoses(x, "", false)
+
+	// Pass 4: the exclusive request ends; pass 2's diagnoses are written again.
+	release(exclusive)
+	pass()
+	diagnoses(x, laneWaitPushed, true)
+
+	// Pass 5: the main job ends; the pushed head fits and is granted, then x in
+	// the walk behind no head. S = 8192 over 8 jobs.
+	release(mainJob)
+	pass()
+	requireLaneGranted(t, head, true)
+	requireLaneGranted(t, x, true)
+	snapshot = occupancy(8192*mib, 8)
+	if !snapshot.scopeSmall[x.scopeID] || snapshot.scopeSmall[head.scopeID] {
+		t.Fatalf("small marks %v", snapshot.scopeSmall)
+	}
 }
 
 // verifies: AIRA-350 §2.5 — the daemon's configuration: off, empty and unset are
@@ -1912,6 +2094,13 @@ func TestSmallLaneConfineListReply(t *testing.T) {
 		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 2 * gi, 64 * gi, 0, true, "" }
 		if lane {
 			server.smallLaneCap, server.smallLaneJobMax = 8*gi, gi
+		}
+		// Before the first admission there is no queue: the reply still carries
+		// x and y (the `small-job lane:` line), with the ledger unevaluated.
+		if before := reserveListing(t, server).SliceReserve; before == nil || before.GrantedEstablished ||
+			(lane && (before.LaneCapacityBytes != 8*gi || before.LaneJobMaxBytes != gi)) ||
+			(!lane && (before.LaneCapacityBytes != 0 || before.LaneJobMaxBytes != 0)) {
+			t.Fatalf("lane=%v no-queue reply %+v", lane, before)
 		}
 		small, large := reserveScopeID(t, "smalljob", 5301), reserveScopeID(t, "largejob", 5302)
 		queuedID := reserveScopeID(t, "queuedjob", 5303)

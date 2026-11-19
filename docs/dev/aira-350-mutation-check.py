@@ -8,8 +8,23 @@ afterwards, so a later change to these files makes mutations report UNAPPLIED.
 It is evidence for that review, not a standing gate.
 
 Each mutation replaces exact snippets in production files, runs the focused
-tests meant to catch it, and restores the files. A mutation whose tests still
-pass is a porous test and fails this script.
+tests meant to catch it (go test -v), and restores the files. Every run is
+classified from its output, never from its exit status alone:
+
+  RED             nonzero exit AND a `--- FAIL: <TestName>` line naming one of
+                  the mutation's selected tests: the mutation was killed.
+  SURVIVED        exit 0 and every selected test printed `--- PASS`: a porous
+                  test.
+  INFRASTRUCTURE  anything else: a build failure, a missing tool, a full disk
+                  ("go: cannot create work dir: no space left on device"), a
+                  selector that ran no test, a failure in a test that was not
+                  selected. Zero tests executed is never a kill.
+
+Before any mutation, a baseline runs every selected test unmutated, once per
+package; each must print `--- PASS`, or the script stops (exit 2) without
+mutating anything. Each mutation's full output is kept: printed (its last 40
+lines) for every SURVIVED or INFRASTRUCTURE run, and written to
+<dir>/<mutation>.log with --output-dir <dir>.
 
 Spec entries NOT run here, each a decision rather than a gap:
   - "room computed once, no 64 per grant" and "any lane-only copy of the fit"
@@ -26,20 +41,29 @@ Spec entries NOT run here, each a decision rather than a gap:
   - "G applied when w is the reference" is listed under T7b in the spec, which
     cannot kill it (a small reference always fits beside itself there); it is
     run against T25e, written for it.
+  - smallLease without its `waiter.accounted` clause: equivalent in
+    production. Every granted waiter is accounted (grantWaiterLocked and the
+    re-declare establish set both together; nothing clears accounted), so the
+    clause cannot change a result. Kept as a guard, not run.
 
-Run from anywhere, under aira confine (it builds and runs Go tests), with a
-short TMPDIR (the daemon tests bind unix sockets):
+Run from anywhere, under aira confine (it builds and runs Go tests), with the
+default TMPDIR (never one inside the checkout):
 
-    TMPDIR=~/tmp/t aira confine --name <unique> -- python3 docs/dev/aira-350-mutation-check.py
+    aira confine --name <unique> -- python3 docs/dev/aira-350-mutation-check.py [--output-dir DIR] [NAME...]
 
-Optional arguments run only the mutations whose name contains one of them.
+Optional NAME arguments run only the mutations whose name contains one of them.
+--selftest checks the classifier alone (no Go, no source edits), including a
+stub `go` that exits 1 with a full-disk message: it must be INFRASTRUCTURE.
 
-Exit 0: every mutation was caught. Exit 1: at least one survived (or a snippet
-no longer matches the source, which also fails: the list must track the code).
+Exit 0: every mutation was RED. Exit 1: at least one SURVIVED, or a snippet no
+longer matches the source (the list must track the code). Exit 2: the baseline
+failed or at least one run was INFRASTRUCTURE, so the result is not evidence.
 """
 import pathlib
+import re
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -57,7 +81,7 @@ D = "./internal/daemon/"
 
 
 def t(*names):
-    return (D, "^(" + "|".join(names) + ")$")
+    return (D, names)
 
 
 T1 = t("TestSmallLaneT1Incident")
@@ -90,15 +114,17 @@ T27 = t("TestSmallLaneDiagnosesAreWrittenByTheEvaluatorAndReadByTheSnapshot")
 TCONF = t("TestSmallLaneConfigFromEnv")
 TSNAP = t("TestSmallLaneSnapshotFields")
 TLOG = t("TestSmallLaneGrantJournalLine")
-TNOTE = ("./internal/runner/", "^TestConfineLaneNote$")
-TINSTALL = ("./internal/install/", "^TestInstallSmallLaneFlags$")
-TPAIR = ("./internal/install/", "^TestInstallSmallLaneExplicitFlagNeverRepairsTheInstalledPair$")
-TCI = ("./internal/install/", "^TestInstallSmallLaneOffInCIMode$")
-TSTATUS = ("./internal/install/", "^TestInstallStatusReportsTheSmallLane$")
-TFACES = ("./cmd/aira/", "^TestConfineSmallLaneGuidanceIsOnEveryFace$")
-TLIST = ("./cmd/aira/", "^TestConfineListSmallLaneLine$")
+TMULTI = t("TestSmallLaneRealPathMultiPass")
+TNOTE = ("./internal/runner/", ("TestConfineLaneNote",))
+TINSTALL = ("./internal/install/", ("TestInstallSmallLaneFlags",))
+TPAIR = ("./internal/install/", ("TestInstallSmallLaneExplicitFlagNeverRepairsTheInstalledPair",))
+TCI = ("./internal/install/", ("TestInstallSmallLaneOffInCIMode",))
+TSTATUS = ("./internal/install/", ("TestInstallStatusReportsTheSmallLane",))
+TFACES = ("./cmd/aira/", ("TestConfineSmallLaneGuidanceIsOnEveryFace",))
+TLIST = ("./cmd/aira/", ("TestConfineListSmallLaneLine",))
+TCLI = ("./cmd/aira/", ("TestInstallParseArgsAcceptsSmallLane",))
 TREPLY = t("TestSmallLaneConfineListReply")
-TPROBE = ("./internal/runner/", "^TestConfineQueueNoteCarriesTheLaneClause$")
+TPROBE = ("./internal/runner/", ("TestConfineQueueNoteCarriesTheLaneClause",))
 MANAGE = "internal/daemon/confine_manage.go"
 
 OFF = """	if !s.smallLaneOn() {
@@ -135,18 +161,22 @@ SMALL = """	return waiter != nil && waiter.state == admitGranted && waiter.accou
 		!waiter.isSubReservation() && waiter.ledgerCharge() <= jobMax"""
 LANEON = "	return s.smallLaneCap > 0 && !s.shimMode()"
 KIND = "	return signature != \"\" && !strings.HasPrefix(signature, runner.AitestParentSignaturePrefix)"
-FORMODE = """	if shim {
-		return 0, 0
-	}"""
+STARTUP = "	if !s.smallLaneOn() {\n		return \"aira daemon: small-job lane off\""
+NOQUEUE = """		snapshot := admitSnapshot{phase: phase}
+		if s.smallLaneOn() {
+			snapshot.laneOn, snapshot.laneCapacity, snapshot.laneJobMax = true, s.smallLaneCap, s.smallLaneJobMax
+		}
+		return snapshot"""
+CLI_ALLOW = "\"pin-charge-factor\", \"small-lane\", \"small-lane-job-max\":"
 MAIN_FIT = "		fit := s.admitFitLocked(queue, waiter, current, effectiveMaximum, reclaimable)\n		available, physicalFree, ramFits := fit.available, fit.physicalFree, fit.ramFits"
 PROTECTED = "		protected := head != nil && !waiter.isSubReservation()"
 SNAP_ON = """	if s.smallLaneOn() {
 		occ := smallLeasesLocked(queue, s.smallLaneJobMax)"""
 PAIR = "	if jobMax < SmallLaneJobMaxMinBytes || jobMax > capacity {"
 CLEAR = "			waiter.laneWait, waiter.heldByHead = \"\", false"
-INSTALL_CI = """		if ciInstall {
-			opts.smallLane = runner.SmallLaneOff
-		}"""
+INSTALL_CI = """	if ciInstall {
+		opts.smallLane = runner.SmallLaneOff
+	}"""
 INSTALL_PAIR = "problem != \"\" && !laneGiven && !jobMaxGiven {"
 INSTALL_BLANK = "			if strings.TrimSpace(value) == \"\" {\n				return opts, argumentInvalid(fmt.Sprintf(\"option --%s requires a value\", name))"
 STATUS_LANE = "	reportDaemonMode(d, \"daemon small-job lane\", \"AIRA_DAEMON_SMALL_LANE\", string(liveEnvironment), liveErr, string(content))\n"
@@ -203,7 +233,8 @@ MUTATIONS = [
     ("t15-workers-in-s", [(LANE, SMALL, SMALL.replace("!waiter.isSubReservation() && ", ""))], T15),
     ("t16-scope-less-eligible", [(LANE, ELIGIBLE, ELIGIBLE.replace("waiter.scopeID != \"\" &&", "true &&"))], T16),
     ("t17-lane-on-in-shim", [(LANE, LANEON, "	return s.smallLaneCap > 0")], T17),
-    ("t17-serve-keeps-the-lane-in-shim", [(LANE, FORMODE, "	if false {\n		return 0, 0\n	}")], T17),
+    ("t17-startup-line-ignores-shim", [(LANE, STARTUP, STARTUP.replace("!s.smallLaneOn()", "s.smallLaneCap <= 0"))], T17),
+    ("t17-no-queue-snapshot-ignores-shim", [(ADMIT, NOQUEUE, NOQUEUE.replace("if s.smallLaneOn() {", "if s.smallLaneCap > 0 {"))], T17),
     # T21-T23: priority, first fit, one room.
     ("t21-exemption-inside-the-walk", [
         (LANE, OFF, OFF.replace("if !s.smallLaneOn() {", "if true {")),
@@ -219,6 +250,9 @@ MUTATIONS = [
     ("t25e-guard-against-itself", [(LANE, G, G.replace("ref != nil && ref != waiter && ", "ref != nil && "))], T25E),
     ("t26-no-skip", [(LANE, SKIP, SKIP.replace("if waiter.isSubReservation() &&", "if false && waiter.isSubReservation() &&"))], T26),
     ("t26b-skip-for-any-sub-reservation", [(LANE, SKIP, SKIP.replace(" &&\n			s.admitFitLocked(queue, waiter, current, effectiveMaximum, reclaimable).all()", ""))], T26),
+    ("t26c-skip-on-ram-alone", [(LANE, SKIP, SKIP.replace(".all() {", ".ramFits {"))], T26),
+    ("t26d-skip-ignores-the-gate", [(LANE, SKIP, SKIP.replace("!gate.blocks(queue, waiter) &&", "true &&"))], T26),
+    ("t26e-sub-reservation-eligible", [(LANE, ELIGIBLE, ELIGIBLE.replace("!waiter.isSubReservation() && ", ""))], T26),
     # T27, configuration, the faces.
     ("t27-a-decision-reads-a-diagnosis", [(LANE, GATE, GATE.replace("gate.blocks(queue, waiter) {", "gate.blocks(queue, waiter) || waiter.laneWait == \"never\" {"))], T27),
     ("config-pair-unchecked", [(RLANE, PAIR, "	if jobMax < SmallLaneJobMaxMinBytes {")], TCONF),
@@ -246,13 +280,120 @@ MUTATIONS = [
     ("status-lane-line-dropped", [(INSTALL, STATUS_LANE, "")], TSTATUS),
     ("status-job-max-line-dropped", [(INSTALL, STATUS_JOBMAX, "")], TSTATUS),
     ("list-line-while-off", [(MAIN, "	if reserve == nil || reserve.LaneCapacityBytes <= 0 {", "	if reserve == nil {")], TLIST),
+    # Review fixes (round 3 of the build review): one multi-pass test through
+    # the real enqueue and snapshot path; the CLI install allowlist.
+    ("multipass-no-queue-snapshot-drops-the-lane", [(ADMIT, NOQUEUE, "		return admitSnapshot{phase: phase}")], TMULTI),
+    ("reply-no-queue-drops-the-lane", [(ADMIT, NOQUEUE, "		return admitSnapshot{phase: phase}")], TREPLY),
+    ("multipass-diagnoses-not-cleared-per-pass", [(ADMIT, CLEAR, "			_ = waiter")], TMULTI),
+    ("multipass-lane-wait-cleared-but-not-held", [(ADMIT, CLEAR, "			waiter.laneWait = \"\"")], TMULTI),
+    ("multipass-held-cleared-but-not-lane-wait", [(ADMIT, CLEAR, "			waiter.heldByHead = false")], TMULTI),
+    ("cli-install-allowlist-drops-the-lane-flags", [(MAIN, CLI_ALLOW, "\"pin-charge-factor\":")], TCLI),
 ]
 
 
-def main() -> int:
-    survivors, broken = [], []
-    selected = [m for m in MUTATIONS if not sys.argv[1:] or any(a in m[0] for a in sys.argv[1:])]
-    for name, edits, (package, selector) in selected:
+FAIL_LINE = re.compile(r"^\s*--- FAIL: (Test[^\s/]+)", re.M)
+PASS_LINE = re.compile(r"^--- PASS: (Test[^\s/]+) ", re.M)
+
+
+def run_tests(package, names, go="go"):
+    """Run the named tests of one package verbosely; (exit status, output)."""
+    try:
+        result = subprocess.run(
+            [go, "test", "-count=1", "-v", "-run", "^(" + "|".join(names) + ")$", package],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+    except OSError as error:
+        return 127, f"cannot run {go}: {error}\n"
+    return result.returncode, result.stdout + result.stderr
+
+
+def classify(returncode, output, names):
+    """RED, SURVIVED or INFRASTRUCTURE (see the module docstring), and the
+    selected tests that failed."""
+    failed = sorted(set(FAIL_LINE.findall(output)) & set(names))
+    if returncode != 0:
+        return ("RED" if failed else "INFRASTRUCTURE"), failed
+    passed = set(PASS_LINE.findall(output))
+    return ("SURVIVED" if set(names) <= passed else "INFRASTRUCTURE"), failed
+
+
+def tail(output, lines=40):
+    return "\n".join("    | " + line for line in output.rstrip("\n").splitlines()[-lines:])
+
+
+def keep(output_dir, name, output):
+    if output_dir is not None:
+        (output_dir / f"{name}.log").write_text(output)
+
+
+def baseline(selected, output_dir):
+    """Every selected test, unmutated, once per package: each must pass."""
+    packages = {}
+    for _, _, (package, names) in selected:
+        packages.setdefault(package, set()).update(names)
+    ok = True
+    for package, names in sorted(packages.items()):
+        names = sorted(names)
+        returncode, output = run_tests(package, names)
+        keep(output_dir, "baseline-" + package.strip("./").replace("/", "-"), output)
+        verdict, failed = classify(returncode, output, names)
+        if verdict != "SURVIVED":
+            missing = sorted(set(names) - set(PASS_LINE.findall(output)))
+            print(f"BASELINE FAILED {package}: exit {returncode}, not passing: {', '.join(missing)}\n{tail(output)}", flush=True)
+            ok = False
+        else:
+            print(f"baseline ok {package}: {len(names)} tests pass", flush=True)
+    return ok
+
+
+def selftest():
+    """The classifier alone: no Go toolchain, no source edits."""
+    names = ("TestSmallLaneT1Incident",)
+    cases = [
+        ("full disk", 1, "go: cannot create work dir: no space left on device\n", "INFRASTRUCTURE"),
+        ("build failure", 1, "# aira/internal/daemon\nsmall_lane.go:1:1: syntax error\nFAIL\taira/internal/daemon [build failed]\n", "INFRASTRUCTURE"),
+        ("another test failed", 1, "--- FAIL: TestSomethingElse (0.00s)\nFAIL\n", "INFRASTRUCTURE"),
+        ("selected test failed", 1, "=== RUN   TestSmallLaneT1Incident\n--- FAIL: TestSmallLaneT1Incident (0.00s)\nFAIL\n", "RED"),
+        ("selected subtest failed", 1, "    --- FAIL: TestSmallLaneT1Incident/row (0.00s)\n--- FAIL: TestSmallLaneT1Incident (0.00s)\nFAIL\n", "RED"),
+        ("selected test passed", 0, "=== RUN   TestSmallLaneT1Incident\n--- PASS: TestSmallLaneT1Incident (0.00s)\nPASS\nok\n", "SURVIVED"),
+        ("no test ran", 0, "testing: warning: no tests to run\nPASS\nok  \taira/internal/daemon\t0.01s [no tests to run]\n", "INFRASTRUCTURE"),
+    ]
+    bad = []
+    for label, returncode, output, want in cases:
+        got, _ = classify(returncode, output, names)
+        if got != want:
+            bad.append(f"{label}: {got}, want {want}")
+    # The review's counterexample end to end: a stub `go` on the real run path.
+    home_tmp = pathlib.Path.home() / "tmp"
+    home_tmp.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=home_tmp, prefix="aira350-selftest-") as scratch:
+        stub = pathlib.Path(scratch) / "go"
+        stub.write_text("#!/bin/sh\necho 'go: cannot create work dir: no space left on device' >&2\nexit 1\n")
+        stub.chmod(0o755)
+        returncode, output = run_tests("./internal/daemon/", names, go=str(stub))
+        got, _ = classify(returncode, output, names)
+        if returncode != 1 or got != "INFRASTRUCTURE":
+            bad.append(f"stub go: exit {returncode}, {got}, want exit 1 and INFRASTRUCTURE")
+    for line in bad:
+        print("SELFTEST FAILED:", line)
+    print(f"selftest: {len(cases) + 1} cases, {len(bad)} failed")
+    return 1 if bad else 0
+
+
+def main(argv) -> int:
+    if argv == ["--selftest"]:
+        return selftest()
+    output_dir = None
+    if argv[:1] == ["--output-dir"] and len(argv) >= 2:
+        output_dir = pathlib.Path(argv[1]).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        argv = argv[2:]
+    selected = [m for m in MUTATIONS if not argv or any(a in m[0] for a in argv)]
+    if not baseline(selected, output_dir):
+        print("\nbaseline failed: no mutation run, nothing is evidence")
+        return 2
+    red, survivors, broken, infrastructure = [], [], [], []
+    for name, edits, (package, names) in selected:
         originals = {}
         try:
             applied = True
@@ -266,32 +407,35 @@ def main() -> int:
                     break
                 file.write_text(current.replace(old, new, 1))
             if not applied:
-                print(f"UNAPPLIED {name}", flush=True)
+                print(f"UNAPPLIED       {name}", flush=True)
                 continue
-            result = subprocess.run(
-                ["go", "test", "-count=1", "-run", selector, package],
-                cwd=ROOT, capture_output=True, text=True,
-            )
-            output = result.stdout + result.stderr
-            if "build failed" in output or "setup failed" in output or "[no tests to run]" in output:
-                broken.append(f"{name}: does not compile or selects no test")
-                print(f"BUILD {name}", flush=True)
-                continue
-            caught = result.returncode != 0
-            print(f"{'RED ' if caught else 'PASS'}  {name}", flush=True)
-            if not caught:
-                survivors.append(name)
+            returncode, output = run_tests(package, names)
         finally:
             for path, text in originals.items():
                 (ROOT / path).write_text(text)
-    print(f"\n{len(selected)} mutations, {len(selected) - len(survivors) - len(broken)} red, "
-          f"{len(survivors)} survived, {len(broken)} unapplied")
+        keep(output_dir, name, output)
+        verdict, failed = classify(returncode, output, names)
+        if verdict == "RED":
+            red.append(name)
+            print(f"RED             {name}  ({', '.join(failed)})", flush=True)
+        elif verdict == "SURVIVED":
+            survivors.append(name)
+            print(f"SURVIVED        {name}\n{tail(output)}", flush=True)
+        else:
+            infrastructure.append(f"{name}: exit {returncode}, no selected test failed")
+            print(f"INFRASTRUCTURE  {name}  (exit {returncode})\n{tail(output)}", flush=True)
+    print(f"\n{len(selected)} mutations: {len(red)} red, {len(survivors)} survived, "
+          f"{len(infrastructure)} infrastructure, {len(broken)} unapplied")
     for line in survivors:
         print("SURVIVED:", line)
+    for line in infrastructure:
+        print("INFRASTRUCTURE:", line)
     for line in broken:
         print("UNAPPLIED:", line)
+    if infrastructure:
+        return 2
     return 1 if survivors or broken else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

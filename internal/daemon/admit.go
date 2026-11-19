@@ -1356,8 +1356,14 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 		// ledger was never built or holds nothing". present stays false here precisely so a caller
 		// reports the granted pair unevaluated rather than as a fabricated empty
 		// slice (AIRA-220). CeilingBytes is an independent memory read and is
-		// unaffected.
-		return admitSnapshot{phase: phase, laneOn: s.smallLaneOn(), laneCapacity: s.smallLaneCap, laneJobMax: s.smallLaneJobMax}
+		// unaffected. The lane's configuration is published here too (AIRA-350),
+		// so `confine --list` shows the lane before the first admission; S and
+		// J_s stay absent, and the caller renders them unevaluated.
+		snapshot := admitSnapshot{phase: phase}
+		if s.smallLaneOn() {
+			snapshot.laneOn, snapshot.laneCapacity, snapshot.laneJobMax = true, s.smallLaneCap, s.smallLaneJobMax
+		}
+		return snapshot
 	}
 	queue.mu.Lock()
 	snapshot := admitSnapshot{

@@ -114,6 +114,39 @@ func TestInstallParseArgsAcceptsCPUSlotsPerCore(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-350 §2.5 — `aira install --small-lane SIZE|off` and
+// `--small-lane-job-max SIZE` pass the CLI face's install allowlist (main.go
+// parseInstallDescriptorArgs), both spellings, so they reach the install
+// parser, which owns the range and pair checks (TestInstallSmallLaneFlags). A
+// bare flag is refused here. Mutation: either name dropped from the allowlist
+// -> red.
+func TestInstallParseArgsAcceptsSmallLane(t *testing.T) {
+	for _, test := range []struct {
+		argv []string
+		want map[string]string
+	}{
+		{[]string{"--small-lane=4G"}, map[string]string{"small-lane": "4G"}},
+		{[]string{"--small-lane", "off"}, map[string]string{"small-lane": "off"}},
+		{[]string{"--small-lane-job-max=512M"}, map[string]string{"small-lane-job-max": "512M"}},
+		{[]string{"--small-lane", "4G", "--small-lane-job-max", "512M"}, map[string]string{"small-lane": "4G", "small-lane-job-max": "512M"}},
+	} {
+		positionals, options, err := parseArgs("install", test.argv)
+		if err != nil || len(positionals) != 0 || len(options) != len(test.want) {
+			t.Fatalf("%q: positionals=%q options=%q err=%v", test.argv, positionals, options, err)
+		}
+		for name, value := range test.want {
+			if options[name] != value {
+				t.Fatalf("%q: option %s=%q, want %q", test.argv, name, options[name], value)
+			}
+		}
+	}
+	for _, bare := range []string{"--small-lane", "--small-lane-job-max"} {
+		if _, _, err := parseArgs("install", []string{bare}); err == nil || !strings.Contains(err.Error(), "requires a value") {
+			t.Fatalf("a bare %s err=%v, want a requires-a-value refusal", bare, err)
+		}
+	}
+}
+
 // AIRA-284. --claude-usage-mod is on the install descriptor's allowlist: bare
 // (install) or =off (remove). The install parser, which the CLI reaches first,
 // owns the --status / --stage=start refusals; this pins only that the CLI face

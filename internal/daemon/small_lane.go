@@ -55,26 +55,19 @@ func smallLaneConfigFromEnv() (capacity, jobMax int64, err error) {
 	}
 }
 
-// smallLaneForMode is the lane Serve applies: ci-shim mode forces it off
-// whatever was configured (an advisory CI ledger gets no priority lane).
-func smallLaneForMode(shim bool, capacity, jobMax int64) (int64, int64) {
-	if shim {
-		return 0, 0
-	}
-	return capacity, jobMax
-}
-
-// smallLaneStartupLine is the daemon's startup report of the lane, after shim
-// mode has forced it off.
-func smallLaneStartupLine(capacity, jobMax int64) string {
-	if capacity <= 0 {
+// smallLaneStartupLine is the daemon's startup report of the lane: off whenever
+// smallLaneOn is, so a lane configured in ci-shim mode reports off.
+func (s *Server) smallLaneStartupLine() string {
+	if !s.smallLaneOn() {
 		return "aira daemon: small-job lane off"
 	}
 	return fmt.Sprintf("aira daemon: small-job lane %s, jobs booking at most %s",
-		runner.FormatConfineBytes(capacity), runner.FormatConfineBytes(jobMax))
+		runner.FormatConfineBytes(s.smallLaneCap), runner.FormatConfineBytes(s.smallLaneJobMax))
 }
 
-// smallLaneOn is laneOn: a configured lane, never in ci-shim mode.
+// smallLaneOn is laneOn: a configured lane, never in ci-shim mode (an advisory
+// CI ledger gets no priority lane). The one off switch: every reader of the
+// configured pair goes through it.
 func (s *Server) smallLaneOn() bool {
 	return s.smallLaneCap > 0 && !s.shimMode()
 }
