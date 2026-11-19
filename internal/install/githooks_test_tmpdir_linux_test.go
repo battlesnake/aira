@@ -311,6 +311,12 @@ func TestTestTmpdirFallsBackToTheNormalTmpdir(t *testing.T) {
 	if err := os.Symlink(lockTarget, filepath.Join(symlinkLockRoot, ".aira-test-lock."+strconv.Itoa(os.Getuid()))); err != nil {
 		t.Fatal(err)
 	}
+	// A root whose lock path is a FIFO we own with no reader: a write-only open
+	// would block forever before the 60 s lock timeout was ever reached.
+	fifoLockRoot := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(fifoLockRoot, ".aira-test-lock."+strconv.Itoa(os.Getuid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	noFlock := "PATH=" + shimDir(t, map[string]string{"flock": "exit 1"}) + ":" + os.Getenv("PATH")
 	cases := []struct {
 		name string
@@ -319,6 +325,7 @@ func TestTestTmpdirFallsBackToTheNormalTmpdir(t *testing.T) {
 		{"ci", []string{"CI=true", "AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}},
 		{"flock-fails", []string{noFlock, "AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}},
 		{"lock-is-a-symlink", []string{"AIRA_TEST_TMPFS_ROOT=" + symlinkLockRoot, "AIRA_TEST_TMPFS_MIN_KB=0"}},
+		{"lock-is-a-fifo", []string{"AIRA_TEST_TMPFS_ROOT=" + fifoLockRoot, "AIRA_TEST_TMPFS_MIN_KB=0"}},
 		{"opt-out", []string{"AIRA_TEST_TMPFS=0", "AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}},
 		{"missing-root", []string{"AIRA_TEST_TMPFS_ROOT=" + filepath.Join(root, "absent"), "AIRA_TEST_TMPFS_MIN_KB=0"}},
 		{"too-small", []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=999999999999"}},

@@ -214,11 +214,13 @@ if [ ! -d "$root" ] || [ ! -w "$root" ] || ! root="$(cd -P -- "$root" 2>/dev/nul
 	exec "$@"
 fi
 
-# The lock (see the header): a regular file we own, never a symlink.
+# The lock (see the header): a regular file we own, never a symlink. It is opened
+# read-write (<>), which never blocks on a FIFO the way a write-only open does; a
+# non-regular file then fails the -f check below and the run falls back.
 lock="$root/.aira-test-lock.$(id -u)"
 lockfd=
 if ! command -v flock >/dev/null 2>&1 || [ -L "$lock" ] ||
-	! { exec {lockfd}>>"$lock"; } 2>/dev/null ||
+	! { exec {lockfd}<>"$lock"; } 2>/dev/null ||
 	[ -L "$lock" ] || [ ! -f "$lock" ] || [ ! -O "$lock" ] ||
 	! flock -w 60 "$lockfd" 2>/dev/null; then
 	printf 'test-tmpdir: cannot take the lock %s (no flock, not our regular file, or held over 60 s); tests use the normal TMPDIR (AIRA-357).\n' "$lock" >&2
