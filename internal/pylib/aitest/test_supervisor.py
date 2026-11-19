@@ -2449,12 +2449,15 @@ def test_unresponsive_growth_probe_does_not_wedge_a_live_pool(tmp_path, monkeypa
     the pool" only means anything where there IS a pool to wedge. This test seeds one
     live worker and wedges the probe (which is the only relay call a live-pool growth
     tick makes before it would claim), proving the growth path stays bounded."""
-    admit = _write_stub(tmp_path / "worker-admit-wedged-probe", """
-import sys, time
+    relay_pidfile = tmp_path / "relay-pid"
+    admit = _write_stub(tmp_path / "worker-admit-wedged-probe", f"""
+import os, sys, time
 # Wedge ONLY the non-blocking probe (--max-wait 0s). This isolates the live-pool
 # growth probe from the empty-pool blocking claim (which passes no --max-wait and
 # is deliberately unbounded).
 if "0s" in sys.argv:
+    with open({str(relay_pidfile)!r}, "w") as handle:
+        handle.write(str(os.getpid()))
     time.sleep(600)
 """)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
@@ -2478,6 +2481,18 @@ if "0s" in sys.argv:
         "the growth probe read was not bounded (%.1fs) -- a wedged probe wedged the loop" % elapsed
     )
     assert supervisor.daemon_available is True, "a wedged probe must not disable the daemon"
+    # The wedged probe relay must be KILLED, not abandoned: a skipped tick that
+    # leaves its relay sleeping leaks one live process per growth attempt.
+    relay_pid = int(relay_pidfile.read_text())
+    for _ in range(100):
+        try:
+            os.kill(relay_pid, 0)
+        except OSError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(relay_pid, 9)
+        assert False, "the unresponsive probe relay was left alive"
 
 
 def test_bounded_growth_claim_that_never_grants_is_a_denial_not_daemon_unavailable(tmp_path, monkeypatch, capsys):
