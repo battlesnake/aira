@@ -50,13 +50,20 @@ func waitForConfineDiagnostic(t *testing.T, deps confineDeps, request ConfineReq
 		defer close(done)
 		_, _ = confineWithDeps(context.Background(), request, deps)
 	}()
+	// Both launch paths' lines end in "memory admission": the real path prints
+	// "waiting for memory admission" (confine_linux.go) and the ci-shim path
+	// "waiting for advisory memory admission" (confine_shim_linux.go). Matching
+	// only the first made every shim caller sit out the whole backstop. A line is
+	// written by one Fprint, so a complete one is the marker followed by "\n".
+	const marker = "memory admission"
 	deadline := time.Now().Add(testdeadline.Wait(5 * time.Second))
-	got := ""
+	seen := false
 	for time.Now().Before(deadline) {
 		mu.Lock()
-		got = buf.String()
+		got := buf.String()
 		mu.Unlock()
-		if strings.Contains(got, "waiting for memory admission") {
+		if at := strings.Index(got, marker); at >= 0 && strings.Contains(got[at:], "\n") {
+			seen = true
 			break
 		}
 		time.Sleep(2 * time.Millisecond)
@@ -65,6 +72,9 @@ func waitForConfineDiagnostic(t *testing.T, deps confineDeps, request ConfineReq
 	<-done
 	mu.Lock()
 	defer mu.Unlock()
+	if !seen {
+		t.Fatalf("no admission wait line (%q) was printed while admission was held; stderr=%q", marker, buf.String())
+	}
 	return buf.String()
 }
 

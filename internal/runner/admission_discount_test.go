@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -284,6 +285,13 @@ func TestAdmitGrantChargeIsValidatedAndNeverReDeclared(t *testing.T) {
 // docker; for a pin inherited only from AIRA_CONFINE_RESERVE; derive it from
 // MemoryReservePinned alone.
 func TestConfineDiscountableIsTheOperatorReserveCap(t *testing.T) {
+	// The launch really execs the argv, so the docker row uses a stand-in named
+	// `docker` rather than the host's docker (which would contact a daemon and
+	// try to run a container). Container detection reads the argv, not the binary.
+	docker := filepath.Join(t.TempDir(), "docker")
+	if err := os.WriteFile(docker, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name      string
 		request   ConfineRequest
@@ -297,7 +305,7 @@ func TestConfineDiscountableIsTheOperatorReserveCap(t *testing.T) {
 		{"no reserve (auto-sized)", ConfineRequest{}, false, DefaultConfineMemoryReserve, DefaultConfineMemoryReserve},
 		{"a token reserve not declared", ConfineRequest{MemoryReserve: 12 << 20}, false, 12 << 20, 12 << 20},
 		{"--delegate-ram", ConfineRequest{MemoryReserve: 12 << 20, MemoryReservePinned: true, DelegateRAM: true}, false, 12 << 20, 12 << 20},
-		{"docker", ConfineRequest{MemoryReserve: 12 << 20, MemoryReservePinned: true, Argv: []string{"docker", "run", "--memory=8m", "img"}}, false, 12 << 20, 12 << 20},
+		{"docker", ConfineRequest{MemoryReserve: 12 << 20, MemoryReservePinned: true, Argv: []string{docker, "run", "--memory=8m", "img"}}, false, 12 << 20, 12 << 20},
 		// The CLI sets MemoryReserveFromEnv only when no --memory-reserve was given
 		// (TestConfineReserveFromEnvTranscription: an explicit flag beside the
 		// variable leaves it false, so that job is the "--memory-reserve" row above).

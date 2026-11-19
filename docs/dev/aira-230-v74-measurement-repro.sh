@@ -39,6 +39,9 @@ log_dir="${AIRA_230_V74_REPRO_DIR:-${HOME}/tmp/aira230-v74-measure}"
 mkdir -p "${log_dir}"
 
 test_name=TestRealPytestAitestMeasurementReport
+# The test runs one fixture test unless told otherwise; the residue curve and the
+# mid-suite turnover below need the whole eight-test fixture.
+export AIRA_AITEST_MEASURE_FULL=1
 pkg=./internal/pylib/
 
 cd "${repo_root}" || { echo "cannot cd to repo root ${repo_root}" >&2; exit 1; }

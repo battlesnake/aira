@@ -45,12 +45,25 @@ func seedLegacySearchFTS(t *testing.T, path, needle string, rows int) {
 		_ = db.Close()
 		t.Fatal(err)
 	}
+	// One transaction for the bulk rows: under synchronous(FULL) each autocommit
+	// INSERT is its own fsync. The checkpoint below still moves every row into the
+	// main file, which is what the raw-bytes check and the migration tests read.
+	tx, err := db.Begin()
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
 	for i := 0; i < rows; i++ {
-		if _, err := db.Exec(`INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content) VALUES(?,?,?,?,?)`,
+		if _, err := tx.Exec(`INSERT INTO search_fts(project_id,kind,ref_id,worktree_id,content) VALUES(?,?,?,?,?)`,
 			"p", "rant", fmt.Sprintf("RANT-%d", i), "main", fmt.Sprintf("padding padding %s padding %d", needle, i)); err != nil {
+			_ = tx.Rollback()
 			_ = db.Close()
 			t.Fatal(err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
 	}
 	// One row far larger than a 4 KB page, so the fixture covers OVERFLOW pages
 	// and not only inline cells: secure_delete zeroes both on free, but a

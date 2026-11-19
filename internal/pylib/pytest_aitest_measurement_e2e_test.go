@@ -79,11 +79,20 @@ func TestRealPytestAitestMeasurementReport(t *testing.T) {
 	// multi-sample RESIDUE curve and its retirement peak is a real per-worker datapoint.
 	// Under the short-window sub-run (AIRA_AITEST_WORKER_MAX_SECONDS=10 from the
 	// operator harness) the worker recycles mid-suite, exercising turnover too.
+	//
+	// Only the operator harness needs that curve (it sets AIRA_AITEST_MEASURE_FULL=1).
+	// Every assertion below needs one worker sample, one sidecar row and one trace
+	// span, which one fixture test gives, so the suite runs test_s0 alone.
 	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(90*time.Second))
 	defer cancelRun()
 	workers := measureWorkers()
 	t.Logf("measurement run: --aitest-workers=%s (AIRA_AITEST_MEASURE_WORKERS)", workers)
-	command := exec.CommandContext(runCtx, harness.pytest, "-q", "--aitest-workers="+workers, "test_slow_passing.py")
+	selection := "test_slow_passing.py::test_s0"
+	if os.Getenv("AIRA_AITEST_MEASURE_FULL") == "1" {
+		selection = "test_slow_passing.py"
+	}
+	t.Logf("measurement run: pytest selection %s (AIRA_AITEST_MEASURE_FULL=1 runs the whole fixture)", selection)
+	command := exec.CommandContext(runCtx, harness.pytest, "-q", "--aitest-workers="+workers, selection)
 	command.Dir = filepath.Join(harness.aitestDir, "testdata")
 	command.WaitDelay = 15 * time.Second // load-bearing on a real-cgroup run (see the pass/fail e2e).
 	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}

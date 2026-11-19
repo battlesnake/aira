@@ -58,10 +58,25 @@ func TestTheRepositorysOwnTicketFilesAreReadable(t *testing.T) {
 		t.Fatalf("rebuild: %v", err)
 	}
 
-	for _, id := range ids {
-		if _, err := s.Get(id); err != nil {
-			t.Errorf("%s is unreadable: %s", id, err)
-		}
+	// One scan pass over the whole directory, not one Get per ticket: Get also
+	// derives relation views, and that derivation rescans every ticket file, so a
+	// Get per ticket made this walk quadratic (70 s at 353 tickets). The scan
+	// applies the same per-file checks Get does (regular-file read, ParseTicket,
+	// the id/filename match) plus project and duplicate-id checks Get lacks. The
+	// only per-ticket work Get adds is the relation derivation, which is a global
+	// scan that reports integrity problems as warnings rather than errors, so no
+	// error that a Get loop could raise is lost; the named Gets below still
+	// exercise that derivation. The scan skips dot-files, so the count is pinned
+	// against the copied ids as well.
+	scanned, findings, _, inconclusive, err := scanTickets(root, s.worktreeID, s.projectSlug)
+	if err != nil || inconclusive {
+		t.Fatalf("scan the copied tickets: err=%v inconclusive=%v", err, inconclusive)
+	}
+	for _, finding := range findings {
+		t.Errorf("ticket file is unreadable: %+v", finding)
+	}
+	if len(scanned) != len(ids) {
+		t.Errorf("scanned %d readable tickets, want all %d copied", len(scanned), len(ids))
 	}
 
 	// The seven tickets AIRA-170 was filed about, plus AIRA-169 whose own

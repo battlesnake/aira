@@ -180,7 +180,8 @@ func TestHandshakeDeadlineDoesNotSurviveIntoAHandlersOwnReads(t *testing.T) {
 	// Wait several connect budgets: the held lease must survive, proving the connect
 	// deadline did not survive into the handler's peer-watcher read. Had it, the read
 	// would have errored at ~Connect and released the lease.
-	time.Sleep(testdeadline.Wait(5 * server.deadlines.Connect))
+	// A negative wait, so a plain sleep: testdeadline.Wait would floor it at 5 s.
+	time.Sleep(5 * server.deadlines.Connect)
 	if _, cpu, jobs := sliceLedger(t, server, "/slice"); jobs != 1 || cpu != runner.DefaultConfineCPUCores {
 		t.Fatalf("lease jobs=%d cpu=%d after %v (>> the %v connect budget): the handler's held read died with the handshake deadline",
 			jobs, cpu, 5*server.deadlines.Connect, server.deadlines.Connect)

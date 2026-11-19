@@ -2459,6 +2459,9 @@ if "0s" in sys.argv:
 """)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_ADMIT_READ_GRACE", "1")
+    # The wedged relay is reaped with a bounded wait before SIGKILL; 0.2 s keeps
+    # that kill path without sitting out the 5 s production reap timeout.
+    monkeypatch.setenv("AIRA_AITEST_REAP_TIMEOUT", "0.2")
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
     supervisor._run_worker_count = 4
@@ -2493,6 +2496,9 @@ time.sleep(600)
 """)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_ADMIT_READ_GRACE", "1")
+    # The wedged relay is reaped with a bounded wait before SIGKILL; 0.2 s keeps
+    # that kill path without sitting out the 5 s production reap timeout.
+    monkeypatch.setenv("AIRA_AITEST_REAP_TIMEOUT", "0.2")
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
 

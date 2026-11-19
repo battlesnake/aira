@@ -319,6 +319,12 @@ func TestRantRedactReportsIncompletePhysicalErasureWhenWALHeld(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The checkpoint waits busy_timeout (5 s in production) for the reader below
+	// before reporting busy. This test asserts the busy outcome, not how long it
+	// was waited for, so the redacting store's one pooled connection waits 100 ms.
+	if _, err := s.db.Exec(`PRAGMA busy_timeout=100`); err != nil {
+		t.Fatal(err)
+	}
 	// A second connection holds an open read transaction, pinning the WAL so a
 	// TRUNCATE checkpoint cannot complete.
 	reader := openRantStore(t, base, root)

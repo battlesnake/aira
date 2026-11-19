@@ -12,7 +12,6 @@ import (
 
 	"aira/internal/core"
 	"aira/internal/runner"
-	"aira/internal/testdeadline"
 )
 
 // shimTestServer is a ci-shim daemon whose ledger admits against a small
@@ -78,7 +77,7 @@ func TestShimLedgerQueuesASecondJobUntilTheFirstReleases(t *testing.T) {
 	select {
 	case <-second.grantedCh:
 		t.Fatal("the second job was admitted while the first held the whole budget: the ci-shim ledger is not gating anything")
-	case <-time.After(testdeadline.Wait(200 * time.Millisecond)):
+	case <-time.After(200 * time.Millisecond): // a negative wait: plain timer, never testdeadline.Wait
 	}
 
 	server.releaseAdmitWaiter(queueOne, first)
