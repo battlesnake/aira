@@ -670,17 +670,25 @@ func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel pan
 	if target == nil {
 		return
 	}
-	if bar != nil && bar.Kind == topBarRAM {
+	if target == r.topBar || (bar != nil && bar.Kind == topBarRAM) {
 		// AIRA-361: the small-job lane gauge rides in the title, so it takes none
 		// of the panel's fixed interior rows from the honesty lines below. With the
 		// gauge the title is left-aligned, so a border too narrow for it clips its
 		// END (the static job maximum), never "System RAM" or the lane's state at
 		// its start as a centred overflow would.
+		//
+		// The title is rewritten on EVERY paint of the RAM panel, a missing model
+		// included: a failed refresh clears the model, and a title left from the
+		// last good reply would state stale lane figures over an ERROR body.
+		lane := ""
+		if bar != nil {
+			lane = bar.Lane
+		}
 		align := tview.AlignCenter
-		if bar.Lane != "" {
+		if lane != "" {
 			align = tview.AlignLeft
 		}
-		target.SetTitle(topRAMPanelTitle(bar.Lane)).SetTitleAlign(align)
+		target.SetTitle(topRAMPanelTitle(lane)).SetTitleAlign(align)
 	}
 	var out strings.Builder
 	if panel.Status == panelError {

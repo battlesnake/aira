@@ -39,9 +39,46 @@ func topRenderBarTitle(t *testing.T, bar *topBar) (string, string) {
 	target := tview.NewTextView().SetDynamicColors(true).SetWrap(false)
 	target.SetBorder(true).SetTitle(topRAMPanelTitle(""))
 	target.SetRect(0, 0, 80, topRAMBarHeight)
-	r := &tuiRuntime{}
+	r := &tuiRuntime{topBar: target}
 	r.renderTopBar(target, bar, panelState{Status: panelReady})
 	return target.GetTitle(), target.GetText(true)
+}
+
+// A refresh that FAILS after a good one clears the panel's model (the body
+// reads ERROR); the RAM panel's title must lose the lane gauge with it, never
+// keep stating the last reply's usage, job count and shut state.
+//
+// Mutation: rewriting the title only while a bar exists (the pre-fix guard) is
+// red: the title keeps "OVER, shut: 9216M/8192M, 12 jobs".
+func TestTopLaneTitleClearsWhenARefreshFails(t *testing.T) {
+	target := tview.NewTextView().SetDynamicColors(true).SetWrap(false)
+	target.SetBorder(true).SetTitle(topRAMPanelTitle(""))
+	target.SetRect(0, 0, 80, topRAMBarHeight)
+	r := &tuiRuntime{topBar: target}
+
+	// Both refreshes go through the REAL reducer, so the test covers what the
+	// reducer actually leaves in the panel after a failure, not an assumed nil.
+	state := newTUIStateForViews(8, topOnlyViews, nil)
+	deliver := func(state tuiState, result fetchResult) tuiState {
+		state, _ = requestPanelRefresh(state, viewTop)
+		result.View, result.Generation = viewTop, state.Panels[viewTop].InFlightGeneration
+		state, _ = onTUIFetchResult(state, result)
+		return state
+	}
+	listing := topTestListing(topLaneFrame(9*gib, 12))
+	state = deliver(state, fetchResult{Top: &listing})
+	good := state.Panels[viewTop]
+	r.renderTopBar(target, good.Model.Bar, good)
+	if title := target.GetTitle(); !strings.Contains(title, "OVER, shut: 9216M/8192M, 12 jobs") {
+		t.Fatalf("good refresh: title=%q, want the lane gauge", title)
+	}
+
+	state = deliver(state, fetchResult{Code: "E_DAEMON_UNAVAILABLE"})
+	failed := state.Panels[viewTop]
+	r.renderTopBar(target, failed.Model.Bar, failed)
+	if title, text := target.GetTitle(), target.GetText(true); title != " System RAM " || !strings.Contains(text, "ERROR E_DAEMON_UNAVAILABLE") {
+		t.Fatalf("failed refresh: title=%q text=%q, want the bare title over the ERROR body", title, text)
+	}
 }
 
 // The lane gauge is the RAM panel's, present exactly while the lane is on, and
