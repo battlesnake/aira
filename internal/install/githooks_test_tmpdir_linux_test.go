@@ -3,6 +3,8 @@
 package install
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,14 +24,19 @@ import (
 //   - drop the liveness check, or compare only the pid and not its start time
 //     (live-run dir swept / reused-pid dir kept);
 //   - drop the pid-namespace check (other-namespace dir swept);
-//   - drop the age margin (young dead dir swept);
 //   - treat an unreadable start time of an existing pid as gone (live dir
 //     swept under a failing cat);
 //   - remove with a plain rm -rf, skip restoring permissions, or skip the
 //     left-over check (owner file lost, or a mode-000 subdir left behind);
-//   - follow a symlink, or sweep a dir without a valid owner file;
+//   - follow a symlink (drop the physical-path check), or sweep a dir
+//     without a valid owner file;
+//   - remove by path after the check instead of from inside the checked dir
+//     (a name reused, or swapped for a symlink, mid-removal is hit);
+//   - drop the lock, or hold it into the command;
 //   - lose the command's exit status, or leave the run dir behind;
-//   - use tmpfs under CI, or when the root is missing or too small.
+//   - use tmpfs under CI, without a usable lock, or when the root is missing
+//     or too small;
+//   - point GOTMPDIR at an explicit (noexec) AIRA_TEST_DISK_TMPDIR.
 //
 // verifies: AIRA-357
 
@@ -150,10 +157,12 @@ func TestTestTmpdirSweepRemovesOnlyDeadRunsDirs(t *testing.T) {
 	gone := map[string]string{
 		"dead":       plantRunDir(t, root, "t.dead", ownerLine(dead, deadStart, ns), old),
 		"reused-pid": plantRunDir(t, root, "t.reus", ownerLine(me, myStart+"1", ns), old),
+		// No age margin: the liveness proof alone decides (the lock means no
+		// sweep sees a dir before its owner file is written).
+		"young": plantRunDir(t, root, "t.youn", ownerLine(dead, deadStart, ns), 0),
 	}
 	kept := map[string]string{
 		"live":            plantRunDir(t, root, "t.live", ownerLine(me, myStart, ns), old),
-		"young":           plantRunDir(t, root, "t.youn", ownerLine(dead, deadStart, ns), time.Minute),
 		"other-namespace": plantRunDir(t, root, "t.othn", ownerLine(dead, deadStart, "pid:[1]"), old),
 		"no-owner":        plantRunDir(t, root, "t.noow", "", old),
 		"wrong-version":   plantRunDir(t, root, "t.badv", "aira-test-tmpdir v0\n"+strconv.Itoa(dead)+" "+deadStart+" "+ns+"\n", old),
@@ -161,14 +170,10 @@ func TestTestTmpdirSweepRemovesOnlyDeadRunsDirs(t *testing.T) {
 		"other-name":      plantRunDir(t, root, "u.dead", ownerLine(dead, deadStart, ns), old),
 		"long-name":       plantRunDir(t, root, "t.dead0", ownerLine(dead, deadStart, ns), old),
 	}
-	// A symlink named like a run dir, pointing at a dead run's dir elsewhere.
-	elsewhere := plantRunDir(t, t.TempDir(), "t.targ", ownerLine(dead, deadStart, ns), old)
+	// A symlink named like a run dir, pointing at a dead run's dir elsewhere,
+	// whose files have modes a chmod -R u+rwX would change.
 	link := filepath.Join(root, "t.link")
-	if err := os.Symlink(elsewhere, link); err != nil {
-		t.Fatal(err)
-	}
-	kept["symlink"] = link
-	kept["symlink-target"] = elsewhere
+	target := plantSymlinkTarget(t, link, ownerLine(dead, deadStart, ns))
 
 	out, code := runTestTmpdir(t, []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, "true")
 	if code != 0 {
@@ -184,6 +189,66 @@ func TestTestTmpdirSweepRemovesOnlyDeadRunsDirs(t *testing.T) {
 			t.Errorf("%s: %s was swept or emptied: %v\n%s", name, dir, err, out)
 		}
 	}
+	target.check(t, link, out)
+}
+
+// symlinkTarget is a dead run's dir outside the root, reached through a symlink
+// named like a run dir, with its state recorded so a check can prove the sweep
+// changed nothing there.
+type symlinkTarget struct {
+	dir, owner string
+	modes      map[string]os.FileMode
+}
+
+// plantSymlinkTarget makes a dead run's dir in a fresh temp dir holding owner,
+// a payload, and modes chmod -R u+rwX would change (owner and payload 0400),
+// and points the symlink link at it.
+func plantSymlinkTarget(t *testing.T, link, owner string) symlinkTarget {
+	t.Helper()
+	parent := t.TempDir()
+	chmodBackOnCleanup(t, parent)
+	dir := plantRunDir(t, parent, "t.targ", owner, time.Hour)
+	st := symlinkTarget{dir: dir, owner: owner, modes: map[string]os.FileMode{}}
+	for _, name := range []string{".aira-test-owner", "payload"} {
+		if err := os.Chmod(filepath.Join(dir, name), 0o400); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{dir, filepath.Join(dir, ".aira-test-owner"), filepath.Join(dir, "payload")} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.modes[path] = info.Mode()
+	}
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// check asserts link is still a symlink to the target, and the target's owner
+// file contents and every recorded mode are unchanged.
+func (st symlinkTarget) check(t *testing.T, link, out string) {
+	t.Helper()
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("%s is no longer a symlink (lstat %v, err %v)\n%s", link, info, err, out)
+	} else if dest, err := os.Readlink(link); err != nil || dest != st.dir {
+		t.Errorf("%s now points at %q (err %v), want %s\n%s", link, dest, err, st.dir, out)
+	}
+	if data, err := os.ReadFile(filepath.Join(st.dir, ".aira-test-owner")); err != nil || string(data) != st.owner {
+		t.Errorf("the symlink target's owner file changed: %q, err %v\n%s", data, err, out)
+	}
+	for path, mode := range st.modes {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Errorf("the symlink target lost %s: %v\n%s", path, err, out)
+			continue
+		}
+		if info.Mode() != mode {
+			t.Errorf("%s mode %v, want %v (chmod went through the symlink)\n%s", path, info.Mode(), mode, out)
+		}
+	}
 }
 
 // TestTestTmpdirRunsOnTmpfsAndCleansUp: the command sees TMPDIR as a fresh
@@ -195,7 +260,9 @@ func TestTestTmpdirRunsOnTmpfsAndCleansUp(t *testing.T) {
 	for _, status := range []int{0, 3} {
 		root := t.TempDir()
 		report := filepath.Join(t.TempDir(), "report")
-		script := `printf '%s\n%s\n%s\n' "$TMPDIR" "$AIRA_TEST_DISK_TMPDIR" "$GOTMPDIR" > "$1"; cat "$TMPDIR/.aira-test-owner" >> "$1"; exit "$2"`
+		script := `printf '%s\n%s\n%s\n' "$TMPDIR" "$AIRA_TEST_DISK_TMPDIR" "$GOTMPDIR" > "$1"; cat "$TMPDIR/.aira-test-owner" >> "$1"; if flock -n "$AIRA_TEST_TMPFS_ROOT/.aira-test-lock.$(id -u)" true; then echo lock-free; else echo lock-held; fi >> "$1"; exit "$2"`
+		// The last line says whether the lock is free while the command runs
+		// (no other run uses this root, so held means this run kept it).
 		out, code := runTestTmpdir(t, []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0", "TMPDIR=/var/tmp"},
 			"bash", "-c", script, "probe", report, strconv.Itoa(status))
 		if code != status {
@@ -206,7 +273,7 @@ func TestTestTmpdirRunsOnTmpfsAndCleansUp(t *testing.T) {
 			t.Fatalf("the command did not run: %v\n%s", err, out)
 		}
 		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		if len(lines) != 5 {
+		if len(lines) != 6 {
 			t.Fatalf("report %q", data)
 		}
 		run := lines[0]
@@ -223,6 +290,9 @@ func TestTestTmpdirRunsOnTmpfsAndCleansUp(t *testing.T) {
 		if len(owner) != 3 || owner[2] != ourPidNS(t) {
 			t.Fatalf("owner line %q", lines[4])
 		}
+		if lines[5] != "lock-free" {
+			t.Fatalf("the lock was %s while the command ran", lines[5])
+		}
 		if _, err := os.Stat(run); !os.IsNotExist(err) {
 			t.Fatalf("run dir %s left behind (stat err %v)", run, err)
 		}
@@ -235,11 +305,20 @@ func TestTestTmpdirRunsOnTmpfsAndCleansUp(t *testing.T) {
 func TestTestTmpdirFallsBackToTheNormalTmpdir(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
+	// A root whose lock path is a symlink (to a file we own): never opened.
+	symlinkLockRoot := t.TempDir()
+	lockTarget := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.Symlink(lockTarget, filepath.Join(symlinkLockRoot, ".aira-test-lock."+strconv.Itoa(os.Getuid()))); err != nil {
+		t.Fatal(err)
+	}
+	noFlock := "PATH=" + shimDir(t, map[string]string{"flock": "exit 1"}) + ":" + os.Getenv("PATH")
 	cases := []struct {
 		name string
 		env  []string
 	}{
 		{"ci", []string{"CI=true", "AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}},
+		{"flock-fails", []string{noFlock, "AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}},
+		{"lock-is-a-symlink", []string{"AIRA_TEST_TMPFS_ROOT=" + symlinkLockRoot, "AIRA_TEST_TMPFS_MIN_KB=0"}},
 		{"opt-out", []string{"AIRA_TEST_TMPFS=0", "AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}},
 		{"missing-root", []string{"AIRA_TEST_TMPFS_ROOT=" + filepath.Join(root, "absent"), "AIRA_TEST_TMPFS_MIN_KB=0"}},
 		{"too-small", []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=999999999999"}},
@@ -251,6 +330,14 @@ func TestTestTmpdirFallsBackToTheNormalTmpdir(t *testing.T) {
 			if code != 4 {
 				t.Fatalf("exit %d, want 4 (the command's own, with TMPDIR untouched)\n%s", code, out)
 			}
+			if c.name == "lock-is-a-symlink" {
+				if _, err := os.Lstat(lockTarget); !os.IsNotExist(err) {
+					t.Fatalf("the lock was opened through the symlink (lstat %s err %v)", lockTarget, err)
+				}
+				if entries, err := filepath.Glob(filepath.Join(symlinkLockRoot, "t.*")); err != nil || len(entries) != 0 {
+					t.Fatalf("run dirs %v made without the lock (err %v)", entries, err)
+				}
+			}
 		})
 	}
 	// The negative control: the same root and size floor 0 DO move TMPDIR.
@@ -258,11 +345,12 @@ func TestTestTmpdirFallsBackToTheNormalTmpdir(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("control: TMPDIR was not moved (exit %d)\n%s", code, out)
 	}
+
 }
 
 // TestTestTmpdirHardKillLeaksAndTheNextRunSweeps is the hard-kill leak check:
 // SIGKILL the whole run (as `aira confine --kill` does) and its dir stays;
-// once it is past the age margin the next run removes it.
+// the next run removes it at once (there is no age margin).
 func TestTestTmpdirHardKillLeaksAndTheNextRunSweeps(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -287,12 +375,8 @@ func TestTestTmpdirHardKillLeaksAndTheNextRunSweeps(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// While it runs, a sweep (even with the dir aged past the margin) keeps it.
+	// While it runs, a sweep keeps it.
 	owner := filepath.Join(run, ".aira-test-owner")
-	aged := time.Now().Add(-time.Hour)
-	if err := os.Chtimes(owner, aged, aged); err != nil {
-		t.Fatal(err)
-	}
 	if out, code := runTestTmpdir(t, []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, "true"); code != 0 {
 		t.Fatalf("sweep run exit %d\n%s", code, out)
 	}
@@ -437,7 +521,7 @@ func TestTestTmpdirSweepKeepsTheOwnerFileUntilThePayloadIsGone(t *testing.T) {
 
 // TestTestTmpdirExitKeepsTheOwnerFileUntilThePayloadIsGone: the run's own exit
 // removes a run dir holding a mode-000 subdir; when that removal cannot finish,
-// the owner file stays, and once past the age margin a later sweep removes it.
+// the owner file stays, and a later sweep removes it.
 // The exit status stays the command's either way.
 func TestTestTmpdirExitKeepsTheOwnerFileUntilThePayloadIsGone(t *testing.T) {
 	if os.Geteuid() == 0 {
@@ -480,10 +564,6 @@ func TestTestTmpdirExitKeepsTheOwnerFileUntilThePayloadIsGone(t *testing.T) {
 		if _, err := os.Stat(owner); err != nil {
 			t.Fatalf("a failed exit removal lost the owner file: %v\n%s", err, out)
 		}
-		aged := time.Now().Add(-time.Hour)
-		if err := os.Chtimes(owner, aged, aged); err != nil {
-			t.Fatal(err)
-		}
 		out, code = runTestTmpdir(t, []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, "true")
 		if code != 0 {
 			t.Fatalf("sweep exit %d\n%s", code, out)
@@ -511,10 +591,11 @@ func TestTestTmpdirFallsBackOnANoexecRoot(t *testing.T) {
 		root := t.TempDir()
 		// Inside the namespace: mount the root, run the real script on a
 		// command that exits 4 when TMPDIR is untouched and 0 when it moved
-		// under the root, and 8 if the fallback left anything in the root.
+		// under the root, and 8 if the fallback left anything in the root but
+		// the lock file.
 		mount := `mount -t tmpfs -o "$1" none "$2" || exit 77; shift 2; exec bash "$@"`
 		cmd := exec.Command("unshare", "-rm", "sh", "-c", mount, "sh", c.opts, root, testTmpdirScript(t),
-			"bash", "-c", `if [ "$TMPDIR" = /var/tmp ]; then [ -z "$(ls -A "$AIRA_TEST_TMPFS_ROOT")" ] || exit 8; exit 4; fi; case "$TMPDIR" in "$AIRA_TEST_TMPFS_ROOT"/t.*) exit 0 ;; esac; exit 9`)
+			"bash", "-c", `if [ "$TMPDIR" = /var/tmp ]; then [ -z "$(ls -A "$AIRA_TEST_TMPFS_ROOT" | grep -v '^\.aira-test-lock\.')" ] || exit 8; exit 4; fi; case "$TMPDIR" in "$AIRA_TEST_TMPFS_ROOT"/t.*) exit 0 ;; esac; exit 9`)
 		cmd.Env = testTmpdirEnv("TMPDIR=/var/tmp", "AIRA_TEST_TMPFS_ROOT="+root, "AIRA_TEST_TMPFS_MIN_KB=0")
 		out, err := cmd.CombinedOutput()
 		code := 0
@@ -537,36 +618,26 @@ func TestTestTmpdirFallsBackOnANoexecRoot(t *testing.T) {
 // TestTestTmpdirDiskDir: the disk directory exported for the SliceCeiling
 // fixture keeps an explicit AIRA_TEST_DISK_TMPDIR, is the incoming TMPDIR
 // when that is on disk, and is /var/tmp when the incoming TMPDIR is tmpfs.
+// GOTMPDIR is chosen the same way but never from the explicit fixture override.
 func TestTestTmpdirDiskDir(t *testing.T) {
 	t.Parallel()
-	isTmpfs := func(dir string) bool {
-		var st syscall.Statfs_t
-		return syscall.Statfs(dir, &st) == nil && st.Type == 0x01021994
-	}
 	if isTmpfs("/var/tmp") {
 		t.Skip("/var/tmp is tmpfs here; no disk directory to expect")
 	}
 	explicit := t.TempDir()
-	cases := []struct {
-		name string
-		env  []string
-		want string
-	}{
-		{"explicit-kept", []string{"TMPDIR=/var/tmp", "AIRA_TEST_DISK_TMPDIR=" + explicit}, explicit},
-		{"disk-tmpdir", []string{"TMPDIR=/var/tmp"}, "/var/tmp"},
+	type diskCase struct {
+		name         string
+		env          []string
+		want, wantGo string
+	}
+	cases := []diskCase{
+		{"explicit-kept", []string{"TMPDIR=/var/tmp", "AIRA_TEST_DISK_TMPDIR=" + explicit}, explicit, "/var/tmp"},
+		{"disk-tmpdir", []string{"TMPDIR=/var/tmp"}, "/var/tmp", "/var/tmp"},
 	}
 	if isTmpfs("/dev/shm") {
 		cases = append(cases,
-			struct {
-				name string
-				env  []string
-				want string
-			}{"tmpfs-tmpdir", []string{"TMPDIR=/dev/shm"}, "/var/tmp"},
-			struct {
-				name string
-				env  []string
-				want string
-			}{"explicit-kept-over-tmpfs", []string{"TMPDIR=/dev/shm", "AIRA_TEST_DISK_TMPDIR=" + explicit}, explicit},
+			diskCase{"tmpfs-tmpdir", []string{"TMPDIR=/dev/shm"}, "/var/tmp", "/var/tmp"},
+			diskCase{"explicit-kept-over-tmpfs", []string{"TMPDIR=/dev/shm", "AIRA_TEST_DISK_TMPDIR=" + explicit}, explicit, "/var/tmp"},
 		)
 	} else {
 		t.Log("/dev/shm is not tmpfs here; the tmpfs-TMPDIR cases are not run")
@@ -574,12 +645,211 @@ func TestTestTmpdirDiskDir(t *testing.T) {
 	for _, c := range cases {
 		root := t.TempDir()
 		env := append([]string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, c.env...)
-		out, code := runTestTmpdir(t, env, "bash", "-c", `case "$TMPDIR" in "$AIRA_TEST_TMPFS_ROOT"/t.*) ;; *) echo "TMPDIR not moved: $TMPDIR"; exit 9 ;; esac; printf '%s\n' "$AIRA_TEST_DISK_TMPDIR"`)
+		out, code := runTestTmpdir(t, env, "bash", "-c", `case "$TMPDIR" in "$AIRA_TEST_TMPFS_ROOT"/t.*) ;; *) echo "TMPDIR not moved: $TMPDIR"; exit 9 ;; esac; printf '%s %s\n' "$AIRA_TEST_DISK_TMPDIR" "$GOTMPDIR"`)
 		if code != 0 {
 			t.Fatalf("%s: exit %d\n%s", c.name, code, out)
 		}
-		if got := strings.TrimSpace(out); got != c.want {
-			t.Errorf("%s: AIRA_TEST_DISK_TMPDIR=%q, want %q", c.name, got, c.want)
+		if got, want := strings.TrimSpace(out), c.want+" "+c.wantGo; got != want {
+			t.Errorf("%s: AIRA_TEST_DISK_TMPDIR GOTMPDIR = %q, want %q", c.name, got, want)
 		}
+	}
+}
+
+func isTmpfs(dir string) bool {
+	var st syscall.Statfs_t
+	return syscall.Statfs(dir, &st) == nil && st.Type == 0x01021994
+}
+
+// TestTestTmpdirGoTmpdirRunsProgramsUnderANoexecFixtureDir: an explicit
+// AIRA_TEST_DISK_TMPDIR mounted noexec is fine for the fixture's page-cache
+// files, and GOTMPDIR (where go test puts the binaries it runs) is not it, so
+// a program copied there runs. The fixture dir is a private noexec tmpfs in a
+// user+mount namespace; the control in the same command shows a program in it
+// does NOT run.
+func TestTestTmpdirGoTmpdirRunsProgramsUnderANoexecFixtureDir(t *testing.T) {
+	t.Parallel()
+	if isTmpfs("/var/tmp") {
+		t.Skip("/var/tmp is tmpfs here; no disk directory for GOTMPDIR")
+	}
+	if err := exec.Command("unshare", "-rm", "true").Run(); err != nil {
+		t.Skipf("unprivileged user+mount namespaces unavailable (unshare -rm: %v)", err)
+	}
+	// /var/tmp itself must run programs, or there is nothing to show.
+	host := `p="/var/tmp/aira-357-exec.$$"; cp "$(type -P true)" "$p" && "$p"; rc=$?; rm -f "$p"; exit $rc`
+	if err := exec.Command("bash", "-c", host).Run(); err != nil {
+		t.Skipf("/var/tmp cannot run programs here: %v", err)
+	}
+	fixture := t.TempDir()
+	mount := `mount -t tmpfs -o noexec none "$1" || exit 77; shift; exec bash "$@"`
+	probe := `cp "$(type -P true)" "$AIRA_TEST_DISK_TMPDIR/x" || exit 5
+"$AIRA_TEST_DISK_TMPDIR/x" 2>/dev/null && exit 6
+p="$GOTMPDIR/aira-357-exec.$$"; cp "$(type -P true)" "$p" || exit 7
+"$p"; rc=$?; rm -f "$p"; [ "$rc" = 0 ] || exit 8`
+	cmd := exec.Command("unshare", "-rm", "sh", "-c", mount, "sh", fixture, testTmpdirScript(t), "bash", "-c", probe)
+	cmd.Env = testTmpdirEnv("TMPDIR=/var/tmp", "AIRA_TEST_DISK_TMPDIR="+fixture, "AIRA_TEST_TMPFS_ROOT="+t.TempDir(), "AIRA_TEST_TMPFS_MIN_KB=0")
+	out, err := cmd.CombinedOutput()
+	code := 0
+	if err != nil {
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		code = exitErr.ExitCode()
+	}
+	switch code {
+	case 0:
+	case 77:
+		t.Skipf("cannot mount a tmpfs in the namespace\n%s", out)
+	case 6:
+		t.Fatalf("control: the fixture dir ran a program, so it is not noexec\n%s", out)
+	case 8:
+		t.Fatalf("a program in GOTMPDIR did not run: GOTMPDIR is the noexec fixture dir\n%s", out)
+	default:
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+}
+
+// pausingChmod returns a PATH entry whose chmod, on its first call only,
+// makes <pause>/paused and waits for <pause>/go before running the real
+// chmod. Removal's first command, in this script and its predecessor, is that
+// chmod, so the pause falls after a sweep has checked a dir and before it
+// deletes anything.
+func pausingChmod(t *testing.T) (path, pause string) {
+	t.Helper()
+	realChmod, err := exec.LookPath("chmod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pause = t.TempDir()
+	body := fmt.Sprintf(`if mkdir '%s/paused' 2>/dev/null; then while [ ! -e '%s/go' ]; do sleep 0.01; done; fi
+exec '%s' "$@"`, pause, pause, realChmod)
+	return "PATH=" + shimDir(t, map[string]string{"chmod": body}) + ":" + os.Getenv("PATH"), pause
+}
+
+// startTestTmpdir starts the real script in its own process group (killed on
+// cleanup if still running), output to the returned buffer.
+func startTestTmpdir(t *testing.T, extraEnv []string, argv ...string) (*exec.Cmd, *bytes.Buffer) {
+	t.Helper()
+	var buf bytes.Buffer
+	cmd := exec.Command("bash", append([]string{testTmpdirScript(t)}, argv...)...)
+	cmd.Env = testTmpdirEnv(extraEnv...)
+	cmd.Stdout, cmd.Stderr = &buf, &buf
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if cmd.ProcessState == nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+		}
+	})
+	return cmd, &buf
+}
+
+// waitPaused waits for the pausing chmod to be reached.
+func waitPaused(t *testing.T, pause string) {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(pause, "paused")); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the sweep never reached its removal")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// resume lets the paused chmod go on and waits for cmd, which must exit 0.
+func resume(t *testing.T, pause string, cmd *exec.Cmd, out *bytes.Buffer) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(pause, "go"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("paused run: %v\n%s", err, out)
+	}
+}
+
+// TestTestTmpdirSweepNeverRemovesADirReusedMidRemoval: sweep B has checked a
+// dead run's dir and is about to delete it when (as sweep A and a new run
+// could, without serialisation) the dir is removed and its name reused by a
+// LIVE run. B must not delete the live run's dir.
+func TestTestTmpdirSweepNeverRemovesADirReusedMidRemoval(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	ns := ourPidNS(t)
+	me := os.Getpid()
+	dead, deadStart := deadPid(t)
+	dir := plantRunDir(t, root, "t.reus", ownerLine(dead, deadStart, ns), time.Hour)
+
+	path, pause := pausingChmod(t)
+	b, out := startTestTmpdir(t, []string{path, "AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, "true")
+	waitPaused(t, pause)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	live := ownerLine(me, procStart(t, me), ns)
+	plantRunDir(t, root, "t.reus", live, 0)
+	resume(t, pause, b, out)
+
+	if _, err := os.Stat(filepath.Join(dir, "payload")); err != nil {
+		t.Errorf("the live run's reused dir was emptied: %v\n%s", err, out)
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, ".aira-test-owner")); err != nil || string(data) != live {
+		t.Errorf("the live run's owner file is %q (err %v)\n%s", data, err, out)
+	}
+}
+
+// TestTestTmpdirSweepNeverFollowsADirSwappedForASymlinkMidRemoval: sweep B has
+// checked a dead run's dir and is about to delete it when the dir is renamed
+// away and a symlink to another dir put in its place. B must change nothing
+// through the symlink.
+func TestTestTmpdirSweepNeverFollowsADirSwappedForASymlinkMidRemoval(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	ns := ourPidNS(t)
+	dead, deadStart := deadPid(t)
+	dir := plantRunDir(t, root, "t.swap", ownerLine(dead, deadStart, ns), time.Hour)
+
+	path, pause := pausingChmod(t)
+	b, out := startTestTmpdir(t, []string{path, "AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, "true")
+	waitPaused(t, pause)
+	if err := os.Rename(dir, filepath.Join(root, "moved")); err != nil {
+		t.Fatal(err)
+	}
+	target := plantSymlinkTarget(t, dir, ownerLine(dead, deadStart, ns))
+	resume(t, pause, b, out)
+
+	target.check(t, dir, out.String())
+}
+
+// TestTestTmpdirSweepsAreSerialised: while one run is mid-removal, the lock is
+// held, so a second run started then waits; both finish, and the dead run's
+// dir and both runs' own dirs are gone.
+func TestTestTmpdirSweepsAreSerialised(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	ns := ourPidNS(t)
+	dead, deadStart := deadPid(t)
+	plantRunDir(t, root, "t.stal", ownerLine(dead, deadStart, ns), time.Hour)
+	lock := filepath.Join(root, ".aira-test-lock."+strconv.Itoa(os.Getuid()))
+
+	path, pause := pausingChmod(t)
+	env := []string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}
+	b, bOut := startTestTmpdir(t, append([]string{path}, env...), "true")
+	waitPaused(t, pause)
+	if err := exec.Command("flock", "-n", lock, "true").Run(); err == nil {
+		t.Errorf("the lock %s was free while a sweep was mid-removal\n%s", lock, bOut)
+	}
+	a, aOut := startTestTmpdir(t, env, "true")
+	resume(t, pause, b, bOut)
+	if err := a.Wait(); err != nil {
+		t.Fatalf("second run: %v\n%s", err, aOut)
+	}
+	if left, err := filepath.Glob(filepath.Join(root, "t.*")); err != nil || len(left) != 0 {
+		t.Fatalf("left behind: %v (err %v)\nB:\n%s\nA:\n%s", left, err, bOut, aOut)
 	}
 }

@@ -101,14 +101,21 @@ opts out for one run.
 The go tool's build directory stays on disk (`GOTMPDIR`), and the daemon's
 SliceCeiling real-cgroup fixture writes to the disk directory named in
 `AIRA_TEST_DISK_TMPDIR`, because it measures page cache and a tmpfs file is not
-page cache. A value already set is kept; otherwise it is the incoming `TMPDIR`
-(or `/tmp`), or `/var/tmp` when that is itself tmpfs. A hard-killed run leaves its directory in `/dev/shm`, holding RAM;
-the next run removes such a directory once it is over 10 minutes old and its
-owner file proves the run that made it is gone (same pid namespace, pid dead or
-reused); it never touches a live run's directory or anything without that proof
-(a pid whose start time cannot be read counts as live). Removal deletes the owner
-file last, after restoring permissions on the tree, so a removal that cannot
-finish keeps the proof for a later sweep.
+page cache. Each keeps a value already set; otherwise both are the incoming
+`TMPDIR` (or `/tmp`), or `/var/tmp` when that is itself tmpfs. An explicit
+`AIRA_TEST_DISK_TMPDIR` never becomes `GOTMPDIR`: it may be mounted noexec,
+which suits page-cache files but not test binaries.
+A hard-killed run leaves its directory in `/dev/shm`, holding RAM; the next run
+removes such a directory when its owner file proves the run that made it is
+gone (same pid namespace, pid dead or reused). It never touches a live run's
+directory or anything without that proof (a pid whose start time cannot be read
+counts as live). The sweep, the creation of a run directory and the writing of
+its owner file are serialised by a short-held `flock` on
+`/dev/shm/.aira-test-lock.<uid>`, released before the tests start; without a
+usable lock the run uses the normal `TMPDIR`. Removal works from inside the
+checked directory, so a directory renamed or swapped for a symlink meanwhile is
+never followed, and deletes the owner file last, after restoring permissions on
+the tree, so a removal that cannot finish keeps the proof for a later sweep.
 
 ## Lighter path for trivial changes
 

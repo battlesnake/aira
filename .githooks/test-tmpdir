@@ -25,20 +25,23 @@
 #   - AIRA_TEST_TMPFS=0 (an explicit opt-out for one run);
 #   - the root is not a writable directory, or it has less than
 #     AIRA_TEST_TMPFS_MIN_KB kilobytes available (default below);
+#   - the lock (see Serialisation below) cannot be taken;
 #   - a program written to the run directory cannot be executed (a noexec
 #     mount): tests run helper scripts and binaries from t.TempDir().
 # Either way the command and its exit status are the same: this wrapper only
 # chooses where the test temp files live, so a `make ci` pass recorded by
 # .githooks/ci-pass (AIRA-355) means the same full suite passed.
 #
-# Two more variables are exported for the tests:
+# Two more variables are exported for the tests, each keeping a value already
+# set and otherwise the disk directory: the incoming TMPDIR (or /tmp), or
+# /var/tmp when that one is itself tmpfs.
 #   - GOTMPDIR keeps the go tool's build work directory (compiled test
-#     binaries) where it was, on disk, so it does not take RAM;
-#   - AIRA_TEST_DISK_TMPDIR names that disk directory for the few tests that
-#     must write real page cache (the daemon's SliceCeiling real-cgroup
-#     fixture: a file on tmpfs is shared memory, not reclaimable page cache).
-#     A value already set is kept; otherwise it is the incoming TMPDIR (or
-#     /tmp), or /var/tmp when that one is itself tmpfs.
+#     binaries, which must run) on disk, so it does not take RAM;
+#   - AIRA_TEST_DISK_TMPDIR names a disk directory for the few tests that must
+#     write real page cache (the daemon's SliceCeiling real-cgroup fixture: a
+#     file on tmpfs is shared memory, not reclaimable page cache).
+#   An explicit AIRA_TEST_DISK_TMPDIR never becomes GOTMPDIR: it may be
+#   mounted noexec, fine for page cache but not for running test binaries.
 #
 # Leak sweep. A confined job has no graceful shutdown: a hard kill leaves the
 # run directory behind, and a file on tmpfs holds RAM until it is deleted or the
@@ -46,23 +49,41 @@
 # runs left. A directory is removed only when ALL of these hold:
 #   - its name is t.<4 characters>, it is a real directory (not a symlink) and
 #     the current user owns it;
-#   - it holds an owner file .aira-test-owner whose first line is the version
-#     line below, naming the pid, the pid's start time (field 22 of
-#     /proc/<pid>/stat) and the pid namespace of the run that made it;
+#   - it holds an owner file .aira-test-owner (a regular file) whose first line
+#     is the version line below, naming the pid, the pid's start time (field
+#     22 of /proc/<pid>/stat) and the pid namespace of the run that made it;
 #   - that pid namespace is ours (in another one the pid means nothing here);
 #   - that pid is gone (no /proc/<pid>), or is now a different process
 #     (another start time); when /proc/<pid> exists but its start time cannot
-#     be read, liveness is unknown and the directory is kept;
-#   - the owner file is more than 10 minutes old, a margin on top of the
-#     liveness proof.
+#     be read, liveness is unknown and the directory is kept.
 # Anything else is left alone: a directory without a readable owner file, a
 # live run of another session, anything that is not ours.
 #
-# Removal (by the sweep and by this run's own exit) deletes the owner file
+# Serialisation. The sweep, the creation of this run's directory and the
+# writing of its owner file happen under one lock, an flock on
+# <root>/.aira-test-lock.<uid>, held only for that short section and released
+# before the command starts. So no sweep can act on a directory another sweep
+# is removing, and no run can create (or reuse the name of) a directory while a
+# sweep runs; a directory is never seen between its creation and its owner
+# file. With that, the liveness proof alone decides, and a hard-killed run's
+# directory is reclaimed by the next run. The recorded owner is this wrapper:
+# killing it alone (not its process tree) while the tests still run makes their
+# directory sweepable; `aira confine --kill` and Ctrl-C stop the whole tree. No
+# flock, or a lock that cannot be opened or taken within 60 s: the command runs
+# with the normal TMPDIR.
+#
+# Removal (by the sweep and by this run's own exit) first changes into the
+# directory and checks that its physical path is still <root>/<name> and that
+# we own it, then (for the sweep) checks the owner file again there, and from
+# then on works only relative to that directory. A directory renamed or
+# replaced by a symlink after the check is never followed: what is removed is
+# the directory that was checked, and the final rmdir of <root>/<name> cannot
+# remove a symlink or a non-empty directory. The removal deletes the owner file
 # LAST, only once everything else in the directory is gone. Tests leave
 # directories without permissions (mode 000) that a hard kill stops them from
-# restoring, so the removal first gives the user rwx on the tree; if anything
-# still cannot be deleted, the owner file stays so a later sweep can retry.
+# restoring, so the removal first gives the user rwx on the tree (chmod -R does
+# not follow the symlinks it meets); if anything still cannot be deleted, the
+# owner file stays so a later sweep can retry.
 set -uo pipefail
 
 AIRA_TEST_TMPFS_OWNER_VERSION='aira-test-tmpdir v1'
@@ -77,9 +98,12 @@ AIRA_TEST_TMPFS_OWNER_VERSION='aira-test-tmpdir v1'
 # `du -sk /dev/shm/t.????` every 2 s and keep the maximum. The speed-up
 # reproduces as `aira confine -- make test` against
 # `AIRA_TEST_TMPFS=0 aira confine -- make test` (2026-11-19, load average
-# 30-100: whole run 10m27s and 12m05s on disk, 3m14s and 3m41s on tmpfs;
-# internal/store 596-717 s -> 101-105 s, internal/daemon 321-351 s ->
-# 129-135 s).
+# 30-100). Passing whole runs: 10m27s and 12m05s on disk, 3m14s on tmpfs. A
+# second tmpfs run took 3m41s but FAILED (internal/runner, the longer
+# t.XXXXXX name's socket-path overflow described above), so it is not a
+# whole-suite sample; its internal/store and internal/daemon packages passed
+# and are in these per-package figures: internal/store 596-717 s -> 101-105 s,
+# internal/daemon 321-351 s -> 129-135 s.
 AIRA_TEST_TMPFS_DEFAULT_MIN_KB=1048576
 
 # aira_test_proc_start <pid> prints the start time of <pid> (field 22 of
@@ -113,44 +137,61 @@ aira_test_owner_alive() {
 	[ -e "/proc/$1" ] || [ ! -e "/proc/$$" ]
 }
 
-# aira_test_rmrun <dir> removes a run directory, the owner file last (see the
-# header). It fails, keeping the owner file, when anything else is left.
-aira_test_rmrun() {
-	local dir="$1" left
-	# GNU chmod -R does not follow symlinks met in the traversal.
-	chmod -R u+rwX -- "$dir" 2>/dev/null
-	find "$dir" -mindepth 1 -maxdepth 1 ! -name .aira-test-owner -exec rm -rf -- {} + 2>/dev/null
-	left="$(find "$dir" -mindepth 1 -maxdepth 1 ! -name .aira-test-owner -print -quit 2>/dev/null)" || return 1
-	[ -z "$left" ] || return 1
-	rm -f -- "$dir/.aira-test-owner" && rmdir -- "$dir"
-}
-
 aira_test_pidns() {
 	readlink "/proc/$1/ns/pid" 2>/dev/null
 }
 
-# aira_test_sweep <root> removes stale run directories (see the header).
-aira_test_sweep() {
-	local root="$1" ourns dir owner line pid start ns
-	ourns="$(aira_test_pidns $$)" || return 0
-	[ -n "$ourns" ] || return 0
-	for dir in "$root"/t.????; do
-		[ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ] || continue
-		owner="$dir/.aira-test-owner"
-		[ -f "$owner" ] && [ ! -L "$owner" ] || continue
-		# Younger than the margin: leave it, whatever it says.
-		[ -n "$(find "$owner" -maxdepth 0 -mmin +10 2>/dev/null)" ] || continue
-		{ IFS= read -r line && read -r pid start ns; } <"$owner" || continue
-		[ "$line" = "$AIRA_TEST_TMPFS_OWNER_VERSION" ] || continue
-		case "$pid" in "" | *[!0-9]*) continue ;; esac
-		case "$start" in "" | *[!0-9]*) continue ;; esac
-		[ "$ns" = "$ourns" ] || continue
-		aira_test_owner_alive "$pid" "$start" && continue
-		if aira_test_rmrun "$dir"; then
-			printf 'test-tmpdir: removed %s, left by a run (pid %s) that is gone (AIRA-357).\n' "$dir" "$pid" >&2
-		else
-			printf 'test-tmpdir: could not fully remove %s (run pid %s is gone); kept its owner file for a later sweep (AIRA-357).\n' "$dir" "$pid" >&2
+# aira_test_owner_stale succeeds when ./.aira-test-owner (in the current
+# directory) proves its run is gone, by the rules in the header.
+aira_test_owner_stale() {
+	local line pid start ns ourns
+	[ -f .aira-test-owner ] && [ ! -L .aira-test-owner ] || return 1
+	{ IFS= read -r line && read -r pid start ns; } <.aira-test-owner || return 1
+	[ "$line" = "$AIRA_TEST_TMPFS_OWNER_VERSION" ] || return 1
+	case "$pid" in "" | *[!0-9]*) return 1 ;; esac
+	case "$start" in "" | *[!0-9]*) return 1 ;; esac
+	ourns="$(aira_test_pidns $$)" && [ -n "$ourns" ] && [ "$ns" = "$ourns" ] || return 1
+	! aira_test_owner_alive "$pid" "$start"
+}
+
+# aira_test_rmrun <root> <name> <own|stale> removes the run directory
+# <root>/<name> (<root> a physical path), the owner file last (see the header).
+# "stale" removes it only when its owner file proves the run is gone. Exit
+# status: 0 removed; 3 kept, not ours or not proven stale; 1 the removal could
+# not finish (the owner file is kept).
+aira_test_rmrun() {
+	local root="$1" name="$2" mode="$3"
+	(
+		cd -P -- "$root/$name" 2>/dev/null || exit 3
+		[ "$(pwd -P)" = "$root/$name" ] && [ -O . ] || exit 3
+		if [ "$mode" = stale ]; then
+			aira_test_owner_stale || exit 3
 		fi
+		# From here on only relative paths: this directory, whatever happens
+		# to <root>/<name>. GNU chmod -R does not follow symlinks it meets.
+		chmod -R u+rwX . 2>/dev/null
+		find . -mindepth 1 -maxdepth 1 ! -name .aira-test-owner -exec rm -rf -- {} + 2>/dev/null
+		left="$(find . -mindepth 1 -maxdepth 1 ! -name .aira-test-owner -print -quit 2>/dev/null)" || exit 1
+		[ -z "$left" ] || exit 1
+		rm -f -- .aira-test-owner || exit 1
+	) || return
+	# rmdir removes neither a symlink nor a non-empty directory.
+	rmdir -- "$root/$name" 2>/dev/null || return 1
+}
+
+# aira_test_sweep <root> removes stale run directories (see the header). The
+# caller holds the lock.
+aira_test_sweep() {
+	local root="$1" dir rc
+	for dir in "$root"/t.????; do
+		# A symlink is refused inside (its physical path is not <root>/<name>).
+		aira_test_rmrun "$root" "${dir##*/}" stale
+		rc=$?
+		case "$rc" in
+		0) printf 'test-tmpdir: removed %s, left by a run that is gone (AIRA-357).\n' "$dir" >&2 ;;
+		3) ;;
+		*) printf 'test-tmpdir: could not fully remove %s (its run is gone); kept its owner file for a later sweep (AIRA-357).\n' "$dir" >&2 ;;
+		esac
 	done
 	return 0
 }
@@ -168,35 +209,61 @@ root="${AIRA_TEST_TMPFS_ROOT:-/dev/shm}"
 min_kb="${AIRA_TEST_TMPFS_MIN_KB:-$AIRA_TEST_TMPFS_DEFAULT_MIN_KB}"
 case "$min_kb" in "" | *[!0-9]*) min_kb="$AIRA_TEST_TMPFS_DEFAULT_MIN_KB" ;; esac
 
-if [ ! -d "$root" ] || [ ! -w "$root" ]; then
+if [ ! -d "$root" ] || [ ! -w "$root" ] || ! root="$(cd -P -- "$root" 2>/dev/null && pwd -P)"; then
 	printf 'test-tmpdir: %s is not a writable directory; tests use the normal TMPDIR (AIRA-357).\n' "$root" >&2
 	exec "$@"
 fi
 
-aira_test_sweep "$root"
-
-avail_kb="$(df -Pk -- "$root" 2>/dev/null | awk 'NR == 2 { print $4 }')"
-case "$avail_kb" in "" | *[!0-9]*) avail_kb=0 ;; esac
-if [ "$avail_kb" -lt "$min_kb" ]; then
-	printf 'test-tmpdir: %s has %s KiB available, under the %s KiB a run needs; tests use the normal TMPDIR (AIRA-357).\n' "$root" "$avail_kb" "$min_kb" >&2
+# The lock (see the header): a regular file we own, never a symlink.
+lock="$root/.aira-test-lock.$(id -u)"
+lockfd=
+if ! command -v flock >/dev/null 2>&1 || [ -L "$lock" ] ||
+	! { exec {lockfd}>>"$lock"; } 2>/dev/null ||
+	[ -L "$lock" ] || [ ! -f "$lock" ] || [ ! -O "$lock" ] ||
+	! flock -w 60 "$lockfd" 2>/dev/null; then
+	printf 'test-tmpdir: cannot take the lock %s (no flock, not our regular file, or held over 60 s); tests use the normal TMPDIR (AIRA-357).\n' "$lock" >&2
+	[ -z "$lockfd" ] || exec {lockfd}>&-
 	exec "$@"
 fi
 
-if ! start="$(aira_test_proc_start $$)" || ! ns="$(aira_test_pidns $$)" || [ -z "$ns" ]; then
-	printf 'test-tmpdir: cannot read this process in /proc; tests use the normal TMPDIR (AIRA-357).\n' >&2
-	exec "$@"
-fi
-if ! run="$(mktemp -d "$root/t.XXXX")"; then
-	printf 'test-tmpdir: cannot create a run directory in %s; tests use the normal TMPDIR (AIRA-357).\n' "$root" >&2
-	exec "$@"
-fi
-trap 'aira_test_rmrun "$run" || printf "test-tmpdir: could not fully remove %s; a later run sweeps it (AIRA-357).\n" "$run" >&2' EXIT
+# aira_test_allocate sweeps, then creates the run directory and its owner
+# file, setting run; it fails (with a message, and no directory left) when the
+# run must use the normal TMPDIR. The caller holds the lock.
+run=
+aira_test_allocate() {
+	local avail_kb start ns
+	aira_test_sweep "$root"
+	avail_kb="$(df -Pk -- "$root" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+	case "$avail_kb" in "" | *[!0-9]*) avail_kb=0 ;; esac
+	if [ "$avail_kb" -lt "$min_kb" ]; then
+		printf 'test-tmpdir: %s has %s KiB available, under the %s KiB a run needs; tests use the normal TMPDIR (AIRA-357).\n' "$root" "$avail_kb" "$min_kb" >&2
+		return 1
+	fi
+	if ! start="$(aira_test_proc_start $$)" || ! ns="$(aira_test_pidns $$)" || [ -z "$ns" ]; then
+		printf 'test-tmpdir: cannot read this process in /proc; tests use the normal TMPDIR (AIRA-357).\n' >&2
+		return 1
+	fi
+	if ! run="$(mktemp -d "$root/t.XXXX")"; then
+		printf 'test-tmpdir: cannot create a run directory in %s; tests use the normal TMPDIR (AIRA-357).\n' "$root" >&2
+		run=
+		return 1
+	fi
+	if ! printf '%s\n%s %s %s\n' "$AIRA_TEST_TMPFS_OWNER_VERSION" "$$" "$start" "$ns" >"$run/.aira-test-owner"; then
+		printf 'test-tmpdir: cannot write the owner file in %s; tests use the normal TMPDIR (AIRA-357).\n' "$run" >&2
+		rm -rf -- "$run"
+		run=
+		return 1
+	fi
+}
+trap '[ -z "$run" ] || aira_test_rmrun "$root" "${run##*/}" own || printf "test-tmpdir: could not fully remove %s; a later run sweeps it (AIRA-357).\n" "$run" >&2' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if ! printf '%s\n%s %s %s\n' "$AIRA_TEST_TMPFS_OWNER_VERSION" "$$" "$start" "$ns" >"$run/.aira-test-owner"; then
-	printf 'test-tmpdir: cannot write the owner file in %s; tests use the normal TMPDIR (AIRA-357).\n' "$run" >&2
-	rm -rf -- "$run"
+aira_test_allocate
+allocated=$?
+# Release the lock before anything else runs; the command must not inherit it.
+exec {lockfd}>&-
+if [ "$allocated" -ne 0 ]; then
 	trap - EXIT
 	exec "$@"
 fi
@@ -208,29 +275,21 @@ probe="$run/.aira-test-exec"
 # (cp keeps the binary's exec mode, so no chmod is needed.)
 if ! { cp -- "$(type -P true)" "$probe" && "$probe"; } 2>/dev/null; then
 	printf 'test-tmpdir: %s cannot run programs (noexec?); tests use the normal TMPDIR (AIRA-357).\n' "$root" >&2
-	aira_test_rmrun "$run" || printf 'test-tmpdir: could not fully remove %s; a later run sweeps it (AIRA-357).\n' "$run" >&2
+	aira_test_rmrun "$root" "${run##*/}" own || printf 'test-tmpdir: could not fully remove %s; a later run sweeps it (AIRA-357).\n' "$run" >&2
 	trap - EXIT
 	exec "$@"
 fi
 rm -f -- "$probe"
 
-# The disk directory: an explicit AIRA_TEST_DISK_TMPDIR wins (the SliceCeiling
-# test's own diagnostic recommends it). Otherwise the incoming TMPDIR (or
-# /tmp), unless that is itself tmpfs, in which case /var/tmp when it is a
-# writable non-tmpfs directory; failing both, the default stands and the
-# SliceCeiling test reports the tmpfs directory itself.
+# The disk directories (see the header).
 aira_test_is_disk_dir() {
 	[ -d "$1" ] && [ -w "$1" ] && [ "$(stat -f -c %T -- "$1" 2>/dev/null)" != tmpfs ]
 }
-if [ -n "${AIRA_TEST_DISK_TMPDIR-}" ]; then
-	disk="$AIRA_TEST_DISK_TMPDIR"
-else
-	disk="${TMPDIR:-/tmp}"
-	if ! aira_test_is_disk_dir "$disk" && aira_test_is_disk_dir /var/tmp; then
-		disk=/var/tmp
-	fi
+disk="${TMPDIR:-/tmp}"
+if ! aira_test_is_disk_dir "$disk" && aira_test_is_disk_dir /var/tmp; then
+	disk=/var/tmp
 fi
-export AIRA_TEST_DISK_TMPDIR="$disk"
+export AIRA_TEST_DISK_TMPDIR="${AIRA_TEST_DISK_TMPDIR:-$disk}"
 export GOTMPDIR="${GOTMPDIR:-$disk}"
 export TMPDIR="$run"
 "$@"
