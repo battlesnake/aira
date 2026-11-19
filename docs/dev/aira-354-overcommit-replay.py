@@ -36,6 +36,12 @@ LIMITS (printed again at the end)
   - models Q/I/W add the extra use on top of the measured MemAvailable and never remove a job
     later, so they ignore that a job admitted earlier also ends earlier (conservative).
   - the CPU ledger (32 slots) is not in the store; the yield is RAM-only unless stated.
+  - models W and I add the extra booking on top of the MEASURED use and keep the observed running
+    set, so they cannot see that overbooking changes which jobs overlap. The AIRA-324 gate report
+    (section 6.1) rejected the same approximation as a bound. Their passes are not a host-safety
+    bound (plan-fix round 1); part 3 (d) gives the margin form instead.
+  - part 6's first rows stack the factor on AIRA-324's live 0.9 discount; the "net" rows book
+    full pins, the configuration overbook enforce would run in (plan-fix round 1).
 """
 import argparse
 import bisect
@@ -79,6 +85,28 @@ def extra(k, E, U, M, bounded):
     if bounded:
         x = min(x, M - H0 - L, L - U)
     return max(0, x)
+
+
+def breach_ratio(k, E):
+    """Use / bookings at which MemAvailable reaches FLOOR with the ledger full at k L (L = E - H0)."""
+    L = E - H0
+    return E / (k * L) if L > 0 else float("inf")
+
+
+def live_admit(queued, room, phys, free, fifo):
+    """Queued jobs (list order) a live room admits, CPU-capped: FIFO stops at the first misfit,
+    skip-misfit (an upper bound: no head budget, no freeze) passes over it."""
+    n = used = 0
+    for w in queued:
+        if n >= free:
+            break
+        c = w["reserve_bytes"]
+        if used + c <= room and c <= phys:
+            n += 1
+            used += c
+        elif fifo:
+            break
+    return n
 
 
 def load_journal(lines):
@@ -226,12 +254,14 @@ def report(jobs, pools, unknown, series, lo, hi, live=None, watch=None, seed=354
     P("(a) block bootstrap by clock hour (%d hours, 1000 draws): p99 of rho_vis 90%% interval [%.3f, %.3f]"
       % (len(hours), q(p99s, .05), q(p99s, .95)))
     big = [(t, r) for t, r, qd, j in grid if sum(x.b for x in r) >= 8 * GIB]
-    draws = []
+    ceil_at = {t: j[0] for t, r, qd, j in grid}
+    draws, draws_e = [], []
     for _ in range(400):
         t, running = rng.choice(big)
         B = sum(x.b for x in running)
         for _ in range(200):
             draws.append(sum(min(rng.choice(pools.get(x.sig) or [x.p]), x.b) if not x.oom else x.b for x in running) / B)
+            draws_e.append(ceil_at[t])
     rho_i = q(draws, .99)
     P("(b) each running job's peak redrawn from its own signature's retained peaks (400 instants x 200): "
       "p50 %.3f p99 %.3f p99.9 %.3f max %.3f" % (q(draws, .5), rho_i, q(draws, .999), max(draws)))
@@ -240,6 +270,19 @@ def report(jobs, pools, unknown, series, lo, hi, live=None, watch=None, seed=354
       % (q(smax, .5), q(smax, .99), max(smax)))
     rho_i = max(rho_i, q(rho, .99))
     P("model I uses rho = %.3f (the larger of (b) p99 and rho_vis p99)" % rho_i)
+    # (d) Added in plan-fix round 1: the margin form of the criterion, reconciled with (b) and (c).
+    # With the ledger full at k L and memory outside the slice unchanged, host MemAvailable reaches
+    # the 8 GiB trip when the running set's real use / bookings reaches r*(k) = (L + H) / (k L).
+    P("(d) breach ratio r*(k) = (L + H) / (k L): the running set's use / bookings at which host MemAvailable "
+      "reaches 8 GiB with the ledger full at k L (outside memory unchanged). A margin, not a probability.")
+    ue = [p[1] / p[0] for p in pts if p[0] > 0]
+    for k in (1.1, 1.25, 1.4):
+        rb = [breach_ratio(k, E) for E in e]
+        sb = sum(1 for d, E in zip(draws, draws_e) if d >= breach_ratio(k, E)) / len(draws)
+        sc = sum(1 for (t, r), s in zip(big, smax) if s >= breach_ratio(k, ceil_at[t])) / len(smax)
+        P("  k=%.2f: r* p50 %.3f (min %.3f); share at or above r*: (b) %.4f of draws, (c) %.4f of instants; "
+          "same-mix model (all use x k): max sliceAnon/E %.3f against 1/k = %.3f"
+          % (k, q(rb, .5), min(rb), sb, sc, max(ue), 1 / k))
 
     # ---- part 4: counterfactual host MemAvailable per k
     P("\n## 4. Counterfactual host MemAvailable (seconds below a threshold; min MA')")
@@ -381,6 +424,41 @@ def report(jobs, pools, unknown, series, lo, hi, live=None, watch=None, seed=354
             P("  k=%.2f: queued jobs admitted now, RAM only p50 %d max %d; RAM+CPU p50 %d max %d (%s GiB p50); "
               "MemAvailable if all of those used their whole booking at once: min %s GiB"
               % (k, q(n_ram, .5), max(n_ram), q(n_cpu, .5), max(n_cpu), g(q(b_cpu, .5)), g(min(ma_after))))
+        # Added in plan-fix round 1. The rows above subtract the ledger as the daemon booked it, in
+        # AIRA-324 charge bytes, so they stack the factor on 324's 0.9 discount. Overbook enforce
+        # requires pin-charge off, so the deployable comparison books every running job at its full
+        # pin (each scope's pin_bytes - reserve_bytes added back). A queued row's reserve_bytes is
+        # its pin (admit.go: queuedEntries carry waiter.reserve).
+        P("net of track 1 (AIRA-324 discount added back: full pins booked, the configuration overbook enforce requires):")
+        withq = [x for x in recs if x[4] > 0]
+        ram_free_cpu = sum(1 for x in withq if x[1] >= x[2] - GIB and x[3] < CPU_SLOTS)
+        cpu_full = sum(1 for x in withq if x[3] >= CPU_SLOTS)
+        P("  samples with a queue %d: RAM-bound with a free CPU slot %d; CPU slots full %d "
+          "(slots estimated as one per granted waiter: the list carries no CPU-ledger total)" % (len(withq), ram_free_cpu, cpu_full))
+        cpu_only = [min(x[4], max(0, CPU_SLOTS - x[3])) for x in recs]
+        P("  ceiling for ANY RAM rule (RAM unlimited, CPU slots only): queued jobs admitted p50 %d mean %.2f max %d, "
+          "none in %d of %d (CPU slots full)" % (q(cpu_only, .5), sum(cpu_only) / len(cpu_only), max(cpu_only),
+                                                sum(1 for n in cpu_only if n == 0), len(cpu_only)))
+        for k in (1.1, 1.15, 1.2, 1.25, 1.3, 1.4):
+            rows = {("stacked", True): [], ("net", True): [], ("net", False): []}
+            netx = []
+            for (t, d), x, dd in zip(live, recs, disc):
+                L = x[2]
+                hr = (x[10] - L) if x[10] else H0
+                limit = min(int(k * L), (x[9] - hr) if x[9] else int(k * L), 2 * L - x[5])
+                phys = L - x[5]
+                free = max(0, CPU_SLOTS - x[3])
+                netx.append(limit - L - dd)
+                for name, fifo in rows:
+                    booked = x[1] + (dd if name == "net" else 0)
+                    rows[(name, fifo)].append(live_admit(d.get("queued") or [], min(limit - booked, phys), phys, free, fifo))
+
+            def s(v):
+                return "p50 %d mean %.2f max %d, none admitted in %d of %d" % (q(v, .5), sum(v) / len(v), max(v), sum(1 for n in v if n == 0), len(v))
+            P("  k=%.2f: extra room net of the 324 discount GiB min %s p50 %s max %s" % (k, g(min(netx)), g(q(netx, .5)), g(max(netx))))
+            P("          stacked FIFO+CPU %s" % s(rows[("stacked", True)]))
+            P("          net     FIFO+CPU %s" % s(rows[("net", True)]))
+            P("          net     skip-misfit+CPU (upper bound) %s" % s(rows[("net", False)]))
 
     if watch:
         P("\n## 7. AIRA-324 watcher (factor 0.9 enforce, 2026-11-16/17): inferred sliceAnon = ceiling + 8 - MemAvailable")
@@ -433,6 +511,12 @@ def selftest():
     check("extra, slice memory.max binds", extra(1.5, E, 10 * GIB, 64 * GIB, True), 64 * GIB - H0 - 42 * GIB)
     check("extra, physical room binds", extra(1.25, E, 36 * GIB, 64 * GIB, True), 6 * GIB)
     check("extra, real use over L gives 0", extra(1.25, E, 43 * GIB, 64 * GIB, True), 0)
+    check("breach ratio at L = 42 GiB, k = 1.25", round(breach_ratio(1.25, E), 6), round((42 * GIB + H0) / (1.25 * 42 * GIB), 6))
+    qd = [{"reserve_bytes": 4 * GIB}, {"reserve_bytes": 1 * GIB}, {"reserve_bytes": 1 * GIB}]
+    check("live FIFO stops at the misfit", live_admit(qd, 3 * GIB, 9 * GIB, 9, True), 0)
+    check("live skip-misfit passes it", live_admit(qd, 3 * GIB, 9 * GIB, 9, False), 2)
+    check("live CPU cap", live_admit(qd, 9 * GIB, 9 * GIB, 1, False), 1)
+    check("live per-job physical fit", live_admit(qd, 9 * GIB, 3 * GIB, 9, True), 0)
     st = list(sweep([a, b], 0, 210, 50))
     check("sweep: queued then running then gone", [(t, len(r), len(qd)) for t, r, qd in st],
           [(0, 0, 1), (50, 0, 2), (100, 2, 0), (150, 2, 0), (200, 0, 0)])

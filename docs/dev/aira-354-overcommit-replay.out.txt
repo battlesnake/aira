@@ -22,6 +22,10 @@ visible running jobs: p50 5 p90 8 max 18 (the live list shows the full count, pa
 (b) each running job's peak redrawn from its own signature's retained peaks (400 instants x 200): p50 0.681 p99 0.902 p99.9 0.938 max 0.998
 (c) every running job at its signature's LARGEST retained peak at once: p50 0.777 p99 0.942 max 1.000
 model I uses rho = 0.915 (the larger of (b) p99 and rho_vis p99)
+(d) breach ratio r*(k) = (L + H) / (k L): the running set's use / bookings at which host MemAvailable reaches 8 GiB with the ledger full at k L (outside memory unchanged). A margin, not a probability.
+  k=1.10: r* p50 0.949 (min 0.947); share at or above r*: (b) 0.0009 of draws, (c) 0.0060 of instants; same-mix model (all use x k): max sliceAnon/E 0.521 against 1/k = 0.909
+  k=1.25: r* p50 0.835 (min 0.834); share at or above r*: (b) 0.0618 of draws, (c) 0.2891 of instants; same-mix model (all use x k): max sliceAnon/E 0.521 against 1/k = 0.800
+  k=1.40: r* p50 0.746 (min 0.744); share at or above r*: (b) 0.2844 of draws, (c) 0.6113 of instants; same-mix model (all use x k): max sliceAnon/E 0.521 against 1/k = 0.714
 
 ## 4. Counterfactual host MemAvailable (seconds below a threshold; min MA')
 models: Q = real queued jobs admitted FIFO into X(t) at held peaks; Qb = same, backfill; I = X(t) x rho; W = X(t) at 100%%; S = (k-1) x real sliceAnon (same mix scaled)
@@ -131,6 +135,33 @@ queued bytes per sample: p50 27.01 GiB max 47.97 GiB
   k=1.25: queued jobs admitted now, RAM only p50 5 max 12; RAM+CPU p50 3 max 8 (5.50 GiB p50); MemAvailable if all of those used their whole booking at once: min 28.71 GiB
   k=1.30: queued jobs admitted now, RAM only p50 7 max 17; RAM+CPU p50 3 max 8 (5.50 GiB p50); MemAvailable if all of those used their whole booking at once: min 23.71 GiB
   k=1.40: queued jobs admitted now, RAM only p50 8 max 17; RAM+CPU p50 3 max 9 (5.50 GiB p50); MemAvailable if all of those used their whole booking at once: min 22.71 GiB
+net of track 1 (AIRA-324 discount added back: full pins booked, the configuration overbook enforce requires):
+  samples with a queue 179: RAM-bound with a free CPU slot 140; CPU slots full 33 (slots estimated as one per granted waiter: the list carries no CPU-ledger total)
+  ceiling for ANY RAM rule (RAM unlimited, CPU slots only): queued jobs admitted p50 3 mean 3.33 max 11, none in 34 of 180 (CPU slots full)
+  k=1.10: extra room net of the 324 discount GiB min 1.21 p50 3.03 max 4.39
+          stacked FIFO+CPU p50 1 mean 1.21 max 4, none admitted in 52 of 180
+          net     FIFO+CPU p50 0 mean 0.57 max 3, none admitted in 107 of 180
+          net     skip-misfit+CPU (upper bound) p50 2 mean 1.64 max 7, none admitted in 37 of 180
+  k=1.15: extra room net of the 324 discount GiB min 3.41 p50 5.19 max 6.72
+          stacked FIFO+CPU p50 2 mean 2.29 max 7, none admitted in 36 of 180
+          net     FIFO+CPU p50 1 mean 1.66 max 7, none admitted in 44 of 180
+          net     skip-misfit+CPU (upper bound) p50 2 mean 2.23 max 7, none admitted in 34 of 180
+  k=1.20: extra room net of the 324 discount GiB min 5.60 p50 7.36 max 9.04
+          stacked FIFO+CPU p50 2 mean 2.76 max 8, none admitted in 34 of 180
+          net     FIFO+CPU p50 2 mean 2.44 max 7, none admitted in 35 of 180
+          net     skip-misfit+CPU (upper bound) p50 2 mean 2.68 max 7, none admitted in 34 of 180
+  k=1.25: extra room net of the 324 discount GiB min 7.79 p50 9.56 max 11.36
+          stacked FIFO+CPU p50 3 mean 2.99 max 8, none admitted in 34 of 180
+          net     FIFO+CPU p50 2 mean 2.79 max 8, none admitted in 34 of 180
+          net     skip-misfit+CPU (upper bound) p50 2 mean 2.94 max 8, none admitted in 34 of 180
+  k=1.30: extra room net of the 324 discount GiB min 9.99 p50 11.74 max 13.59
+          stacked FIFO+CPU p50 3 mean 3.12 max 8, none admitted in 34 of 180
+          net     FIFO+CPU p50 3 mean 2.98 max 8, none admitted in 34 of 180
+          net     skip-misfit+CPU (upper bound) p50 3 mean 3.08 max 8, none admitted in 34 of 180
+  k=1.40: extra room net of the 324 discount GiB min 11.26 p50 13.80 max 16.10
+          stacked FIFO+CPU p50 3 mean 3.19 max 9, none admitted in 34 of 180
+          net     FIFO+CPU p50 3 mean 3.10 max 8, none admitted in 34 of 180
+          net     skip-misfit+CPU (upper bound) p50 3 mean 3.13 max 8, none admitted in 34 of 180
 
 ## 7. AIRA-324 watcher (factor 0.9 enforce, 2026-11-16/17): inferred sliceAnon = ceiling + 8 - MemAvailable
 samples 92: inferred real use / booked p50 0.109 p90 0.286 max 0.431; queued max 23; running max 32
