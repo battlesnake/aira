@@ -680,7 +680,7 @@ func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOp
 	// propagated (the rule above); a pair that is invalid only together is
 	// handled after the defaults below. A CI install (--ci in any form) does not
 	// inherit the lane: the owner's lane is default mode only, so CI renders
-	// `off` unless --small-lane is typed.
+	// `off`, whatever --small-lane says (spec §2.5).
 	laneGiven, jobMaxGiven := opts.smallLaneGiven(), opts.smallLaneJobMaxGiven()
 	ciInstall := opts.ci || opts.ciValue != ""
 	if !laneGiven && !ciInstall {
@@ -752,12 +752,13 @@ func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOp
 	if _, ok := runner.ParsePinChargeFactor(opts.pinChargeFactor); !ok {
 		return opts, errors.New("pin charge factor must be a decimal from 0.5 to 1 with at most two places")
 	}
-	// AIRA-350: on (8G, 1G) unless an operator chose otherwise; off for CI.
+	// AIRA-350: on (8G, 1G) unless an operator chose otherwise; always off for
+	// CI, a typed --small-lane included (spec §2.5: "CI renders off").
 	if !opts.smallLaneGiven() {
 		opts.smallLane = defaultSmallLane
-		if ciInstall {
-			opts.smallLane = runner.SmallLaneOff
-		}
+	}
+	if ciInstall {
+		opts.smallLane = runner.SmallLaneOff
 	}
 	if !opts.smallLaneJobMaxGiven() {
 		opts.smallLaneJobMax = defaultSmallLaneJobMax

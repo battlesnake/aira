@@ -154,35 +154,67 @@ func TestInstallSmallLaneExplicitFlagNeverRepairsTheInstalledPair(t *testing.T) 
 	}
 }
 
-// verifies: AIRA-350 §2.5 (review fix) — "default mode only, not CI mode": a
-// real-mode CI install (bare --ci, --ci=auto) renders the lane off, also over an
-// installed lane, unless --small-lane is typed; the job maximum is untouched.
-// End to end, a bare --ci dry run renders AIRA_DAEMON_SMALL_LANE=off into the
-// daemon unit. Mutation: the CI default deleted (the lane renders 8G).
+// verifies: AIRA-350 §2.5 (review fixes) — "default mode only, not CI mode":
+// a CI install (bare --ci, --ci=auto, --ci=shim) renders the lane off, over an
+// installed lane AND over explicit --small-lane / --small-lane-job-max flags (CI
+// renders off, no exception for a typed flag). End to end, dry runs of bare
+// --ci and of --ci=auto resolved to the real path, each with --small-lane=4G,
+// render AIRA_DAEMON_SMALL_LANE=off into the daemon unit and never =4G.
+// Mutations: the CI default deleted (the lane renders 8G); the CI override made
+// conditional on --small-lane being absent (round-1's exception: renders 4G).
 func TestInstallSmallLaneOffInCIMode(t *testing.T) {
 	installed := "Environment=AIRA_DAEMON_SMALL_LANE=4G\nEnvironment=AIRA_DAEMON_SMALL_LANE_JOB_MAX=512M\n"
-	for _, opts := range []installOpts{{ci: true}, {ciValue: "auto"}, {ciValue: "shim"}} {
-		for _, unit := range []string{"", installed} {
-			resolved, err := resolveDaemonModes(opts, unit)
-			if err != nil || resolved.smallLane != runner.SmallLaneOff {
-				t.Fatalf("ci=%v ciValue=%q unit=%q: lane %q %v, want off", opts.ci, opts.ciValue, unit, resolved.smallLane, err)
+	for _, ci := range []installOpts{{ci: true}, {ciValue: "auto"}, {ciValue: "shim"}} {
+		for _, flags := range []installOpts{{}, {smallLane: "4G"}, {smallLane: "4G", smallLaneJobMax: "512M"}, {smallLaneJobMax: "2G"}} {
+			opts := ci
+			opts.smallLane, opts.smallLaneJobMax = flags.smallLane, flags.smallLaneJobMax
+			for _, unit := range []string{"", installed} {
+				resolved, err := resolveDaemonModes(opts, unit)
+				if err != nil || resolved.smallLane != runner.SmallLaneOff {
+					t.Fatalf("ci=%v ciValue=%q lane=%q jobMax=%q unit=%q: lane %q %v, want off",
+						opts.ci, opts.ciValue, opts.smallLane, opts.smallLaneJobMax, unit, resolved.smallLane, err)
+				}
 			}
 		}
 	}
-	resolved, err := resolveDaemonModes(installOpts{ci: true, smallLane: "4G"}, "")
-	if err != nil || resolved.smallLane != "4G" || resolved.smallLaneJobMax != "1G" {
-		t.Fatalf("an explicit --small-lane under --ci: %q %q %v, want 4G 1G", resolved.smallLane, resolved.smallLaneJobMax, err)
-	}
 
-	d, state := newFakeInstall(t)
-	calls := 0
-	d = withCIReader(d, ciMeasured, true, "", &calls)
-	d.run = func([]string, []byte) ([]byte, error) { t.Fatal("dry-run invoked a command"); return nil, nil }
-	if err := runInstall(d, installOpts{ci: true, dryRun: true}); err != nil {
-		t.Fatal(err)
-	}
-	if report := strings.Join(state.logs, "\n"); !strings.Contains(report, "Environment=AIRA_DAEMON_SMALL_LANE=off\n") {
-		t.Fatalf("a bare --ci dry run does not render the lane off:\n%s", report)
+	for _, test := range []struct {
+		name string
+		opts installOpts
+		auto bool
+	}{
+		{"bare --ci", installOpts{ci: true, smallLane: "4G", dryRun: true}, false},
+		{"--ci=auto resolved to real", installOpts{ciValue: "auto", smallLane: "4G", smallLaneJobMax: "512M", dryRun: true}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d, state := newFakeInstall(t)
+			calls := 0
+			d = withCIReader(d, ciMeasured, true, "", &calls)
+			probed := false
+			d.lookPath = func(name string) (string, error) { return "/usr/bin/" + name, nil }
+			d.run = func(argv []string, _ []byte) ([]byte, error) {
+				if test.auto && strings.Contains(strings.Join(argv, " "), "is-system-running") {
+					probed = true
+					return []byte("running\n"), nil
+				}
+				t.Fatalf("dry-run invoked a command: %q", argv)
+				return nil, nil
+			}
+			if err := runInstall(d, test.opts); err != nil {
+				t.Fatal(err)
+			}
+			if test.auto && !probed {
+				t.Fatal("--ci=auto never probed the systemd user manager")
+			}
+			report := strings.Join(state.logs, "\n")
+			if !strings.Contains(report, "Environment=AIRA_DAEMON_SMALL_LANE=off\n") ||
+				strings.Contains(report, "AIRA_DAEMON_SMALL_LANE=4G") {
+				t.Fatalf("%s --small-lane=4G dry run does not render the lane off:\n%s", test.name, report)
+			}
+			if test.auto && !strings.Contains(report, "aira.slice") {
+				t.Fatalf("--ci=auto did not take the real path:\n%s", report)
+			}
+		})
 	}
 }
 
