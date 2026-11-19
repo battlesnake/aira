@@ -24,7 +24,9 @@
 #     the workflow must test what it always tested);
 #   - AIRA_TEST_TMPFS=0 (an explicit opt-out for one run);
 #   - the root is not a writable directory, or it has less than
-#     AIRA_TEST_TMPFS_MIN_KB kilobytes available (default below).
+#     AIRA_TEST_TMPFS_MIN_KB kilobytes available (default below);
+#   - a program written to the run directory cannot be executed (a noexec
+#     mount): tests run helper scripts and binaries from t.TempDir().
 # Either way the command and its exit status are the same: this wrapper only
 # chooses where the test temp files live, so a `make ci` pass recorded by
 # .githooks/ci-pass (AIRA-355) means the same full suite passed.
@@ -35,6 +37,8 @@
 #   - AIRA_TEST_DISK_TMPDIR names that disk directory for the few tests that
 #     must write real page cache (the daemon's SliceCeiling real-cgroup
 #     fixture: a file on tmpfs is shared memory, not reclaimable page cache).
+#     A value already set is kept; otherwise it is the incoming TMPDIR (or
+#     /tmp), or /var/tmp when that one is itself tmpfs.
 #
 # Leak sweep. A confined job has no graceful shutdown: a hard kill leaves the
 # run directory behind, and a file on tmpfs holds RAM until it is deleted or the
@@ -197,7 +201,35 @@ if ! printf '%s\n%s %s %s\n' "$AIRA_TEST_TMPFS_OWNER_VERSION" "$$" "$start" "$ns
 	exec "$@"
 fi
 
-disk="${TMPDIR:-/tmp}"
+# The run directory must be able to run programs: tests build helper scripts
+# and binaries under t.TempDir() and execute them, which fails on a noexec
+# mount however much space it has.
+probe="$run/.aira-test-exec"
+# (cp keeps the binary's exec mode, so no chmod is needed.)
+if ! { cp -- "$(type -P true)" "$probe" && "$probe"; } 2>/dev/null; then
+	printf 'test-tmpdir: %s cannot run programs (noexec?); tests use the normal TMPDIR (AIRA-357).\n' "$root" >&2
+	aira_test_rmrun "$run" || printf 'test-tmpdir: could not fully remove %s; a later run sweeps it (AIRA-357).\n' "$run" >&2
+	trap - EXIT
+	exec "$@"
+fi
+rm -f -- "$probe"
+
+# The disk directory: an explicit AIRA_TEST_DISK_TMPDIR wins (the SliceCeiling
+# test's own diagnostic recommends it). Otherwise the incoming TMPDIR (or
+# /tmp), unless that is itself tmpfs, in which case /var/tmp when it is a
+# writable non-tmpfs directory; failing both, the default stands and the
+# SliceCeiling test reports the tmpfs directory itself.
+aira_test_is_disk_dir() {
+	[ -d "$1" ] && [ -w "$1" ] && [ "$(stat -f -c %T -- "$1" 2>/dev/null)" != tmpfs ]
+}
+if [ -n "${AIRA_TEST_DISK_TMPDIR-}" ]; then
+	disk="$AIRA_TEST_DISK_TMPDIR"
+else
+	disk="${TMPDIR:-/tmp}"
+	if ! aira_test_is_disk_dir "$disk" && aira_test_is_disk_dir /var/tmp; then
+		disk=/var/tmp
+	fi
+fi
 export AIRA_TEST_DISK_TMPDIR="$disk"
 export GOTMPDIR="${GOTMPDIR:-$disk}"
 export TMPDIR="$run"

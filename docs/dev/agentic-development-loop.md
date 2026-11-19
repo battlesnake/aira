@@ -94,13 +94,15 @@ directory, `/dev/shm/t.XXXX` (AIRA-357, `.githooks/test-tmpdir`). The store's
 `internal/store` 656 s on disk against 124 s on tmpfs, `internal/daemon` 343 s
 against 132 s). Only where the temp files live changes: the same tests run and
 `make ci` records a pass exactly as before. GitHub CI (`CI` set) is unchanged,
-and so is a run where `/dev/shm` is missing or has under 1 GiB free (a full run
-peaked at about 113 MB there); `AIRA_TEST_TMPFS=0 make test` opts out for one
-run.
+and so is a run where `/dev/shm` is missing, has under 1 GiB free (a full run
+peaked at about 113 MB there) or cannot run programs (a noexec mount: tests run
+helper scripts and binaries from their temp dirs); `AIRA_TEST_TMPFS=0 make test`
+opts out for one run.
 The go tool's build directory stays on disk (`GOTMPDIR`), and the daemon's
 SliceCeiling real-cgroup fixture writes to the disk directory named in
 `AIRA_TEST_DISK_TMPDIR`, because it measures page cache and a tmpfs file is not
-page cache. A hard-killed run leaves its directory in `/dev/shm`, holding RAM;
+page cache. A value already set is kept; otherwise it is the incoming `TMPDIR`
+(or `/tmp`), or `/var/tmp` when that is itself tmpfs. A hard-killed run leaves its directory in `/dev/shm`, holding RAM;
 the next run removes such a directory once it is over 10 minutes old and its
 owner file proves the run that made it is gone (same pid namespace, pid dead or
 reused); it never touches a live run's directory or anything without that proof

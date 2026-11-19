@@ -493,3 +493,93 @@ func TestTestTmpdirExitKeepsTheOwnerFileUntilThePayloadIsGone(t *testing.T) {
 		}
 	}
 }
+
+// TestTestTmpdirFallsBackOnANoexecRoot: a writable, roomy root mounted noexec
+// cannot run the programs tests build under t.TempDir(), so the command runs
+// with TMPDIR untouched and the probe's run dir is removed. The root is a
+// private noexec tmpfs in a user+mount namespace; the negative control mounts
+// the same tmpfs without noexec and TMPDIR does move.
+func TestTestTmpdirFallsBackOnANoexecRoot(t *testing.T) {
+	t.Parallel()
+	if err := exec.Command("unshare", "-rm", "true").Run(); err != nil {
+		t.Skipf("unprivileged user+mount namespaces unavailable (unshare -rm: %v); cannot mount a private noexec tmpfs", err)
+	}
+	for _, c := range []struct {
+		opts string
+		want int
+	}{{"noexec", 4}, {"exec", 0}} {
+		root := t.TempDir()
+		// Inside the namespace: mount the root, run the real script on a
+		// command that exits 4 when TMPDIR is untouched and 0 when it moved
+		// under the root, and 8 if the fallback left anything in the root.
+		mount := `mount -t tmpfs -o "$1" none "$2" || exit 77; shift 2; exec bash "$@"`
+		cmd := exec.Command("unshare", "-rm", "sh", "-c", mount, "sh", c.opts, root, testTmpdirScript(t),
+			"bash", "-c", `if [ "$TMPDIR" = /var/tmp ]; then [ -z "$(ls -A "$AIRA_TEST_TMPFS_ROOT")" ] || exit 8; exit 4; fi; case "$TMPDIR" in "$AIRA_TEST_TMPFS_ROOT"/t.*) exit 0 ;; esac; exit 9`)
+		cmd.Env = testTmpdirEnv("TMPDIR=/var/tmp", "AIRA_TEST_TMPFS_ROOT="+root, "AIRA_TEST_TMPFS_MIN_KB=0")
+		out, err := cmd.CombinedOutput()
+		code := 0
+		if err != nil {
+			exitErr, ok := err.(*exec.ExitError)
+			if !ok {
+				t.Fatalf("%s: %v\n%s", c.opts, err, out)
+			}
+			code = exitErr.ExitCode()
+		}
+		if code == 77 {
+			t.Skipf("cannot mount a tmpfs in the namespace\n%s", out)
+		}
+		if code != c.want {
+			t.Fatalf("%s root: exit %d, want %d\n%s", c.opts, code, c.want, out)
+		}
+	}
+}
+
+// TestTestTmpdirDiskDir: the disk directory exported for the SliceCeiling
+// fixture keeps an explicit AIRA_TEST_DISK_TMPDIR, is the incoming TMPDIR
+// when that is on disk, and is /var/tmp when the incoming TMPDIR is tmpfs.
+func TestTestTmpdirDiskDir(t *testing.T) {
+	t.Parallel()
+	isTmpfs := func(dir string) bool {
+		var st syscall.Statfs_t
+		return syscall.Statfs(dir, &st) == nil && st.Type == 0x01021994
+	}
+	if isTmpfs("/var/tmp") {
+		t.Skip("/var/tmp is tmpfs here; no disk directory to expect")
+	}
+	explicit := t.TempDir()
+	cases := []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"explicit-kept", []string{"TMPDIR=/var/tmp", "AIRA_TEST_DISK_TMPDIR=" + explicit}, explicit},
+		{"disk-tmpdir", []string{"TMPDIR=/var/tmp"}, "/var/tmp"},
+	}
+	if isTmpfs("/dev/shm") {
+		cases = append(cases,
+			struct {
+				name string
+				env  []string
+				want string
+			}{"tmpfs-tmpdir", []string{"TMPDIR=/dev/shm"}, "/var/tmp"},
+			struct {
+				name string
+				env  []string
+				want string
+			}{"explicit-kept-over-tmpfs", []string{"TMPDIR=/dev/shm", "AIRA_TEST_DISK_TMPDIR=" + explicit}, explicit},
+		)
+	} else {
+		t.Log("/dev/shm is not tmpfs here; the tmpfs-TMPDIR cases are not run")
+	}
+	for _, c := range cases {
+		root := t.TempDir()
+		env := append([]string{"AIRA_TEST_TMPFS_ROOT=" + root, "AIRA_TEST_TMPFS_MIN_KB=0"}, c.env...)
+		out, code := runTestTmpdir(t, env, "bash", "-c", `case "$TMPDIR" in "$AIRA_TEST_TMPFS_ROOT"/t.*) ;; *) echo "TMPDIR not moved: $TMPDIR"; exit 9 ;; esac; printf '%s\n' "$AIRA_TEST_DISK_TMPDIR"`)
+		if code != 0 {
+			t.Fatalf("%s: exit %d\n%s", c.name, code, out)
+		}
+		if got := strings.TrimSpace(out); got != c.want {
+			t.Errorf("%s: AIRA_TEST_DISK_TMPDIR=%q, want %q", c.name, got, c.want)
+		}
+	}
+}
