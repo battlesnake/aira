@@ -92,6 +92,9 @@ TSNAP = t("TestSmallLaneSnapshotFields")
 TLOG = t("TestSmallLaneGrantJournalLine")
 TNOTE = ("./internal/runner/", "^TestConfineLaneNote$")
 TINSTALL = ("./internal/install/", "^TestInstallSmallLaneFlags$")
+TPAIR = ("./internal/install/", "^TestInstallSmallLaneExplicitFlagNeverRepairsTheInstalledPair$")
+TCI = ("./internal/install/", "^TestInstallSmallLaneOffInCIMode$")
+TSTATUS = ("./internal/install/", "^TestInstallStatusReportsTheSmallLane$")
 TFACES = ("./cmd/aira/", "^TestConfineSmallLaneGuidanceIsOnEveryFace$")
 TLIST = ("./cmd/aira/", "^TestConfineListSmallLaneLine$")
 TREPLY = t("TestSmallLaneConfineListReply")
@@ -140,6 +143,14 @@ PROTECTED = "		protected := head != nil && !waiter.isSubReservation()"
 SNAP_ON = """	if s.smallLaneOn() {
 		occ := smallLeasesLocked(queue, s.smallLaneJobMax)"""
 PAIR = "	if jobMax < SmallLaneJobMaxMinBytes || jobMax > capacity {"
+CLEAR = "			waiter.laneWait, waiter.heldByHead = \"\", false"
+INSTALL_CI = """		if ciInstall {
+			opts.smallLane = runner.SmallLaneOff
+		}"""
+INSTALL_PAIR = "problem != \"\" && !laneGiven && !jobMaxGiven {"
+INSTALL_BLANK = "			if strings.TrimSpace(value) == \"\" {\n				return opts, argumentInvalid(fmt.Sprintf(\"option --%s requires a value\", name))"
+STATUS_LANE = "	reportDaemonMode(d, \"daemon small-job lane\", \"AIRA_DAEMON_SMALL_LANE\", string(liveEnvironment), liveErr, string(content))\n"
+STATUS_JOBMAX = "	reportDaemonMode(d, \"daemon small-job lane job max\", \"AIRA_DAEMON_SMALL_LANE_JOB_MAX\", string(liveEnvironment), liveErr, string(content))\n"
 NOTE_HELD = """	if position.heldByHead {
 		return ", fits but held behind the head of the queue"
 	}"""
@@ -224,7 +235,16 @@ MUTATIONS = [
     ("reply-small-mark-dropped", [(MANAGE, "		runner.ApplyConfineScopeSmall(result.Scopes, snapshot.scopeSmall)\n", "")], TREPLY),
     ("reply-probe-diagnoses-dropped", [(MANAGE, "				LaneWait:          snapshot.queuedLaneWait,\n", "")], TREPLY),
     ("probe-parse-dropped", [(QPOS, "	exclusive.laneWait, exclusive.heldByHead = reserve.LaneWait, reserve.HeldByHead\n", "")], TPROBE),
-    ("install-pair-fallback-dropped", [(INSTALL, "problem != \"\" && (laneFromUnit || jobMaxFromUnit) {", "false && problem != \"\" && (laneFromUnit || jobMaxFromUnit) {")], TINSTALL),
+    ("install-pair-fallback-dropped", [(INSTALL, INSTALL_PAIR, "false && " + INSTALL_PAIR)], TINSTALL),
+    # Review fixes (round 1 of the build review).
+    ("t3-diagnoses-not-cleared-per-pass", [(ADMIT, CLEAR, "			_ = waiter")], T3),
+    ("t3-lane-wait-cleared-but-not-held", [(ADMIT, CLEAR, "			waiter.laneWait = \"\"")], T3),
+    ("t3-held-cleared-but-not-lane-wait", [(ADMIT, CLEAR, "			waiter.heldByHead = false")], T3),
+    ("install-explicit-flag-repairs-the-pair", [(INSTALL, INSTALL_PAIR, "problem != \"\" && !(laneGiven && jobMaxGiven) {")], TPAIR),
+    ("install-ci-default-dropped", [(INSTALL, INSTALL_CI, "		if false {\n			opts.smallLane = runner.SmallLaneOff\n		}")], TCI),
+    ("install-blank-value-accepted", [(INSTALL, INSTALL_BLANK, INSTALL_BLANK.replace("strings.TrimSpace(value) == \"\"", "value == \"\""))], TINSTALL),
+    ("status-lane-line-dropped", [(INSTALL, STATUS_LANE, "")], TSTATUS),
+    ("status-job-max-line-dropped", [(INSTALL, STATUS_JOBMAX, "")], TSTATUS),
     ("list-line-while-off", [(MAIN, "	if reserve == nil || reserve.LaneCapacityBytes <= 0 {", "	if reserve == nil {")], TLIST),
 ]
 

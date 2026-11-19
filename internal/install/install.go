@@ -489,7 +489,9 @@ func parseInstallArgs(args []string) (installOpts, error) {
 				i++
 				value = args[i]
 			}
-			if value == "" {
+			// strings.TrimSpace: a whitespace-only value is no value. Several
+			// parsers below trim, so " " would otherwise read as "not given".
+			if strings.TrimSpace(value) == "" {
 				return opts, argumentInvalid(fmt.Sprintf("option --%s requires a value", name))
 			}
 			switch name {
@@ -676,19 +678,22 @@ func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOp
 	}
 	// AIRA-350. An installed lane value that is invalid alone is ignored, never
 	// propagated (the rule above); a pair that is invalid only together is
-	// handled after the defaults below.
-	laneFromUnit, jobMaxFromUnit := false, false
-	if !opts.smallLaneGiven() {
+	// handled after the defaults below. A CI install (--ci in any form) does not
+	// inherit the lane: the owner's lane is default mode only, so CI renders
+	// `off` unless --small-lane is typed.
+	laneGiven, jobMaxGiven := opts.smallLaneGiven(), opts.smallLaneJobMaxGiven()
+	ciInstall := opts.ci || opts.ciValue != ""
+	if !laneGiven && !ciInstall {
 		if value := installedEnvironmentValue(installedDaemonUnit, installedSmallLaneRE); value != "" {
 			if _, _, problem := runner.ParseSmallLane(value, runner.SmallLaneJobMaxMinBytesText); problem == "" {
-				opts.smallLane, laneFromUnit = value, true
+				opts.smallLane = value
 			}
 		}
 	}
-	if !opts.smallLaneJobMaxGiven() {
+	if !jobMaxGiven {
 		if value := installedEnvironmentValue(installedDaemonUnit, installedSmallLaneJobMaxRE); value != "" {
 			if _, _, problem := runner.ParseSmallLane(runner.SmallLaneMaxBytesText, value); problem == "" {
-				opts.smallLaneJobMax, jobMaxFromUnit = value, true
+				opts.smallLaneJobMax = value
 			}
 		}
 	}
@@ -747,27 +752,26 @@ func resolveDaemonModes(opts installOpts, installedDaemonUnit string) (installOp
 	if _, ok := runner.ParsePinChargeFactor(opts.pinChargeFactor); !ok {
 		return opts, errors.New("pin charge factor must be a decimal from 0.5 to 1 with at most two places")
 	}
-	// AIRA-350: on (8G, 1G) unless an operator chose otherwise.
+	// AIRA-350: on (8G, 1G) unless an operator chose otherwise; off for CI.
 	if !opts.smallLaneGiven() {
 		opts.smallLane = defaultSmallLane
+		if ciInstall {
+			opts.smallLane = runner.SmallLaneOff
+		}
 	}
 	if !opts.smallLaneJobMaxGiven() {
 		opts.smallLaneJobMax = defaultSmallLaneJobMax
 	}
-	// A pair that is invalid only together (a job maximum above the lane) is the
-	// operator's error when they typed it, and refused; when a value came from
-	// the installed unit, that value falls back to its default instead, so a
-	// flagless re-install never fails on what an earlier install left behind.
-	if _, _, problem := runner.ParseSmallLane(opts.smallLane, opts.smallLaneJobMax); problem != "" && (laneFromUnit || jobMaxFromUnit) {
-		if laneFromUnit {
-			opts.smallLane = defaultSmallLane
-		}
-		if jobMaxFromUnit {
-			opts.smallLaneJobMax = defaultSmallLaneJobMax
-		}
+	// A pair that is invalid only together (a job maximum above the lane). With
+	// no lane flag typed it can only come from the installed unit, so both fall
+	// back to the defaults: a flagless re-install never fails on what an earlier
+	// install left behind. With either flag typed it is refused, never repaired:
+	// repairing would silently change the value the operator did not type.
+	if _, _, problem := runner.ParseSmallLane(opts.smallLane, opts.smallLaneJobMax); problem != "" && !laneGiven && !jobMaxGiven {
+		opts.smallLane, opts.smallLaneJobMax = defaultSmallLane, defaultSmallLaneJobMax
 	}
 	if _, _, problem := runner.ParseSmallLane(opts.smallLane, opts.smallLaneJobMax); problem != "" {
-		return opts, fmt.Errorf("--small-lane-job-max %s must not exceed --small-lane %s", opts.smallLaneJobMax, opts.smallLane)
+		return opts, fmt.Errorf("small-job lane %s with a job maximum of %s: the job maximum must not exceed the lane (an omitted --small-lane or --small-lane-job-max keeps the installed value; give both)", opts.smallLane, opts.smallLaneJobMax)
 	}
 	if !validDaemonMode(opts.watchdog) {
 		return opts, errors.New("watchdog mode must be off, observe, or enforce")

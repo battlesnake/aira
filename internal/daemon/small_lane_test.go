@@ -302,7 +302,11 @@ func TestSmallLaneT2LedgerFull(t *testing.T) {
 // Pass 1: the 1024 is full (8704 > 8192); the 512 is granted at equality (S
 // 8192); today's walk then grants the 1024 in main (S 9216). Pass 2 (hold): an
 // 8192 waiter, refused (room 5424 − 1088 = 4336) with its budget spent, is the
-// head; another 512 is full and, in the walk, held behind the head.
+// head; another 512 is full and, in the walk, held behind the head. Pass 3 (a
+// restart freeze, so neither the pre-pass nor the walk reaches the 512): it is
+// still queued, and both pass-2 diagnoses are gone, since each pass clears them
+// before rewriting (spec §2.1); a stale "lane full" or "held behind the head"
+// would otherwise reach the wait line and `confine --list`.
 func TestSmallLaneT3LaneFull(t *testing.T) {
 	now := time.Unix(350400, 0)
 	current := int64(0)
@@ -337,6 +341,15 @@ func TestSmallLaneT3LaneFull(t *testing.T) {
 	requireLaneGranted(t, third, false)
 	requireLaneWait(t, third, laneWaitFull)
 	requireHeldByHead(t, third, true)
+
+	server.restartFreezeUntilNanos.Store(now.Add(time.Hour).UnixNano())
+	server.evaluateAdmitQueue(queue)
+
+	if third.state != admitQueued {
+		t.Fatalf("waiter %d state %v, want still queued", third.seq, third.state)
+	}
+	requireLaneWait(t, third, "")
+	requireHeldByHead(t, third, false)
 }
 
 // t4Fixture: E 45056; a 40960 head with its budget spent (hold); a never-ending

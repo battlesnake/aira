@@ -1,10 +1,16 @@
 package install
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"aira/internal/daemon"
 	"aira/internal/runner"
 )
 
@@ -34,6 +40,10 @@ func TestInstallSmallLaneFlags(t *testing.T) {
 		{"--small-lane=abc"}, {"--small-lane=0"}, {"--small-lane"}, {"--small-lane-job-max=0"},
 		{"--small-lane-job-max=512K"}, {"--small-lane-job-max=lots"},
 		{"--status", "--small-lane=8G"}, {"--status", "--small-lane-job-max=1G"},
+		// Explicit empty and whitespace-only values, attached and separate: each
+		// trims to "", which the lane parser reads as "not given".
+		{"--small-lane="}, {"--small-lane= "}, {"--small-lane", ""}, {"--small-lane", " \t"},
+		{"--small-lane-job-max="}, {"--small-lane-job-max= "}, {"--small-lane-job-max", ""}, {"--small-lane-job-max", " "},
 	} {
 		if _, err := parseInstallArgs(args); err == nil || !strings.Contains(err.Error(), CodeArgumentInvalid) {
 			t.Fatalf("args=%q err=%v", args, err)
@@ -105,5 +115,115 @@ func TestInstallSmallLaneFlags(t *testing.T) {
 	}), " ")
 	if !strings.Contains(env, "AIRA_DAEMON_SMALL_LANE=off") {
 		t.Fatalf("a CI (ci-shim) daemon does not get the lane off:\n%s", env)
+	}
+}
+
+// verifies: AIRA-350 §2.5 (review fix) — an explicit flag never repairs a pair
+// it made invalid with an inherited value: installed 512M/256M, then
+// --small-lane-job-max=1G (or --small-lane=128M) is refused, never resolved to the 8G/1G defaults that silently change the value
+// the operator did not type. Through runInstall the refusal carries
+// E_INSTALL_ARGUMENT_INVALID and leaves the installed unit as it was. Mutation:
+// the pre-fix recovery (any conflict with an inherited value falls back).
+func TestInstallSmallLaneExplicitFlagNeverRepairsTheInstalledPair(t *testing.T) {
+	installed := "Environment=AIRA_DAEMON_SMALL_LANE=512M\nEnvironment=AIRA_DAEMON_SMALL_LANE_JOB_MAX=256M\n"
+	resolved, err := resolveDaemonModes(installOpts{}, installed)
+	if err != nil || resolved.smallLane != "512M" || resolved.smallLaneJobMax != "256M" {
+		t.Fatalf("flagless re-install: %q %q %v, want the installed 512M 256M", resolved.smallLane, resolved.smallLaneJobMax, err)
+	}
+	for _, opts := range []installOpts{{smallLaneJobMax: "1G"}, {smallLane: "128M"}} {
+		if resolved, err := resolveDaemonModes(opts, installed); err == nil {
+			t.Fatalf("%+v against installed 512M/256M resolved to %q %q, want a refusal", opts, resolved.smallLane, resolved.smallLaneJobMax)
+		}
+	}
+
+	d, state := newFakeInstall(t)
+	if err := runInstall(d, installOpts{memoryMax: "16G", smallLane: "512M", smallLaneJobMax: "256M"}); err != nil {
+		t.Fatalf("seed install: %v", err)
+	}
+	unitPath := filepath.Join(state.home, ".config", "systemd", "user", d.daemonUnit)
+	before, err := os.ReadFile(unitPath)
+	if err != nil || !strings.Contains(string(before), "AIRA_DAEMON_SMALL_LANE=512M\n") {
+		t.Fatalf("seed unit: %v\n%s", err, before)
+	}
+	err = runInstall(d, installOpts{smallLaneJobMax: "1G"})
+	if err == nil || !strings.Contains(err.Error(), CodeArgumentInvalid) {
+		t.Fatalf("--small-lane-job-max=1G against installed 512M/256M: err=%v, want %s", err, CodeArgumentInvalid)
+	}
+	if after, _ := os.ReadFile(unitPath); string(after) != string(before) {
+		t.Fatalf("a refused install changed the unit:\n%s", after)
+	}
+}
+
+// verifies: AIRA-350 §2.5 (review fix) — "default mode only, not CI mode": a
+// real-mode CI install (bare --ci, --ci=auto) renders the lane off, also over an
+// installed lane, unless --small-lane is typed; the job maximum is untouched.
+// End to end, a bare --ci dry run renders AIRA_DAEMON_SMALL_LANE=off into the
+// daemon unit. Mutation: the CI default deleted (the lane renders 8G).
+func TestInstallSmallLaneOffInCIMode(t *testing.T) {
+	installed := "Environment=AIRA_DAEMON_SMALL_LANE=4G\nEnvironment=AIRA_DAEMON_SMALL_LANE_JOB_MAX=512M\n"
+	for _, opts := range []installOpts{{ci: true}, {ciValue: "auto"}, {ciValue: "shim"}} {
+		for _, unit := range []string{"", installed} {
+			resolved, err := resolveDaemonModes(opts, unit)
+			if err != nil || resolved.smallLane != runner.SmallLaneOff {
+				t.Fatalf("ci=%v ciValue=%q unit=%q: lane %q %v, want off", opts.ci, opts.ciValue, unit, resolved.smallLane, err)
+			}
+		}
+	}
+	resolved, err := resolveDaemonModes(installOpts{ci: true, smallLane: "4G"}, "")
+	if err != nil || resolved.smallLane != "4G" || resolved.smallLaneJobMax != "1G" {
+		t.Fatalf("an explicit --small-lane under --ci: %q %q %v, want 4G 1G", resolved.smallLane, resolved.smallLaneJobMax, err)
+	}
+
+	d, state := newFakeInstall(t)
+	calls := 0
+	d = withCIReader(d, ciMeasured, true, "", &calls)
+	d.run = func([]string, []byte) ([]byte, error) { t.Fatal("dry-run invoked a command"); return nil, nil }
+	if err := runInstall(d, installOpts{ci: true, dryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if report := strings.Join(state.logs, "\n"); !strings.Contains(report, "Environment=AIRA_DAEMON_SMALL_LANE=off\n") {
+		t.Fatalf("a bare --ci dry run does not render the lane off:\n%s", report)
+	}
+}
+
+// verifies: AIRA-350 §6 "--status" — `aira install --status` reports the lane's
+// size and job maximum, live from the running daemon's environment when it is
+// readable, else as declared by the unit. Mutation: either reportDaemonMode call
+// deleted.
+func TestInstallStatusReportsTheSmallLane(t *testing.T) {
+	unit := []byte("# aira-managed: aira-daemon.service\n[Service]\n" +
+		"Environment=AIRA_DAEMON_SMALL_LANE=8G\nEnvironment=AIRA_DAEMON_SMALL_LANE_JOB_MAX=1G\n")
+	for _, test := range []struct {
+		name    string
+		liveErr error
+		want    []string
+	}{
+		{"live", nil, []string{"daemon small-job lane: 4G\n", "daemon small-job lane job max: 512M\n"}},
+		{"declared", errors.New("no bus"), []string{
+			"daemon small-job lane: 8G (declared; live unevaluated)\n",
+			"daemon small-job lane job max: 1G (declared; live unevaluated)\n",
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d, _ := newFakeInstall(t)
+			var out bytes.Buffer
+			d.logf = func(format string, args ...any) { fmt.Fprintf(&out, format+"\n", args...) }
+			d.run = func(argv []string, _ []byte) ([]byte, error) {
+				if strings.Join(argv, " ") == "systemctl --user show -p Environment --value "+d.daemonUnit {
+					if test.liveErr != nil {
+						return nil, test.liveErr
+					}
+					return []byte("AIRA_DAEMON_SMALL_LANE=4G AIRA_DAEMON_SMALL_LANE_JOB_MAX=512M\n"), nil
+				}
+				return nil, errors.New("not modelled")
+			}
+			d.daemonPaths = func() (daemon.Paths, error) { return daemon.Paths{}, errors.New("not modelled") }
+			statusDaemonFacet(d, 1000, unit, nil)
+			for _, want := range test.want {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("status lacks %q:\n%s", want, out.String())
+				}
+			}
+		})
 	}
 }
