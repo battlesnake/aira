@@ -69,6 +69,27 @@ func IsolatedScopeParent(t *testing.T) string {
 	return parent
 }
 
+// CurrentCgroupChildError reports whether this process can create a child
+// cgroup in its own cgroup, the parent the runner uses for a run scope when it
+// is given no other. It creates one throwaway child and removes it; nil means
+// the capability is present. It runs no AIRA code, so no AIRA defect can make
+// it report the capability absent.
+func CurrentCgroupChildError() error {
+	mount, err := unifiedMount()
+	if err != nil {
+		return err
+	}
+	current, err := currentCgroupPath(mount)
+	if err != nil {
+		return err
+	}
+	probe, err := os.MkdirTemp(current, ".aira-test-probe-")
+	if err != nil {
+		return err
+	}
+	return os.Remove(probe)
+}
+
 // SkipOrFailRealCgroup applies the real-cgroup test policy: a host without real
 // cgroup-v2 delegation skips, but under AIRA_REAL_CGROUP=1 — the mode that MUST
 // exercise real containment — an unavailable cgroup is a hard failure, never a

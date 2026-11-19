@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1310,6 +1311,20 @@ func TestRealProcObserveSelectsClaudeChildWithoutSignalling(t *testing.T) {
 	// only on the predicates this test checks, computed from the real tree.
 	child.rss = 1 << 62
 	procs[childPID] = child
+	// Where the test itself runs in system.slice (GitHub's hosted runner runs
+	// the job in a system.slice service), the real child is protected by its
+	// cgroup path. Check that verdict on the real path, with every other
+	// predicate met, then place the child outside system.slice so the rest of
+	// the test can check selection and observe mode.
+	if slices.Contains(strings.Split(child.cgroup.path, "/"), "system.slice") {
+		selected, verdicts := selectOffender(procs, 1024, os.Getpid(), "/not-the-helper")
+		want := watchdogPredicates{Uncapped: true, AgentAttributable: true, Heavy: true, NotProtected: false}
+		if (selected != nil && selected.pid == childPID) || verdicts[childPID] != want {
+			t.Fatalf("child in %s: selected=%+v verdict=%+v, want not selected with verdict %+v", child.cgroup.path, selected, verdicts[childPID], want)
+		}
+		child.cgroup.path = "/user.slice/aira-watchdog-test.scope"
+		procs[childPID] = child
+	}
 	if selected, _ := selectOffender(procs, 1024, os.Getpid(), "/not-the-helper"); selected == nil || selected.pid != childPID {
 		t.Fatalf("selected=%+v want child pid %d", selected, childPID)
 	}
