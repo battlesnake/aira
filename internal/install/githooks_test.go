@@ -474,8 +474,9 @@ func TestHooksQueuePriority(t *testing.T) {
 		expect(t, fx, "aira argv: confine -- make -C "+fx.worktree+" ci", "high")
 	})
 	t.Run("every pre-push step is normal", func(t *testing.T) {
-		// Both pre-push forms are long (`make ci`; the store tests measured
-		// minutes on a busy box), so neither may ever be high.
+		// Every pre-push form stays normal: `make ci` is long, and AIRA-359's
+		// narrowed runs (test-docs, test-store, both) are left at the
+		// priority the store tier always had.
 		data, err := os.ReadFile(filepath.Join(hookSourceDir(t), "pre-push"))
 		if err != nil {
 			t.Fatal(err)
@@ -491,8 +492,8 @@ func TestHooksQueuePriority(t *testing.T) {
 				t.Fatalf("pre-push step %q is not normal priority", line)
 			}
 		}
-		if calls != 2 {
-			t.Fatalf("found %d aira_hook_run_make calls in pre-push, want 2 (ci, test-store)", calls)
+		if calls != 4 {
+			t.Fatalf("found %d aira_hook_run_make calls in pre-push, want 4 (test-docs, test-store, test-store test-docs, ci)", calls)
 		}
 	})
 }
