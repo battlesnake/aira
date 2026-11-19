@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-361","project":"aira","title":"aira top: show the new admission state: small-job lane gauge, lane marker per job, why a queued job is waiting (lane reason), pin-discounted booking","status":"done","kind":"feature","severity":"P3","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
+---
+Owner 2026-11-19: 'update aira top to reflect some of the new changes too, so it shows relevant info'. The daemon already puts the fields on the wire (internal/runner/confine_manage.go: slice_reserve.lane_capacity_bytes / lane_job_max_bytes / lane_used_bytes / lane_jobs / lane_wait / held_by_head, per-scope small and pin_bytes, per-queued-row lane_wait; ceiling_basis and ceiling_would_be_bytes already exist). aira top (cmd/aira/tui_top.go) does not render the lane. Display-only: no protocol or daemon change.
