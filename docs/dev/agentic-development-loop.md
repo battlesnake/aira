@@ -72,7 +72,8 @@ instead of `make ci`, only the named test that reads those files (AIRA-359):
 text test) when the push touches `docs/`, `make test-store`
 (`TestTheRepositorysOwnTicketFilesAreReadable`) when it touches
 `.aira/tickets/`, both when it touches both. Like `make ci` these test the
-checked-out tree, and they never record a tree-pass marker. The third
+checked-out tree, so the refusal below applies to them too, and they never
+record a tree-pass marker. The third
 is a recorded pass (AIRA-355): `make ci` that passes every step from a clean
 worktree (no staged, unstaged, untracked or assume-unchanged/skip-worktree
 file, the same HEAD tree before and after, no stop-or-ignore make flag

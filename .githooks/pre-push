@@ -17,8 +17,9 @@ set -euo pipefail
 # path that is not under docs/ or Markdown under .aira/tickets/) runs the full
 # `make ci` exactly as before. A narrowed run never records an AIRA-355
 # tree-pass marker (its targets do not go through .githooks/ci-pass). Like
-# `make ci`, it tests the CHECKED-OUT tree, not the pushed commits; CI is the
-# gate for the pushed tree. Design: invariant I5 of
+# `make ci`, it tests the CHECKED-OUT tree, so it runs only after the AIRA-355
+# checks below have refused a pushed branch whose tree is neither that tree nor
+# recorded as passed, and under the same HEAD re-check. Design: invariant I5 of
 # docs/superpowers/specs/2026-10-25-rant-small-batch-design.md.
 #
 # No .go file: the Go toolchain walks docs/ (a .go file there is a package
@@ -154,21 +155,6 @@ if root="$(aira_hook_worktree_root)"; then
 else
 	root=""
 fi
-case "$scope" in
-docs)
-	printf 'pre-push: every pushed path is a non-Go file under docs/ (against origin/master); running only make test-docs instead of make ci (AIRA-315).\n' >&2
-	aira_hook_run_make pre-push normal test-docs
-	;;
-tickets)
-	printf 'pre-push: every pushed path is Markdown under .aira/tickets/ (against origin/master); running only make test-store instead of make ci (AIRA-315).\n' >&2
-	aira_hook_run_make pre-push normal test-store
-	;;
-docs+tickets)
-	printf 'pre-push: every pushed path is a non-Go file under docs/ or Markdown under .aira/tickets/ (against origin/master); running only make test-store test-docs instead of make ci (AIRA-315).\n' >&2
-	aira_hook_run_make pre-push normal test-store test-docs
-	;;
-esac
-
 head_tree=""
 if [ -n "$root" ]; then
 	if trees="$(aira_prepush_pushed_trees "$root" <<<"$input")"; then
@@ -199,9 +185,29 @@ if [ -n "$root" ]; then
 	fi
 fi
 
+# AIRA-359: a narrowed scope runs its targets in place of `make ci` only
+# here, after the AIRA-355 checks above: it too tests the checked-out tree, so
+# a pushed branch whose tree is neither that tree nor recorded as passed has
+# already been refused, and the HEAD re-check below covers it as well.
+targets=(ci)
+case "$scope" in
+docs)
+	printf 'pre-push: every pushed path is a non-Go file under docs/ (against origin/master); running only make test-docs instead of make ci (AIRA-315).\n' >&2
+	targets=(test-docs)
+	;;
+tickets)
+	printf 'pre-push: every pushed path is Markdown under .aira/tickets/ (against origin/master); running only make test-store instead of make ci (AIRA-315).\n' >&2
+	targets=(test-store)
+	;;
+docs+tickets)
+	printf 'pre-push: every pushed path is a non-Go file under docs/ or Markdown under .aira/tickets/ (against origin/master); running only make test-store test-docs instead of make ci (AIRA-315).\n' >&2
+	targets=(test-store test-docs)
+	;;
+esac
+
 status=0
 (
-	aira_hook_run_make pre-push normal ci
+	aira_hook_run_make pre-push normal "${targets[@]}"
 ) || status=$?
 if [ "$status" -ne 0 ]; then
 	exit "$status"
@@ -212,7 +218,7 @@ fi
 if [ -n "$root" ]; then
 	head_after="$(aira_prepush_head_tree "$root")"
 	if [ "$head_after" != "$head_tree" ]; then
-		printf 'pre-push: refusing the push: the checked-out tree changed during make ci (%s -> %s), so the run proves neither (AIRA-355).\n' "${head_tree:-none}" "${head_after:-none}" >&2
+		printf 'pre-push: refusing the push: the checked-out tree changed during make %s (%s -> %s), so the run proves neither (AIRA-355).\n' "${targets[*]}" "${head_tree:-none}" "${head_after:-none}" >&2
 		exit 1
 	fi
 	if ! unproven="$(aira_prepush_unproven "$root" "$head_after" <<<"$input")"; then
