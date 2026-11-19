@@ -14,7 +14,7 @@ The withdrawn dynamic lane is `2026-11-18-small-job-lane-design.md` (four rounds
 | Fixed lane, round 2 | A partition: the lane out of the ceiling and gated on the whole-slice fit `W` | Review: 2 P1 and 6 P2, of which six of the eight substantive findings were fix-induced (families A, C). Sol was OOM-killed at its 1 GiB cap. |
 | Fixed lane, round 3 | The fork stated with a proof; rows A-D (below); derived pools; blocked on the owner | Superseded by the owner's 2026-11-19 decision. |
 | Round 4 | Priority and a cap of `x` inside the one ceiling, guard G | Review: 3 P1, 12 P2 (§A7). |
-| Round 5 | Round 4 with its review fixed; stop at a fitting sub-reservation | This spec. |
+| Round 5 | Round 4 with its review fixed; the pre-pass skipped while a queued sub-reservation fits | This spec. |
 
 ## A2. Why round 4 drops what it drops
 
@@ -99,10 +99,10 @@ round 4 was the first review of the owner's design. Grouped by root cause:
 
 | Family | Findings | Root cause | Disposition (round 5) |
 |---|---|---|---|
-| P, the price of priority understated | P1 R1 (the head advances only on main releases; the minutes and the `x` bound wrong, headroom outside `x`); P2 a starved suite worker; P2 a `confine-reserve` hold timing out behind lane grants; P2 G guards only the reference | Round 4 priced priority with the all-jobs release rate and guarded one waiter | R1 restated without minutes; the take is `x` plus 64 MiB per small job (I3); a fitting sub-reservation ends the pre-pass (new, one conjunct) and R6 states the rest; R2 with T24 and a veto form |
+| P, the price of priority understated | P1 R1 (the head advances only on main releases; the minutes and the `x` bound wrong, headroom outside `x`); P2 a starved suite worker; P2 a `confine-reserve` hold timing out behind lane grants; P2 G guards only the reference | Round 4 priced priority with the all-jobs release rate and guarded one waiter | R1 restated without minutes; the take is `x` plus 64 MiB per small job (I3); the pre-pass is skipped in any pass where a queued sub-reservation fits (new, one conjunct; an in-loop stop was drafted first and missed a worker queued behind a small waiter, T26c) and R6 states the rest; R2 with T24 and a veto form |
 | G, model | P1 the VRAM term used `total` for `free`, but the fit charges a running job twice (`vram.go:53-63`, `191`) | Copied from head eligibility, where occupancy is zero | VRAM term `total - occ.vram`; T6 runs through release, ramp-up and a fresh snapshot and fails against round 4's form; R4 states undeclared use |
 | C, restart paths | P2 x 2: a SET keeps a discounted charge (`admit.go:2326`) | Establish and SET conflated | §2.4 has two rows; I2, I6, R7 and T13 split |
-| T, test oracles | P1 + P2 T3 contradicted the pre-pass; P2 physical fit and 354 untested; P2 the reference's derivation untested | Rows written against the intent, not the pseudo-code | T3 rewritten with passes; T23 (physical witness, room-parity contract); T25 (four reference cases); T26 |
+| T, test oracles | P1 + P2 T3 contradicted the pre-pass; P2 physical fit and 354 untested; P2 the reference's derivation untested | Rows written against the intent, not the pseudo-code | T3 rewritten with passes; T23 (physical witness, room-parity contract); T25 (four reference cases); T26 (three sub-reservation cases) |
 | W, wording | P2 generated text promised a total cap; P2 I1 omitted a falling ceiling (`sliceceiling.go:531`); P2 the 354 row was stale; P2 yield rows read as cause | Claims not checked against the code or the sibling spec | §2.7 rewritten with keyword checks; I1 at grant time and T2c; the 354 row against its spec; §7 names the supported rows (0-30%); replay label fixed |
 
 **Replay re-run** (`aira350-r5-replay`, `--memory-reserve 256M`, exit 0, no `hint:` line; peak-rss

@@ -27,7 +27,7 @@ sum, derived by a walk. One ledger, one ceiling, and every reader of them unchan
 |---|---|---|
 | Guard G (§2.3) | Small leases filling room a head needs beside them, so that a head above `E - H - x`, or a slot- or VRAM-bound head, could not fit even after every main lease ends. G does not make small-job turnover help a head (R1) | head eligibility with an occupancy argument |
 | Closed behind a pushed head (§2.2) | AIRA-309: only another push passes a pushed head | one conjunct |
-| Stop at a fitting sub-reservation (§2.2) | The lane taking room a queued suite worker or `confine-reserve` hold fits into now and would get today (R6) | one conjunct |
+| Skip while a sub-reservation fits (§2.2) | The lane taking room a queued suite worker or `confine-reserve` hold fits into now and would get today (R6) | one conjunct |
 | Suite parents and unsigned jobs not eligible (§2.1) | A parent's workers are head-exempt main grants: 13 worker scopes booking 28.0 GiB in one worktree beside a 1 GiB and a 2 GiB job (M, 13:55; appendix §A6) | one bool frozen at enqueue |
 | Scope-less waiters not eligible | Real use is not capped by the reserve, so G's sum of pins would not bound it | one conjunct |
 | Configuration, off in ci-shim (§2.5) | Owner: default mode only, install-settable | the pin-charge pattern |
@@ -84,12 +84,11 @@ without the `head.bypassed` line) into `s.grantWaiterLocked(queue, w, physicalFr
 use them, so a lane grant faces exactly the RAM ledger, physical, CPU and VRAM fit of a main grant.
 
 ```
-if laneOn && !restartFrozen {
-  order := admitOrderLocked(queue)                       // pushed, high, normal (admit.go:452)
-  clear laneWait on every queued waiter
+clear laneWait on every queued waiter
+order := admitOrderLocked(queue)                         // pushed, high, normal (admit.go:452)
+if laneOn && !restartFrozen && !anySubFits(order, gate) {  // a queued, ungated sub-reservation fits
   r := nextRef(order, 0)                                 // the reference waiter, below
   for i, w := range order {
-    if w.isSubReservation() && !gate.blocks(queue, w) && admitFitLocked(...).all() { break }
     if !laneEligible(w) || gate.blocks(queue, w) { continue }  // gate: today's diagnosis
     ref := order[r] or nil
     if ref != nil && ref != w && ref.pushSeq > 0 { w.laneWait = "pushed"; continue }
@@ -109,10 +108,10 @@ if laneOn && !restartFrozen {
   a sub-reservation, not gated, and passes `admitCouldFitEmptyLocked(w, E)` (`admit.go:2843`), from
   this pass's queue. Today's walk would make it the head if it does not fit, or grant it if it
   does. It advances only when the lane grants it (T25).
-- **A fitting sub-reservation ends the pre-pass.** At the first queued, ungated sub-reservation
-  (suite worker, `confine-reserve` hold) that fits now, the pre-pass stops and today's walk runs,
-  so the lane never takes room such a waiter would get today. Small waiters behind it are tried in
-  main this pass and in the lane on the next (T26).
+- **A fitting sub-reservation skips the pre-pass.** In a pass where any queued, ungated
+  sub-reservation (suite worker, `confine-reserve` hold) fits now, wherever it is in the order, the
+  pre-pass does nothing and today's walk runs, so the lane never takes room such a waiter would get
+  today. Small waiters are tried in main that pass and in the lane on the next (T26).
 - **Pushed:** behind a pushed reference the lane is closed; a pushed eligible reference may use the
   lane. A pushed reference that fits is granted by the main walk, so the lane waits one pass.
 - **Priority:** freed room goes to small waiters first, even past an earlier main waiter that fits
@@ -164,14 +163,14 @@ lane full, headroom for 33 jobs): 11.36 GiB to spare at `x = 8`, 15.36 at 4. CPU
 | `--priority high` | Order only. A high head is an unpushed reference, so the lane stays open past it. | T8 |
 | Fairness freeze, backstop | The pre-pass reads no phase. Lane grants never write `head.bypassed`, `budgetWithheld` or `freezeArmedAt`, so they never arm or spend a hold. The backstop pass is today's. | T11 |
 | Restart freeze (S11) | The pre-pass is skipped while `restartFrozen`, as every new admission is (`admit.go:2592`). | T10 |
-| Sub-reservations (suite workers, `confine-reserve`) | Never eligible, never in `S`. A fitting one ends the pre-pass (§2.2). One that does not fit is passed by fitting small waiters as by any fitting job today: sub-reservations are never heads (`admit.go:2688`, `2770`). Worker claims wait without deadline (`worker_admit.go:493-503`); a `confine-reserve` hold gives up after 300 s (`internal/runner/confine_reserve.go:13`) and its test runs unreserved (R6). | T26 |
+| Sub-reservations (suite workers, `confine-reserve`) | Never eligible, never in `S`. While one fits, the pre-pass is skipped (§2.2). One that does not fit is passed by fitting small waiters as by any fitting job today: sub-reservations are never heads (`admit.go:2688`, `2770`). Worker claims wait without deadline (`worker_admit.go:493-503`); a `confine-reserve` hold gives up after 300 s (`internal/runner/confine_reserve.go:13`) and its test runs unreserved (R6). | T26 |
 | AIRA-324 (enforce at 0.9 since 2026-11-19 00:10, R) | `y` and `x` are in bookings (`ledgerCharge`), so a pin up to `y` / factor is eligible: 1137 MiB at 0.9. G and the physical rule use pins. With pin-charge off or observe the booking is the pin, so `y` applies to the pin. | T12, T23 |
 | ARDR establish (daemon restart) | `newEstablishedWaiter` books the pin (`admit.go:2114-2125`: no charge, not discountable). A discounted or resized small lease whose pin is above `y` leaves `S`; one whose pin is at most `y` re-books at its pin, so `S` may rise above `x`. The lane is then shut until `S` falls; bookings above the ceiling are today's re-declare window (I1). | T13a |
 | ARDR SET (reconnect, lease present) | A discounted lease keeps its discounted charge (`admit.go:2326`); a resize is dropped back to the grant-time booking. So only resized small leases change: one whose pin is above `y` leaves `S`, one whose pin is at most `y` re-books higher. | T13b |
 | `confine --resize` | Lowers the booking (`confine_resize.go:128-142`), so `S` falls or a large lease becomes small. Either is a re-derive. | T14 |
 | Suite parents | Not eligible (`laneKind`). Granted in main, a parent of at most `y` counts in `S`. A plain `make` wrapper that runs a nested `--delegate-ram` suite is eligible; its workers name the nested parent (`confine_linux.go:1233-1238`, `1255-1256`). | T15 |
 | ci-shim | `laneOn` is false (`s.shimMode()`); `install --ci` renders `off` (`internal/install/mode.go:321` pattern). | T17 |
-| AIRA-354 (measured overbooking; spec `docs/superpowers/specs/2026-11-19-measured-overcommit-design.md` on branch `aira-overcommit-spec`, `e9077760`, not merged) | 354 §3.2 replaces the `checkedAvailable` / `ledgerAvailable` switch with one helper, `admitAvailable`, at every site, and keeps head eligibility on `L`. The lane's room is `admitFitLocked`, which calls the main walk's helper, so lane and main room cannot differ (contract T23). G is head eligibility with an occupancy argument, so it stays on `L`, never `L + over`; 354's build re-runs T4 under overbook enforce with unchanged outcomes. 354 §3.3 retires AIRA-324 to observe: `y` then applies to the pin (T12's observe arm) and the physical-pin rule is idle. 354 §10 recommends building 354 first; the build order is an owner line (§8). | T4, T12, T23 |
+| AIRA-354 (measured overbooking; spec `docs/superpowers/specs/2026-11-19-measured-overcommit-design.md` on branch `aira-overcommit-spec`, `e9077760`, not merged) | 354 §3.2 replaces the `checkedAvailable` / `ledgerAvailable` switch with one helper, `admitAvailable`, at every site, and keeps head eligibility on `L`. The lane's room is `admitFitLocked`, which calls the main walk's helper, so lane and main room cannot differ (contract T23). G is head eligibility with an occupancy argument, so it stays on `L`, never `L + over`; 354's build adds a T4 variant with `E` throttled below `memory.max` (so `over > 0`) whose G verdicts equal those on `L`. 354 §3.3 retires AIRA-324 to observe: `y` then applies to the pin (T12's observe arm) and the physical-pin rule is idle. 354 §10 recommends building 354 first; the build order is an owner line (§8). | T4, T12, T23 |
 
 ### 2.5 Configuration (the pin-charge pattern)
 
@@ -244,7 +243,7 @@ long only: `small-job lane`, `restart`, `CI`, `--front`, `worker`, `--delegate-r
   leases whose pin is at most `y`, independent of order: discounted pins at 0.9 re-book about 11%
   higher (a full `S = 8 GiB` becomes about 8.9 GiB, E), resized ones at their pin. After a SET only
   resized leases change. While `S > x` no lane grant happens (I1 bounds the rest).
-- **I7 Precedence:** fail-fast trip, slice read, restart freeze, a fitting sub-reservation (stop),
+- **I7 Precedence:** fail-fast trip, slice read, restart freeze, a fitting sub-reservation (skip),
   exclusivity gate, pushed reference, lane cap, fit, G, then today's walk. **I8 Off is today:**
   with `laneOn` false the pre-pass does nothing, and every existing test passes unchanged.
 
@@ -280,7 +279,7 @@ long only: `small-job lane`, `restart`, `CI`, `--front`, `worker`, `--delegate-r
   and under sustained small demand gain room only from main releases (R1). Witness: 32 slots, a
   running one-slot suite parent, a queued 31-slot worker, a later persistent one-slot small job: if
   slots free one at a time the small job takes one, and worker and parent wait for its end (freed at
-  once, the stop rule grants the worker). A `confine-reserve` hold past 300 s runs its test
+  once, the skip rule grants the worker). A `confine-reserve` hold past 300 s runs its test
   unreserved in the parent's scope, capped at its booking or, for a `--delegate-ram` parent, a
   containment ceiling many times it (`admit.go:1189-1192`), as on any timeout today. *Accept, or
   veto for no lane grant past any queued sub-reservation (shut whenever a worker waits).*
@@ -317,7 +316,7 @@ scoped and `laneKind`; "main leases" book above `y`. Every test asserts the gran
 |---|---|---|---|
 | **T1 incident** | `E` 45056; 20 main leases booking 38182 (room `45056 - H(21) - 38182 = 3482`). A 4096 head queued first, `bypassed` 2048 (budget spent), hold phase. 14 small, in order: 72, 256, 512, 1024, 512, 256, 1024, 72, 512, 1024, 256, 512, 72, 1024. | Lane grants 1-6, 8 and 11 (`S` 2960; room left 10: each grant costs its booking plus 64). 7, 9, 10, 12, 13, 14 `no-room`. Head refused; `bypassed` 2048; anchor unchanged. | Lane off or behind the head rule: none. Room computed once, no 64 per grant: also 9. Lane judged on `x` alone (on top): all 14. Lane grants in `bypassed`: 5008. |
 | **T1b slots** | T1 with 32 of 32 slots held. | No grant; all `no-room`. | Lane fit without CPU. |
-| **T2 ledger full** | (a) Room 0; (b) -512 (an ARDR deficit); four 1024 small, no head. (c) Room 2000 at `memory.max`, but the enforced ceiling (`admitEffectiveMaximum`, set through the slice-ceiling seam) 3000 lower, below bookings; then restored. | (a), (b) No grant; `no-room`. (c) No grant while lowered; one grant after. | Lane on top of the ceiling: four grants. Lane fit on `memory.max` instead of the enforced ceiling: (c) granted while lowered. |
+| **T2 ledger full** | (a) Room 0; (b) -512 (an ARDR deficit); four 1024 small, no head. (c) Room 2000 at `memory.max`, but the enforced ceiling 3000 lower (`publishSliceCeilingSnapshot`, as `admit_pin_charge_test.go:359-361`), below bookings; then restored. | (a), (b) No grant; `no-room`. (c) No grant while lowered; one grant after. | Lane on top of the ceiling: four grants. Lane fit on `memory.max` instead of the enforced ceiling: (c) granted while lowered. |
 | **T3 lane full** | `S` 7680 (eight 960 small leases), room 6000, no head. Pass 1: a 1024 small, then a 512. Pass 2, hold phase: an 8192 waiter (refused, budget spent: the head), then another 512 small. | Pass 1: 1024 `full`; 512 lane-granted at equality (`S` 8192); then today's walk grants the 1024 in main (`S` 9216). Pass 2: the 512 `full` and `heldByHead`, not granted. | Lane and main interleaved per waiter: 512 `full`. `>=` for `>`: 512 `full`. A refused waiter never tried in main: 1024 not granted. Cap ignored: pass-2 512 granted. |
 | **T4 guard, silt** | `E` 45056. A 40960 head, budget spent, hold. A never-ending 1024 small lease; main leases 2 x 1536 (room 38656). Small waiters 1024, 512, 320, 256. Pass 2: both main leases end. (b) The never-ending lease a discounted pin 1137 booking 1024. (c) Twin without G; each pass one non-silt small lease ends and a 1024 small waiter is queued. (d) Four never-ending 1024 small leases. | Pass 1: 1024 `kept` (`45056 - H(3) - 2048 = 40768 < 40960`) and `heldByHead`; 512 granted (41280); 320 `kept` (40896); 256 granted at equality (`45056 - H(4) - 1792 = 40960`). Pass 2: head granted (room 40960). (b) 256 `kept` (pins 1905: 40847). (c) Head never granted in 50 passes. (d) Head waits; every small waiter `kept`. | No G (c); G on bookings (b); `<` for `<=` (256); `H` without the head's job (320 granted, then the head refused in pass 2). |
 | **T5 guard, CPU** | 32 slots: small leases 26, main 6; a head needing 4 slots, RAM ample, budget spent. Main leases end one per pass; a 1-slot small waiter is queued before each pass. | Grants at 27 and 28 small slots (`28 + 4 = 32`); the next `kept`; the head is granted once 4 slots are free. | G without the CPU conjunct: head never granted. |
@@ -340,8 +339,8 @@ scoped and `laneKind`; "main leases" book above `y`. Every test asserts the gran
 | **T22 first fit** | Room 600; small waiters 1024, then 256. | 256 granted; 1024 `no-room`. | A lane head-of-line rule. |
 | **T23 one room** | Enforce 90%, `E` 45056, one 4096 main lease; a small discounted pin 1137 (booking 1023.3). (a) Real use 41780 (physical room `45056 - H(2) - 41780 = 1100`, ledger room 1100). (b) Real use 41743 (1137). (c) Parity: over a table of real use, reclaimable, bookings, discount, CPU and VRAM, a lone small waiter with `S` 0 and no head is lane-granted exactly when the lane-off twin grants it. | (a) `no-room`. (b) Granted at equality. (c) Equal verdicts on every row. | Lane fit without the full-pin physical rule: (a) granted. Any lane-only copy of the fit: (c). |
 | **T24 G masked (R2)** | `E` 45056, room 10000 (one main lease books 2048). Order: A 2048 main, B 36864 main, eight 1024 small. Pass 2: the 2048 main lease ends. Pass 3: one small lease ends; a 512 small waiter. | Pass 1: all eight lane-granted (`S` 8192; G against A vacuous); A refused (room 1296), the head. Pass 2: A granted in main. Pass 3: B is the reference; the 512 `kept` (`45056 - H(9) - 7680 = 34752 < 36864`). | G against B from pass 1 (the veto form): pass 1 grants 5. |
-| **T25 reference** | `E` 45056; a never-ending 1024 small lease, main 2 x 1536 (room 38656) unless stated. (a) Order: 512 small, a 40960 waiter, 1024 small. (b) A queued 39000 worker (refused), a 40960 waiter, 1024 small. (c) Throttled `E` 38912 (`memory.max` 45056), no leases: a 40960 waiter (cannot fit empty), 1024 small. (d) An exclusive holder booking 2048, no other leases: a non-holder 42000 waiter (gated), a 1024 small carrying the holder's token. | (a) 512 granted, then 1024 `kept` (`45056 - H(4) - 2560 = 40192 < 40960`). (b) 1024 `kept` (40768). (c) 1024 granted. (d) 1024 granted. | (a) Reference not advanced after its grant: granted. (b) Reference may be a sub-reservation: granted. (c) No could-fit-empty filter: `kept`. (d) Reference may be gated: `kept` (41856). |
-| **T26 sub-reservation** | (a) Room 1100: a queued 1024 worker of a granted parent, then a 1024 small. (b) The worker needs 2048. | (a) The worker granted by today's walk; the small waiter not, `laneWait` "". (b) The small waiter lane-granted. | No stop: (a) small granted, worker refused. Stop at any sub-reservation: (b) not granted. |
+| **T25 reference** | `E` 45056; a never-ending 1024 small lease, main 2 x 1536 (room 38656) unless stated. (a) Order: 512 small, a 40960 waiter, 1024 small. (b) A queued 39000 worker (refused), a 40960 waiter, 1024 small. (c) Throttled `E` 38912 (`memory.max` 45056, published as in T2c), no leases: a 40960 waiter (cannot fit empty), 1024 small. (d) An exclusive holder booking 2048, no other leases: a non-holder 42000 waiter (gated), a 1024 small carrying the holder's token. | (a) 512 granted, then 1024 `kept` (`45056 - H(4) - 2560 = 40192 < 40960`). (b) 1024 `kept` (40768). (c) 1024 granted. (d) 1024 granted. | (a) Reference not advanced after its grant: granted. (b) Reference may be a sub-reservation: granted. (c) No could-fit-empty filter: `kept`. (d) Reference may be gated: `kept` (41856). |
+| **T26 sub-reservation** | (a) Room 1100: a queued 1024 worker of a granted parent, then a 1024 small. (b) The worker needs 2048. (c) Hold phase, room 1100: a 4096 head (budget spent), a 1024 small, then the 1024 worker. | (a) The worker granted by today's walk; the small waiter not, `laneWait` "". (b) The small waiter lane-granted. (c) The small waiter `heldByHead`; the worker granted. | No skip: (a), (c) small granted, worker refused. Stop only at a sub-reservation reached in order: (c) the same. Skip for any queued sub-reservation: (b) not granted. |
 
 **Also:** every §2.5 value and refusal (`off`, empty, `8G`; `abc`, `0`, `x < y`, `y = 0`; shim off;
 install `8G`/`1G`, CI `off`, `--status`); every §2.6 field only while on, each wait clause, the
@@ -354,8 +353,9 @@ only in `evaluateAdmitQueue`, read only by the snapshot (`admit_pin_charge_guard
 interleaved, `>=` for `>` (T3); `bypassed` or arming (T1, T11); high as pushed (T8); push rule or G
 when `w` is the reference (T7b); eligibility or `S` on pins (T12, T14); stored pool, SET as
 establish (T13, T19); in-walk exemption (T21); lane head-of-line (T22); reference unfiltered or
-gated (T25c, d); stop at any sub-reservation (T26b); `<` for `<=` (T4, T20). **False pass** (a
-wrong grant made): every other entry, among them T2c, T4-T6, T23, T25a-b and T26a.
+gated (T25c, d); skip for any sub-reservation (T26b); `<` for `<=` (T4, T20); G against every
+waiter ahead (T24, R2's veto form, a decision rather than a bug). **False pass** (a wrong grant
+made): every other entry, among them T2c, T4-T6, T23, T25a-b and T26a, c.
 
 ## 7. Expected yield: estimates, not bounds
 
