@@ -140,9 +140,10 @@ and would need its own replay. The one-shot gives more room (5.4 against 3.4 GiB
 per job reaches 3.18 GiB.
 
 `memory.current` is in `target` because the two files are read at different instants: a peak read
-before a burst could otherwise put the booking below live use. Then `target` can exceed the upper
-bound only when the job already uses more than its booking (the 324 discount's overrun). The `min`
-leaves the booking at today's value in that case; it is never raised above it.
+before a burst could otherwise put the booking below live use. When `target` exceeds the upper bound (from
+the peak term, or from the current-use term when the job already uses more than its booking, the
+324 discount's overrun), the `min` leaves the booking at today's value. It is never raised above
+it.
 
 The tick reads no file while holding `queue.mu` (the rule stated at `sliceceiling.go:729`):
 1. Under the lock, snapshot `(waiter pointer, scopeID, grantedAt)` for the eligible leases.
