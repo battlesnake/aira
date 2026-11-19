@@ -263,7 +263,7 @@ func (r *tuiRuntime) buildWidgets() {
 			// requirement 6 made visible: one glance maps a coloured span to the row
 			// that owns it.
 			r.topBar = tview.NewTextView().SetDynamicColors(true).SetWrap(false)
-			r.topBar.SetBorder(true).SetTitle(" System RAM ")
+			r.topBar.SetBorder(true).SetTitle(topRAMPanelTitle(""))
 			// AIRA-137. The CPU bar is a second instance of the SAME renderer over
 			// the same model type, stacked under the RAM bar and above the rows it
 			// shares its colours with. It gets fewer lines because it carries no
@@ -670,6 +670,18 @@ func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel pan
 	if target == nil {
 		return
 	}
+	if bar != nil && bar.Kind == topBarRAM {
+		// AIRA-361: the small-job lane gauge rides in the title, so it takes none
+		// of the panel's fixed interior rows from the honesty lines below. With the
+		// gauge the title is left-aligned, so a border too narrow for it clips its
+		// END (the static job maximum), never "System RAM" or the lane's state at
+		// its start as a centred overflow would.
+		align := tview.AlignCenter
+		if bar.Lane != "" {
+			align = tview.AlignLeft
+		}
+		target.SetTitle(topRAMPanelTitle(bar.Lane)).SetTitleAlign(align)
+	}
 	var out strings.Builder
 	if panel.Status == panelError {
 		fmt.Fprintf(&out, "ERROR %s\n", panel.ErrorCode)
@@ -679,9 +691,6 @@ func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel pan
 		out.WriteString("loading…")
 	case !bar.Evaluated:
 		fmt.Fprintf(&out, "UNEVALUATED: %s", bar.Reason)
-		if bar.Lane != "" {
-			out.WriteString("\n" + bar.Lane)
-		}
 	default:
 		_, _, width, _ := target.GetInnerRect()
 		if width < topBarMinColumns {
@@ -717,9 +726,6 @@ func (r *tuiRuntime) renderTopBar(target *tview.TextView, bar *topBar, panel pan
 		}
 		for _, note := range bar.Notes {
 			out.WriteString("\n" + note)
-		}
-		if bar.Lane != "" {
-			out.WriteString("\n" + bar.Lane)
 		}
 	}
 	target.SetText(out.String())
@@ -781,6 +787,15 @@ func topBarFreeNoun(bar *topBar) string {
 		return "idle"
 	}
 	return "free"
+}
+
+// topRAMPanelTitle is the RAM panel's border title, with the small-job lane's
+// gauge (topLaneLine) after it while the lane is on.
+func topRAMPanelTitle(lane string) string {
+	if lane == "" {
+		return " System RAM "
+	}
+	return " System RAM · " + lane + " "
 }
 
 // topBarMinColumns keeps the bar honest on a very narrow terminal: below this,

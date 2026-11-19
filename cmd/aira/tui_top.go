@@ -329,9 +329,8 @@ type topBar struct {
 	// Notes name every scope the bar could NOT draw, so a stack that is narrower
 	// than the slice's real claim is never read as an idle slice.
 	Notes []string
-	// Lane is the RAM bar's small-job lane line (AIRA-361, topLaneLine); empty
-	// while the lane is off. Rendered LAST, after every honesty line, so on a
-	// crowded panel it is the line that clips, never a note.
+	// Lane is the RAM bar's small-job lane gauge (AIRA-361, topLaneLine), drawn
+	// in the panel title; empty while the lane is off.
 	Lane string
 }
 
@@ -834,18 +833,37 @@ func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int) table
 // topQueuedState is a queued row's LIVE cell. "pushed" wins: a pushed job is
 // ahead of every high one, and its freeze is the stronger fact. "high"
 // (AIRA-340) marks a `--priority high` launch, so misuse of the flag is visible
-// to every session watching the queue. Otherwise (AIRA-361) the small-job lane's
-// last-pass diagnosis, in plain words and only when the daemon gave one: held
-// behind the head first (a fit the head rule refused), as the confine wait line
-// orders them (confineLaneNote), then why the lane did not take it. A token this
-// binary does not know reads as plain "queued", never a guess.
+// to every session watching the queue. AIRA-361 adds the small-job lane's
+// last-pass diagnosis (topLaneReason) AFTER either, never instead of it: a high
+// job the lane refused shows both facts ("high, lane full"), and a row with
+// neither reads as plain "queued".
 func topQueuedState(record runner.ConfineRecord) string {
+	head := ""
 	switch {
 	case record.Pushed:
-		return "pushed"
+		head = "pushed"
 	case record.Priority == runner.ConfinePriorityHigh:
-		return "high"
-	case record.HeldByHead:
+		head = "high"
+	}
+	reason := topLaneReason(record)
+	switch {
+	case head != "" && reason != "":
+		return head + ", " + reason
+	case head != "":
+		return head
+	case reason != "":
+		return reason
+	}
+	return "queued"
+}
+
+// topLaneReason is why the small-job lane did not take a queued job, in plain
+// words, only when the daemon gave one: held behind the head first (a fit the
+// head rule refused), as the confine wait line orders them (confineLaneNote),
+// then the lane's own verdict. A token this binary does not know names nothing
+// rather than a guess.
+func topLaneReason(record runner.ConfineRecord) string {
+	if record.HeldByHead {
 		return "behind head"
 	}
 	switch record.LaneWait {
@@ -858,35 +876,40 @@ func topQueuedState(record runner.ConfineRecord) string {
 	case "no-room":
 		return "no room"
 	}
-	return "queued"
+	return ""
 }
 
 // topLaneLine is the small-job lane's gauge (AIRA-350, shown by AIRA-361): used
-// over capacity, how many small leases, and the per-job maximum. Empty while the
-// lane is off (the daemon then sends no lane field at all), so a lane-off slice
-// shows nothing rather than a fabricated "0M / 0M". Used and the job count come
-// from the same locked pass as GrantedBytes, so they are stated only when that
-// is established; the capacity is configuration and stands regardless. Used can
+// over capacity, how many small leases, and the per-job maximum. It rides in the
+// RAM panel's TITLE (topRAMPanelTitle), so it costs none of the panel's interior
+// rows and no honesty line can push it off. Empty while the lane is off (the
+// daemon then sends no lane field at all), so a lane-off slice shows nothing
+// rather than a fabricated "0M/0M". Used and the job count come from the same
+// locked pass as GrantedBytes, so they are stated only when that is
+// established; the capacity is configuration and stands regardless. Used can
 // exceed the capacity, and the lane is then shut until it falls: both real
-// figures are printed and the state named, never a clamp.
+// figures are printed and the state named, never a clamp. The state comes
+// FIRST and the static job maximum last, so a title clipped at a narrow width
+// loses the least important part.
 func topLaneLine(reserve *runner.ConfineSliceReserve) string {
 	if reserve == nil || reserve.LaneCapacityBytes <= 0 {
 		return ""
 	}
 	each := ""
 	if reserve.LaneJobMaxBytes > 0 {
-		each = " (max " + runner.FormatConfineMegabytes(reserve.LaneJobMaxBytes) + " each)"
+		each = ", max " + runner.FormatConfineMegabytes(reserve.LaneJobMaxBytes) + " each"
 	}
+	capacity := runner.FormatConfineMegabytes(reserve.LaneCapacityBytes)
 	if !reserve.GrantedEstablished {
-		return "small-job lane: " + runner.FormatConfineMegabytes(reserve.LaneCapacityBytes) + each + ", use unevaluated"
+		return "small-job lane use unevaluated, " + capacity + each
 	}
-	line := fmt.Sprintf("small-job lane: %s / %s used, %d %s%s",
-		runner.FormatConfineMegabytes(reserve.LaneUsedBytes), runner.FormatConfineMegabytes(reserve.LaneCapacityBytes),
-		reserve.LaneJobs, confinePlural(reserve.LaneJobs, "job", "jobs"), each)
+	state := ""
 	if reserve.LaneUsedBytes > reserve.LaneCapacityBytes {
-		line += " OVER: shut"
+		state = "OVER, shut: "
 	}
-	return line
+	return fmt.Sprintf("small-job lane %s%s/%s, %d %s%s", state,
+		runner.FormatConfineMegabytes(reserve.LaneUsedBytes), capacity,
+		reserve.LaneJobs, confinePlural(reserve.LaneJobs, "job", "jobs"), each)
 }
 
 // topQueuedBytesCell renders a REQUESTED byte count. nil is unevaluated (the
@@ -1397,12 +1420,12 @@ func topMarkersFor(reserve *runner.ConfineSliceReserve) []topBarMarker {
 	markers := make([]topBarMarker, 0, 3)
 	if reserve.SliceHighState == runner.ConfineSliceHighSet && reserve.SliceHighBytes > 0 {
 		markers = append(markers, topBarMarker{
-			Name: topMarkerSoft, Label: "soft (memory.high)", At: reserve.SliceHighBytes,
+			Name: topMarkerSoft, Label: "soft", At: reserve.SliceHighBytes,
 		})
 	}
 	if reserve.SliceMaxBytes > 0 {
 		markers = append(markers, topBarMarker{
-			Name: topMarkerHard, Label: "hard (memory.max)", At: reserve.SliceMaxBytes,
+			Name: topMarkerHard, Label: "hard", At: reserve.SliceMaxBytes,
 		})
 	}
 	// Only when it genuinely sits BELOW memory.max. An unthrottled ceiling equals
@@ -1410,27 +1433,39 @@ func topMarkersFor(reserve *runner.ConfineSliceReserve) []topBarMarker {
 	// not in effect.
 	if reserve.CeilingEffectiveBytes > 0 && reserve.SliceMaxBytes > 0 && reserve.CeilingEffectiveBytes < reserve.SliceMaxBytes {
 		markers = append(markers, topBarMarker{
-			Name: topMarkerCeiling, Label: "admission ceiling" + topCeilingCause(reserve), At: reserve.CeilingEffectiveBytes,
+			Name: topMarkerCeiling, Label: "ceiling" + topCeilingCause(reserve), At: reserve.CeilingEffectiveBytes,
 		})
 	}
 	return markers
 }
 
-// topCeilingCause names what cut the admission ceiling (AIRA-106 basis, shown
-// by AIRA-361), only for an ENFORCED, throttled ceiling: observe mode applies
-// nothing, so its marker must not claim a cut. A basis this binary does not know
-// names no cause rather than a guessed one.
+// topCeilingCause qualifies the admission-ceiling marker (AIRA-361): what cut it
+// (the AIRA-106 basis), only for an ENFORCED, throttled ceiling, because observe
+// mode applies nothing and its marker must not claim a cut; and "last known"
+// when the daemon is HOLDING the last established ceiling because the newest
+// reading failed (CeilingHeld), so a stale figure never reads as current. A
+// basis this binary does not know names no cause rather than a guessed one.
+//
+// The marker labels are short ("soft", "hard", "ceiling") so the whole legend,
+// cause included, fits an 80-column terminal: the long forms clipped the
+// ceiling's own figure there.
 func topCeilingCause(reserve *runner.ConfineSliceReserve) string {
-	if reserve.CeilingMode != "enforce" || reserve.CeilingState != "throttled" {
+	parts := make([]string, 0, 2)
+	if reserve.CeilingMode == "enforce" && reserve.CeilingState == "throttled" {
+		switch reserve.CeilingBasis {
+		case "system-pressure":
+			parts = append(parts, "pressure")
+		case "machine-reserve":
+			parts = append(parts, "machine reserve")
+		}
+	}
+	if reserve.CeilingHeld {
+		parts = append(parts, "last known")
+	}
+	if len(parts) == 0 {
 		return ""
 	}
-	switch reserve.CeilingBasis {
-	case "system-pressure":
-		return " (system pressure)"
-	case "machine-reserve":
-		return " (machine reserve)"
-	}
-	return ""
+	return " (" + strings.Join(parts, ", ") + ")"
 }
 
 // topBarFill is how a bar column is painted WITHIN its colour: which block

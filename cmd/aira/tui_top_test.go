@@ -706,7 +706,7 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 		rendered = runtime.topBar.GetText(true)
 		return strings.Contains(rendered, "total ")
 	}, "the top bar never rendered its totals")
-	if !strings.Contains(rendered, "total 65536M") || !strings.Contains(rendered, "soft (memory.high) 28672M") {
+	if !strings.Contains(rendered, "total 65536M") || !strings.Contains(rendered, "┊ soft 28672M") {
 		t.Fatalf("bar text=%q, want the totals and the soft-limit legend", rendered)
 	}
 	if !strings.Contains(rendered, "█") {
@@ -736,9 +736,11 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 	if count := onUI(t, runtime, func() int { return runtime.tables[viewTop].GetRowCount() }); count != 3 { // one header plus two scopes
 		t.Fatalf("table rows=%d, want a header and two scopes", count)
 	}
-	// AIRA-361: the lane gauge and the small-lease marker reach the terminal.
-	if want := "small-job lane: 1024M / 8192M used, 1 job (max 1024M each)"; !strings.Contains(rendered, want) {
-		t.Fatalf("bar text=%q, want the lane line %q", rendered, want)
+	// AIRA-361: the lane gauge and the small-lease marker reach the terminal. The
+	// gauge is read from the DRAWN cells (the panel title), not widget text.
+	if want, drawnText := "System RAM · small-job lane 1024M/8192M, 1 job, max 1024M each",
+		onUI(t, runtime, func() string { return simulationText(screen) }); !strings.Contains(drawnText, want) {
+		t.Fatalf("screen=\n%s\nwant the lane gauge %q", drawnText, want)
 	}
 	if cell := onUI(t, runtime, func() string { return runtime.tables[viewTop].GetCell(2, 5).Text }); !strings.Contains(cell, "1024M lane") {
 		t.Fatalf("bravo RESERVATION cell=%q, want the small-lease marker", cell)
