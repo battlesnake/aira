@@ -2238,7 +2238,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		// AIRA-62 and were simply never described.) Omitting a mode flag PRESERVES
 		// whatever the installed unit declares rather than resetting it, which is
 		// why each description says so.
-		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--ci] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--pin-charge MODE] [--pin-charge-factor F] [--cpu-slots-per-core R] [--claude-usage-mod[=off]] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
+		"install": {Name: "install", Usage: "install [--memory-max SZ] [--memory-high SZ] [--ci] [--watchdog MODE] [--watchdog-interval D] [--slice-ceiling MODE] [--pin-charge MODE] [--pin-charge-factor F] [--small-lane SIZE|off] [--small-lane-job-max SIZE] [--cpu-slots-per-core R] [--claude-usage-mod[=off]] [--allow-overcommit] [--dry-run] [--status]", Args: []ArgSpec{
 			stringSpec("memory_max", false, false, "aira.slice MemoryMax (<N>G)"),
 			boolSpec("ci", false, false, "Dedicated CI worker: size MemoryMax from a one-time MemAvailable snapshot with zero headroom; refuses with --memory-max"),
 			stringSpec("memory_high", false, false, "aira.slice MemoryHigh (<N>G)"),
@@ -2247,6 +2247,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			stringSpec("slice_ceiling", false, false, "Dynamic slice-ceiling mode; omitted keeps the installed value, or enforce when no installed value is readable", "off", "observe", "enforce"),
 			stringSpec("pin_charge", false, false, "Pinned-job charge discount (AIRA-324): enforce books a scope-backed --memory-reserve job at factor x its pin while its cap stays the pin, granting it only when the full pin fits real free memory; observe books the pin and logs what enforce would book; omitted keeps the installed value, or observe when no installed value is readable", "off", "observe", "enforce"),
 			stringSpec("pin_charge_factor", false, false, "Pinned-job charge factor, a decimal from 0.5 to 1 with at most two places (1 books the pin); omitted keeps the installed value, or 0.8"),
+			stringSpec("small_lane", false, false, ConfineSmallLaneGuidance+" The lane's size, a size such as 8G or off; omitted keeps the installed value, or 8G"),
+			stringSpec("small_lane_job_max", false, false, "Small-job lane job maximum: jobs booking at most this size use the lane, from 1M to the lane's size; omitted keeps the installed value, or 1G"),
 			stringSpec("cpu_slots_per_core", false, false, "CPU admission slots per core R, 1-64 (default 2): the daemon's CPU ceiling is R x NumCPU; omitted keeps the recorded value; refused with --stage=start and --status"),
 			boolSpec("claude_usage_mod", false, false, "Opt in: install the fixed aira-usage Claude Code mod into ~/.claude/skills/aira-usage/ (--claude-usage-mod=off removes only the files aira wrote). The mod reports each turn's token counters and the session id (never prompts or file contents) to `aira spend add`; omitted leaves an installed mod untouched; refused with --stage=start and --status"),
 			boolSpec("allow_overcommit", false, false, "Acknowledge coexistence with capped whale.slice"),
@@ -2262,6 +2264,8 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "slice_ceiling")
 			_ = stringArg(args, "pin_charge")
 			_ = stringArg(args, "pin_charge_factor")
+			_ = stringArg(args, "small_lane")
+			_ = stringArg(args, "small_lane_job_max")
 			_ = stringArg(args, "cpu_slots_per_core")
 			_ = boolArg(args, "claude_usage_mod")
 			_ = boolArg(args, "allow_overcommit")
@@ -2604,7 +2608,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			{Name: "ls-remote", Summary: "List remote refs", Safety: SafetyExecute, Args: []OperationArg{{Name: "remote"}, {Name: "refspecs"}}, Example: []string{"ls-remote", "origin"}},
 		}},
 		"run":             {summary: "Launch a subprocess in an owned scope", safety: SafetyExecute, example: []string{"--merge", "--", "printf", "hello"}},
-		"confine":         {summary: "Run a foreground subprocess in a machine-wide confined slice. " + ConfinePrioritySummary, safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
+		"confine":         {summary: "Run a foreground subprocess in a machine-wide confined slice. " + ConfinePrioritySummary + ". " + ConfineSmallLaneSummary, safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"confine-reserve": {summary: "Hold one daemon-only pinned confine reservation", safety: SafetyExecute, example: []string{"--bytes", "512M", "--pinned", "--signature", "pytest:test_example.py::test_case"}},
 		"confine-list":    {summary: "List discoverable confine scopes without fabricating unreadable fields", safety: SafetyRead, example: []string{}},
 		"confine-budget":  {summary: "Report observed peak RSS against the budget actually granted, and recommend (never apply) a change; the worst 50 actionable subjects by default", safety: SafetyRead, example: []string{}},
@@ -2629,7 +2633,7 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		// request/response tool without either fabricating success or blocking a
 		// dispatcher for up to half an hour. The example is real and runnable.
 		"drain":   {summary: "Hold the slice empty for a deploy, reusing exclusive-mode admission", safety: SafetyExecute, example: []string{"wait", "--reason", "deploy"}},
-		"install": {summary: "Install and inspect the AIRA-owned confinement slice", safety: SafetyExecute, example: []string{"--status"}},
+		"install": {summary: "Install and inspect the AIRA-owned confinement slice. " + ConfineSmallLaneSummary, safety: SafetyExecute, example: []string{"--status"}},
 		"time":    {summary: "Run a byte-transparent command and record timing", safety: SafetyExecute, example: []string{"--", "go", "test", "./..."}},
 		"commands": {summary: "Read recorded command events and exact distributions", safety: SafetyRead, operations: []OperationSpec{
 			{Name: "ls", Summary: "List recorded command events", Safety: SafetyRead, Args: []OperationArg{{Name: "query"}, {Name: "by"}}, Example: []string{"ls", "key-source:program-subcommand key:go test"}},

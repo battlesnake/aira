@@ -205,6 +205,8 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		runner.ApplyConfineScopeReserves(result.Scopes, snapshot.scopeReserves)
 		// AIRA-324. The pin beside a booking below it, from the same snapshot.
 		runner.ApplyConfineScopePins(result.Scopes, snapshot.scopePins)
+		// AIRA-350. The small-lease mark, from the same snapshot (lane on only).
+		runner.ApplyConfineScopeSmall(result.Scopes, snapshot.scopeSmall)
 		// AIRA-269. The VRAM twin, from the SAME locked snapshot: each granted
 		// scope's declared --vram (0 = "not a GPU job") onto its row, a scope the
 		// ledger holds no record for left unevaluated.
@@ -281,6 +283,14 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				// ceiling beside it. Absent for every caller that named no queued
 				// scope id, `aira confine --list` included.
 				ResolvedReserveBytes: snapshot.queuedReserveBytes,
+				// AIRA-350. The lane's figures and the probe's own diagnoses, from
+				// the same snapshot; all zero (omitted) while the lane is off.
+				LaneCapacityBytes: snapshot.laneCapacity,
+				LaneJobMaxBytes:   snapshot.laneJobMax,
+				LaneUsedBytes:     snapshot.laneUsed,
+				LaneJobs:          snapshot.laneJobs,
+				LaneWait:          snapshot.queuedLaneWait,
+				HeldByHead:        snapshot.queuedHeldByHead,
 				// AIRA-68: the same snapshot's population split, so the summary can
 				// never again be read against the Scopes table above it as though
 				// they counted the same thing.

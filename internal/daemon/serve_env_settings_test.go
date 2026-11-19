@@ -87,6 +87,23 @@ func serveEnvSettingRows() []serveEnvSetting {
 			want:  int64(67),
 			get:   func(s *Server) any { return s.pinChargePercent },
 		},
+		{
+			// AIRA-350: the raw default is off (0), so 3G is distinctive.
+			field: "smallLaneCap",
+			env:   "AIRA_DAEMON_SMALL_LANE",
+			value: "3G",
+			want:  int64(3 << 30),
+			get:   func(s *Server) any { return s.smallLaneCap },
+		},
+		{
+			// AIRA-350: read only when the lane is on (the row above); 700M is
+			// neither the default 1G nor a bound.
+			field: "smallLaneJobMax",
+			env:   "AIRA_DAEMON_SMALL_LANE_JOB_MAX",
+			value: "700M",
+			want:  int64(700 << 20),
+			get:   func(s *Server) any { return s.smallLaneJobMax },
+		},
 	}
 }
 

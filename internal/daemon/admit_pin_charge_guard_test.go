@@ -36,9 +36,13 @@ var pinChargeReserveAllowList = map[string]struct {
 	"resizeRunningConfineLocked target.charge":  {1, "--resize writes the booking"},
 	"resizeRunningConfineLocked target.reserve": {1, "--resize keeps the booking below the pin (bookingField)"},
 	// Pin sites: the grant echo, head feasibility, the physical-fit rule.
-	"admitConnection waiter.reserve":          {1, "the grant echoes the pin; the client writes it as memory.max"},
-	"admitCouldFitEmptyLocked waiter.reserve": {1, "head eligibility: the full pin must fit an empty slice"},
-	"evaluateAdmitQueue waiter.reserve":       {1, "the physical-fit rule"},
+	"admitConnection waiter.reserve":           {1, "the grant echoes the pin; the client writes it as memory.max"},
+	"admitCouldFitBesideLocked waiter.reserve": {1, "head eligibility and the AIRA-350 guard G: the full pin must fit beside the small leases' pins"},
+	"admitFitLocked waiter.reserve":            {1, "the physical-fit rule"},
+	// AIRA-350: the small leases' pins (S_pin) for guard G, and the lane grant's
+	// journal line (the pin beside the booking).
+	"plus waiter.reserve":                    {1, "S_pin, G's RAM occupancy: a scoped small lease uses at most its pin"},
+	"logSmallLaneGrantLocked waiter.reserve": {1, "the lane grant's journal line"},
 	// Display and diagnosis of the pin, never summed into the ledger.
 	"admitSliceSnapshotFor waiter.reserve":            {3, "queuedReserveBytes and the queued row's request (the pin), and the pin beside a booking below it"},
 	"logAdmitFreezeTransition holder.reserve":         {1, "the head's request in a log line"},

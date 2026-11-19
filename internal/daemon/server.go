@@ -121,6 +121,17 @@ type Server struct {
 	// every waiter at its reserve.
 	pinChargeMode    pinChargeMode
 	pinChargePercent int64
+	// AIRA-350. The small-job lane's capacity x (bytes; 0 is off) and job maximum
+	// y, read once in Serve (small_lane.go) and fixed for the daemon's lifetime.
+	// The zero value is off: a Server built without Serve (every unit test that
+	// does not set them) admits exactly as before.
+	smallLaneCap    int64
+	smallLaneJobMax int64
+	// smallLaneGrantObserver is a TEST seam (nil in production): called under
+	// queue.mu at every lane grant with the reference waiter (nil when none) and
+	// the small occupancy guard G was judged on, so a property test can check the
+	// cap, G and the one ceiling at the instant of each lane grant.
+	smallLaneGrantObserver func(queue *sliceQueue, granted, reference *admitWaiter, occ laneOccupancy, effectiveMaximum int64)
 	// S13 restart recovery (design §4). restartFreeze is how long NEW admissions are
 	// frozen from listen-ready (so a slow survivor's re-declare is not beaten to its
 	// space by a new admission); injectable (default 2s) so tests drive timing via the
@@ -427,6 +438,14 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 	if pinMode != pinChargeOff {
 		log.Printf("aira daemon: pinned-job charge discount %s (factor %s)", pinMode, runner.FormatPinChargeFactor(pinPercent))
 	}
+	// AIRA-350. The small-job lane: default mode only, never ci-shim.
+	laneCap, laneJobMax, err := smallLaneConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	laneCap, laneJobMax = smallLaneForMode(s.shimMode(), laneCap, laneJobMax)
+	s.smallLaneCap, s.smallLaneJobMax = laneCap, laneJobMax
+	log.Print(smallLaneStartupLine(laneCap, laneJobMax))
 	if len(s.Paths.SocketPath) > maxUnixSocketPath {
 		// Fail fast with a clear code instead of a cryptic bind EINVAL. In
 		// production XDG_RUNTIME_DIR is short (/run/user/<uid>); an over-long one
