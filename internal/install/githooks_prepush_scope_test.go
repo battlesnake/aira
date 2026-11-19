@@ -4,21 +4,25 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
 
-// AIRA-315 (RANT-44). The pre-push hook's docs-only fast path, driven through
-// the REAL hook files with real `git push`es (the same recording-shim harness
-// as githooks_test.go). Skipping a gate is a false-pass hazard, so most cases
-// below are pushes that must NOT skip: every look-alike, rename, deletion,
-// tag, multi-ref, stale-base and malformed-input edge falls to the full
-// `make ci`. A skip case asserts the hook's skip notice too, so "no make line"
-// cannot pass vacuously when the hook never ran.
+// AIRA-315 (RANT-44), AIRA-359. The pre-push hook's docs and tickets fast
+// paths, driven through the REAL hook files with real `git push`es (the same
+// recording-shim harness as githooks_test.go). Narrowing a gate is a
+// false-pass hazard, so most cases below are pushes that must NOT narrow:
+// every look-alike, rename, deletion, tag, multi-ref, stale-base and
+// malformed-input edge falls to the full `make ci`. A narrowed case asserts the
+// hook's notice too, so a lone make line cannot come from some other path.
 //
 // verifies: AIRA-315
+// verifies: AIRA-359
 
-const prepushSkipNotice = "make ci skipped (AIRA-315)"
+// prepushNarrowedNotice ends the notice the hook prints when it runs a
+// narrowed target set instead of `make ci`.
+const prepushNarrowedNotice = "instead of make ci (AIRA-315)"
 
 // pushFixture is a hookFixture whose linked worktree has a bare `origin` with a
 // base tree pushed as refs/heads/master and fetched, so
@@ -109,9 +113,11 @@ func (fx pushFixture) runHookDirectly(t *testing.T, stdin string) (string, error
 // as passed.
 const prepushRefusalNotice = "pre-push: refusing the push: "
 
-// expectScope asserts exactly what the hook ran: "skip" (no make at all, and
-// the skip notice printed), "refused" (AIRA-355: no make at all, the push
-// refused with its notice), or the single make target `ci` / `test-store`.
+// expectScope asserts exactly what the hook ran: "refused" (AIRA-355: no make
+// at all, the push refused with its notice), or the single make invocation
+// whose targets are want: `ci`, or a narrowed set (`test-docs`, `test-store`,
+// `test-store test-docs`) that must print the narrowed notice and must leave no
+// AIRA-355 ci-pass marker behind (only a full `make ci` may record one).
 // Every outcome but "refused" must leave the push succeeding.
 func (fx pushFixture) expectScope(t *testing.T, output string, pushErr error, want string) {
 	t.Helper()
@@ -136,21 +142,30 @@ func (fx pushFixture) expectScope(t *testing.T, output string, pushErr error, wa
 	if pushErr != nil {
 		t.Fatalf("push failed: %v\noutput:\n%s", pushErr, output)
 	}
-	if want == "skip" {
-		if len(makes) != 0 {
-			t.Fatalf("want the make ci skip, but the hook ran %q\noutput:\n%s", makes, output)
-		}
-		if !strings.Contains(output, prepushSkipNotice) {
-			t.Fatalf("no make ran but the skip notice is missing (did the hook run?)\noutput:\n%s", output)
-		}
-		return
-	}
 	wantLine := "make argv: -C " + fx.worktree + " " + want
 	if len(makes) != 1 || makes[0] != wantLine {
 		t.Fatalf("hook ran %q, want exactly %q\noutput:\n%s", makes, wantLine, output)
 	}
-	if strings.Contains(output, prepushSkipNotice) {
-		t.Fatalf("the hook ran %s but also printed the skip notice\noutput:\n%s", want, output)
+	narrowed := want != "ci"
+	if got := strings.Contains(output, prepushNarrowedNotice); got != narrowed {
+		t.Fatalf("hook ran %s; narrowed notice printed=%v, want %v\noutput:\n%s", want, got, narrowed, output)
+	}
+	if narrowed {
+		fx.expectNoCIPassMarker(t)
+	}
+}
+
+// expectNoCIPassMarker fails if the hook left any AIRA-355 marker (or marker
+// temporary) in the shared marker directory.
+func (fx pushFixture) expectNoCIPassMarker(t *testing.T) {
+	t.Helper()
+	dir := filepath.Dir(fx.markerPath(t, "x"))
+	entries, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read marker dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("a narrowed pre-push run left %d entries in %s; only a full make ci may record a pass", len(entries), dir)
 	}
 }
 
@@ -161,17 +176,17 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 		want string
 		run  func(t *testing.T, fx pushFixture) (string, error)
 	}{
-		{"docs-add", "skip", func(t *testing.T, fx pushFixture) (string, error) {
+		{"docs-add", "test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			fx.write(t, "docs/a.md", "a\n")
 			fx.commitAll(t, "docs")
 			return fx.push(t, "origin", "linked-branch")
 		}},
-		{"docs-delete", "skip", func(t *testing.T, fx pushFixture) (string, error) {
+		{"docs-delete", "test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			fx.git(t, fx.worktree, "rm", "-q", "docs/old.md")
 			fx.commitAll(t, "docs delete")
 			return fx.push(t, "origin", "linked-branch")
 		}},
-		{"docs-rename-within", "skip", func(t *testing.T, fx pushFixture) (string, error) {
+		{"docs-rename-within", "test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			fx.git(t, fx.worktree, "mv", "docs/old.md", "docs/new.md")
 			fx.commitAll(t, "docs rename")
 			return fx.push(t, "origin", "linked-branch")
@@ -181,7 +196,7 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 			fx.commitAll(t, "ticket")
 			return fx.push(t, "origin", "linked-branch")
 		}},
-		{"docs+tickets", "test-store", func(t *testing.T, fx pushFixture) (string, error) {
+		{"docs+tickets", "test-store test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			fx.write(t, "docs/a.md", "a\n")
 			fx.write(t, ".aira/tickets/T-2.md", "t2\n")
 			fx.commitAll(t, "docs and ticket")
@@ -231,16 +246,31 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 		}},
 		// The Go toolchain walks docs/ (`go list ./...` lists a package
 		// there), and fmt-check's `find . -name '*.go'` walks .aira/ too, so
-		// only Markdown is invisible to the gate: any other file type under
-		// either tree runs the full make ci.
+		// a .go file anywhere under either tree runs the full make ci. Under
+		// docs/ every other file type takes the docs scope (AIRA-359: go
+		// vet/build/test ignore a directory with no .go file); under
+		// .aira/tickets/ only Markdown does.
 		{"docs-go-file", "ci", func(t *testing.T, fx pushFixture) (string, error) {
 			fx.write(t, "docs/zz/fail_test.go", "package zz\n\nimport \"testing\"\n\nfunc TestFail(t *testing.T) { t.Fatal(\"x\") }\n")
 			fx.commitAll(t, "go under docs")
 			return fx.push(t, "origin", "linked-branch")
 		}},
-		{"docs-non-md", "ci", func(t *testing.T, fx pushFixture) (string, error) {
+		{"docs-non-md", "test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			fx.write(t, "docs/dev/x.sh", "#!/bin/sh\n")
-			fx.commitAll(t, "script under docs")
+			fx.write(t, "docs/dev/x.py", "print(1)\n")
+			fx.write(t, "docs/dev/x.out.txt", "1\n")
+			fx.commitAll(t, "scripts under docs")
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"docs-go-test-file-deep", "ci", func(t *testing.T, fx pushFixture) (string, error) {
+			fx.write(t, "docs/dev/x.sh", "#!/bin/sh\n")
+			fx.write(t, "docs/dev/deep/x_test.go", "package deep\n")
+			fx.commitAll(t, "script and go under docs")
+			return fx.push(t, "origin", "linked-branch")
+		}},
+		{"tickets-non-md", "ci", func(t *testing.T, fx pushFixture) (string, error) {
+			fx.write(t, ".aira/tickets/T-2.txt", "t\n")
+			fx.commitAll(t, "non-md ticket")
 			return fx.push(t, "origin", "linked-branch")
 		}},
 		{"docs-go-under-md-dir", "ci", func(t *testing.T, fx pushFixture) (string, error) {
@@ -323,7 +353,7 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 			fx.commitAll(t, "docs off the old tip")
 			return fx.push(t, "origin", "old-docs")
 		}},
-		{"docs-on-current-master-tip", "skip", func(t *testing.T, fx pushFixture) (string, error) {
+		{"docs-on-current-master-tip", "test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			// Control for the case above: after master moves and is fetched,
 			// a docs commit on the NEW tip does skip.
 			fx.write(t, "src/b.txt", "b\n")
@@ -387,19 +417,19 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 		// The tickets count spans every ref line: one tickets ref anywhere in
 		// the push selects the store tier, whichever order git writes the lines
 		// (branch-one sorts first on stdin).
-		{"two-refs-tickets-docs", "test-store", func(t *testing.T, fx pushFixture) (string, error) {
+		{"two-refs-tickets-docs", "test-store test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			ticketsA, docsB := twoBranches(t, fx, ".aira/tickets/T-2.md", "docs/a.md")
 			return fx.push(t, "origin", ticketsA, docsB)
 		}},
-		{"two-refs-docs-tickets", "test-store", func(t *testing.T, fx pushFixture) (string, error) {
+		{"two-refs-docs-tickets", "test-store test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			docsA, ticketsB := twoBranches(t, fx, "docs/a.md", ".aira/tickets/T-2.md")
 			return fx.push(t, "origin", docsA, ticketsB)
 		}},
-		{"two-refs-docs", "skip", func(t *testing.T, fx pushFixture) (string, error) {
+		{"two-refs-docs", "test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			first, second := twoBranches(t, fx, "docs/a.md", "docs/b.md")
 			return fx.push(t, "origin", first, second)
 		}},
-		{"head-refspec", "skip", func(t *testing.T, fx pushFixture) (string, error) {
+		{"head-refspec", "test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			fx.write(t, "docs/a.md", "a\n")
 			fx.commitAll(t, "docs")
 			return fx.push(t, "origin", "HEAD:refs/heads/x")
@@ -417,7 +447,7 @@ func TestPrePushHookFastPathIsFailClosed(t *testing.T) {
 			docsA, _ := twoBranches(t, fx, "docs/a.md", "docs/b.md")
 			return fx.runHookDirectly(t, refLine(t, fx, docsA)+" extra\n")
 		}},
-		{"stdin-docs-control", "skip", func(t *testing.T, fx pushFixture) (string, error) {
+		{"stdin-docs-control", "test-docs", func(t *testing.T, fx pushFixture) (string, error) {
 			// The control for the two above: the same well-formed docs line
 			// alone does skip, so their "ci" is the malformation's doing.
 			docsA, _ := twoBranches(t, fx, "docs/a.md", "docs/b.md")
@@ -457,19 +487,109 @@ func refLine(t *testing.T, fx pushFixture, branch string) string {
 	return "refs/heads/" + branch + " " + sha + " refs/heads/" + branch + " " + strings.Repeat("0", len(sha))
 }
 
-// TestMakefileTestStoreTargetRunsTheStoreTests pins the target the tickets tier
-// calls, so the hook cannot name a target the Makefile does not have.
-func TestMakefileTestStoreTargetRunsTheStoreTests(t *testing.T) {
+// TestPrePushNarrowedRunFailureFailsThePush: a narrowed target that fails (a
+// docs file naming the deleted prior fails test-docs) must fail the push, as a
+// failing make ci does. The make shim exits 1 here.
+func TestPrePushNarrowedRunFailureFailsThePush(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, path, want string }{
+		{"docs", "docs/dev/a.md", "test-docs"},
+		{"tickets", ".aira/tickets/T-2.md", "test-store"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fx := newPushFixture(t)
+			fx.env = append(append([]string(nil), fx.env...), "AIRA_TEST_MAKE_SHIM_EXIT=1")
+			fx.write(t, tc.path, "x\n")
+			fx.commitAll(t, tc.name)
+			output, err := fx.push(t, "origin", "linked-branch")
+			if err == nil {
+				t.Fatalf("the narrowed %s run failed but the push succeeded\noutput:\n%s", tc.want, output)
+			}
+			wantLine := "make argv: -C " + fx.worktree + " " + tc.want
+			if makes := fx.makeLines(t); len(makes) != 1 || makes[0] != wantLine {
+				t.Fatalf("hook ran %q, want exactly %q\noutput:\n%s", makes, wantLine, output)
+			}
+			fx.expectNoCIPassMarker(t)
+		})
+	}
+}
+
+func (fx pushFixture) makeLines(t *testing.T) []string {
+	t.Helper()
+	var makes []string
+	for _, line := range fx.logLines(t) {
+		if strings.HasPrefix(line, "make argv: ") {
+			makes = append(makes, line)
+		}
+	}
+	return makes
+}
+
+// TestMakefileNarrowedPrePushTargets pins the targets the docs and tickets
+// scopes call (AIRA-359): each runs exactly one named test of one package, the
+// named test exists there (`go test -run` on a renamed test passes with "no
+// tests to run", a silent false pass), and neither recipe goes through
+// .githooks/ci-pass, the only writer of the AIRA-355 tree-pass marker.
+func TestMakefileNarrowedPrePushTargets(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("make"); err != nil {
 		t.Skipf("make unavailable: %v", err)
 	}
-	cmd := exec.Command("make", "-n", "-C", repositoryRoot(t), "test-store")
-	out, err := cmd.CombinedOutput()
+	root := repositoryRoot(t)
+	runFlag := regexp.MustCompile(`-run '\^([A-Za-z0-9_]+)\$'`)
+	for _, tc := range []struct{ target, pkg, test string }{
+		{"test-store", "./internal/store", "TestTheRepositorysOwnTicketFilesAreReadable"},
+		{"test-docs", "./internal/daemon", "TestNoLiveCodeOrDocNamesTheDeletedPrior"},
+	} {
+		t.Run(tc.target, func(t *testing.T) {
+			t.Parallel()
+			out, err := exec.Command("make", "-n", "-C", root, tc.target).CombinedOutput()
+			if err != nil {
+				t.Fatalf("make -n %s: %v\n%s", tc.target, err, out)
+			}
+			var lines []string
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				if !strings.HasPrefix(line, "make") {
+					lines = append(lines, line)
+				}
+			}
+			if len(lines) != 1 {
+				t.Fatalf("%s runs %d commands, want exactly one go test:\n%s", tc.target, len(lines), out)
+			}
+			line := lines[0]
+			if strings.Contains(line, "ci-pass") {
+				t.Fatalf("%s goes through ci-pass, which records a tree-pass marker:\n%s", tc.target, line)
+			}
+			if !strings.Contains(line, " test "+tc.pkg+" ") {
+				t.Fatalf("%s does not run %s:\n%s", tc.target, tc.pkg, line)
+			}
+			runs := runFlag.FindAllStringSubmatch(line, -1)
+			if len(runs) != 1 || runs[0][1] != tc.test {
+				t.Fatalf("%s must run exactly -run '^%s$':\n%s", tc.target, tc.test, line)
+			}
+			if !packageDeclaresTest(t, filepath.Join(root, tc.pkg), tc.test) {
+				t.Fatalf("%s names %s, which %s does not declare", tc.target, tc.test, tc.pkg)
+			}
+		})
+	}
+}
+
+func packageDeclaresTest(t *testing.T, dir, name string) bool {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, "*_test.go"))
 	if err != nil {
-		t.Fatalf("make -n test-store: %v\n%s", err, out)
+		t.Fatal(err)
 	}
-	if !strings.Contains(string(out), "test ./internal/store ") {
-		t.Fatalf("test-store does not run the internal/store tests:\n%s", out)
+	decl := regexp.MustCompile(`(?m)^func ` + regexp.QuoteMeta(name) + `\(t \*testing\.T\) \{`)
+	for _, file := range files {
+		body, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decl.Match(body) {
+			return true
+		}
 	}
+	return false
 }

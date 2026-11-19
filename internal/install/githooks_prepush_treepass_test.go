@@ -131,8 +131,8 @@ func (fx pushFixture) expectTreePass(t *testing.T, output string, pushErr error,
 			t.Fatalf("missing skip notice %q\noutput:\n%s", want, output)
 		}
 	}
-	if strings.Contains(output, prepushSkipNotice) {
-		t.Fatalf("the tree-pass skip printed the docs fast-path notice\noutput:\n%s", output)
+	if strings.Contains(output, prepushNarrowedNotice) {
+		t.Fatalf("the tree-pass skip printed the narrowed fast-path notice\noutput:\n%s", output)
 	}
 }
 

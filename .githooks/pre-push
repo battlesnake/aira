@@ -4,19 +4,27 @@ set -euo pipefail
 # shellcheck source=common.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 
-# AIRA-315 (RANT-44): a push that changes only Markdown under docs/ skips
-# `make ci`, and one that changes only Markdown under docs/ and .aira/tickets/
-# runs only the internal/store tests (the package that parses the repository's
-# own ticket files). Skipping a gate is a false-pass hazard, so the classifier
-# is FAIL-CLOSED: it prints exactly `docs` or `tickets` and returns 0 only when
-# every condition below is proven for every ref line git hands it; anything
-# else (a git error, an empty push, a tag, a deletion, an unresolvable base, a
-# branch not on top of origin/master, any path that is not docs/*.md or
-# .aira/tickets/*.md) runs the full `make ci` exactly as before. Design:
-# invariant I5 of docs/superpowers/specs/2026-10-25-rant-small-batch-design.md.
+# AIRA-315 (RANT-44), AIRA-359: a push that changes only non-Go files under
+# docs/ and Markdown under .aira/tickets/ runs, instead of `make ci`, only the
+# one named test that reads those files: `make test-docs` (the whole-tree text
+# test) when it touches docs/, `make test-store` (the test that parses the
+# repository's own ticket files) when it touches .aira/tickets/, both when it
+# touches both. Narrowing a gate is a false-pass hazard, so the classifier is
+# FAIL-CLOSED: it prints exactly `docs`, `tickets` or `docs+tickets` and
+# returns 0 only when every condition below is proven for every ref line git
+# hands it; anything else (a git error, an empty push, a tag, a deletion, an
+# unresolvable base, a branch not on top of origin/master, any .go file, any
+# path that is not under docs/ or Markdown under .aira/tickets/) runs the full
+# `make ci` exactly as before. A narrowed run never records an AIRA-355
+# tree-pass marker (its targets do not go through .githooks/ci-pass). Like
+# `make ci`, it tests the CHECKED-OUT tree, not the pushed commits; CI is the
+# gate for the pushed tree. Design: invariant I5 of
+# docs/superpowers/specs/2026-10-25-rant-small-batch-design.md.
 #
-# Only Markdown: the Go toolchain walks docs/ (a .go file there is a package
+# No .go file: the Go toolchain walks docs/ (a .go file there is a package
 # `go test ./...` builds), and fmt-check's `find . -name '*.go'` walks .aira/.
+# go vet/build/test ignore a directory with no .go file, so any other file
+# under docs/ is invisible to them. Under .aira/tickets/ only Markdown.
 #
 # The base is origin/master's TIP, and a ref is judged only when that tip is an
 # ancestor of it: an older master commit may never have been tested on its own
@@ -32,7 +40,7 @@ set -euo pipefail
 aira_prepush_scope() {
 	local root="$1" base_ref=refs/remotes/origin/master
 	local input _local_ref local_sha remote_ref remote_sha extra base changed path
-	local refs=0 tickets=0 paths
+	local refs=0 tickets=0 docs=0 paths
 	base="$(git -C "$root" rev-parse --verify --quiet "$base_ref^{commit}")" || return 1
 	[ -n "$base" ] || return 1
 	# All of stdin first: `read` would drop a final line with no newline, and an
@@ -50,7 +58,11 @@ aira_prepush_scope() {
 		while IFS= read -r path; do
 			case "$path" in
 			"") ;;
-			docs/?*.md) paths=$((paths + 1)) ;;
+			*.go) return 1 ;;
+			docs/?*)
+				paths=$((paths + 1))
+				docs=$((docs + 1))
+				;;
 			.aira/tickets/?*.md)
 				paths=$((paths + 1))
 				tickets=$((tickets + 1))
@@ -62,7 +74,13 @@ aira_prepush_scope() {
 		refs=$((refs + 1))
 	done <<<"$input"
 	[ "$refs" -gt 0 ] || return 1
-	if [ "$tickets" -gt 0 ]; then echo tickets; else echo docs; fi
+	if [ "$tickets" -gt 0 ] && [ "$docs" -gt 0 ]; then
+		echo docs+tickets
+	elif [ "$tickets" -gt 0 ]; then
+		echo tickets
+	else
+		echo docs
+	fi
 }
 
 # AIRA-355: the FULL scope skips `make ci` only when every pushed ref line is a
@@ -138,12 +156,16 @@ else
 fi
 case "$scope" in
 docs)
-	printf 'pre-push: every pushed path is Markdown under docs/ (against origin/master); make ci skipped (AIRA-315).\n' >&2
-	exit 0
+	printf 'pre-push: every pushed path is a non-Go file under docs/ (against origin/master); running only make test-docs instead of make ci (AIRA-315).\n' >&2
+	aira_hook_run_make pre-push normal test-docs
 	;;
 tickets)
-	printf 'pre-push: every pushed path is Markdown under docs/ or .aira/tickets/ (against origin/master); running only the internal/store tests (AIRA-315).\n' >&2
+	printf 'pre-push: every pushed path is Markdown under .aira/tickets/ (against origin/master); running only make test-store instead of make ci (AIRA-315).\n' >&2
 	aira_hook_run_make pre-push normal test-store
+	;;
+docs+tickets)
+	printf 'pre-push: every pushed path is a non-Go file under docs/ or Markdown under .aira/tickets/ (against origin/master); running only make test-store test-docs instead of make ci (AIRA-315).\n' >&2
+	aira_hook_run_make pre-push normal test-store test-docs
 	;;
 esac
 

@@ -116,14 +116,15 @@ func newHookFixture(t *testing.T) hookFixture {
 	}
 
 	// `make` records the -C directory it was told to build and the GIT_*
-	// variables still visible to it, then succeeds.
+	// variables still visible to it, then succeeds (or exits with
+	// AIRA_TEST_MAKE_SHIM_EXIT, for a test of a failing step).
 	writeShim(t, filepath.Join(binDir, "make"), `#!/usr/bin/env bash
 {
   echo "make argv: $*"
   echo "make cwd: $PWD"
   for v in ${!GIT_@}; do echo "make leaked-git-env: $v"; done
 } >> "`+logPath+`"
-exit 0
+exit "${AIRA_TEST_MAKE_SHIM_EXIT:-0}"
 `)
 	// `aira` records that it was asked to confine, then runs the real command
 	// so the hook's end-to-end shape (confine wrapping make) is exercised.
