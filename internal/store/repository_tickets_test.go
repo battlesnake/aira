@@ -62,11 +62,11 @@ func TestTheRepositorysOwnTicketFilesAreReadable(t *testing.T) {
 	// derives relation views, and that derivation rescans every ticket file, so a
 	// Get per ticket made this walk quadratic (70 s at 353 tickets). The scan
 	// applies the same per-file checks Get does (regular-file read, ParseTicket,
-	// the id/filename match) plus project and duplicate-id checks Get lacks. The
-	// only per-ticket work Get adds is the relation derivation, which is a global
-	// scan that reports integrity problems as warnings rather than errors, so no
-	// error that a Get loop could raise is lost; the named Gets below still
-	// exercise that derivation. The scan skips dot-files, so the count is pinned
+	// the id/filename match) plus project and duplicate-id checks Get lacks. Get
+	// also runs selector processing, an indexed-digest query and the relation
+	// derivation, each of which can return errors; the named Gets below keep that
+	// coverage for the tickets they name, and an unnamed ticket loses its individual
+	// Get-path coverage (accepted residual, AIRA-358). The scan skips dot-files, so the count is pinned
 	// against the copied ids as well.
 	scanned, findings, _, inconclusive, err := scanTickets(root, s.worktreeID, s.projectSlug)
 	if err != nil || inconclusive {

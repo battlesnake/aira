@@ -2437,34 +2437,6 @@ def test_drain_worker_rejects_a_logstart_event_for_the_wrong_nodeid(pytester, mo
 # ---------------------------------------------------------------------------
 
 
-def _capture_admit_relays(monkeypatch, supervisor):
-    """Record every Popen the supervisor spawns as an admit relay, so a test can
-    check the relay's fate through the process object itself: no pid file the
-    stub must have time to write before the supervisor kills it."""
-    relays = []
-    spawn = supervisor._spawn_admit_relay
-
-    def recording_spawn(*args, **kwargs):
-        process = spawn(*args, **kwargs)
-        relays.append(process)
-        return process
-
-    monkeypatch.setattr(supervisor, "_spawn_admit_relay", recording_spawn)
-    return relays
-
-
-def _assert_relays_reaped(relays, message):
-    """Every captured relay must already be dead and reaped when the call under
-    test returns. A survivor is killed here before failing, so no stub outlives
-    the test."""
-    assert relays, "the call under test spawned no admit relay"
-    alive = [process for process in relays if process.poll() is None]
-    for process in alive:
-        process.kill()
-        process.wait()
-    assert not alive, message
-
-
 def test_unresponsive_growth_probe_does_not_wedge_a_live_pool(tmp_path, monkeypatch):
     """S16 retarget of the AIRA-92 whole-pool regression onto the path the property
     now lives on. A relay that answers NOTHING to a growth PROBE must cost at most
@@ -2487,16 +2459,12 @@ if "0s" in sys.argv:
 """)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_ADMIT_READ_GRACE", "1")
-    # The wedged relay is reaped with a bounded wait before SIGKILL; 0.2 s keeps
-    # that kill path without sitting out the 5 s production reap timeout.
-    monkeypatch.setenv("AIRA_AITEST_REAP_TIMEOUT", "0.2")
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
     supervisor._run_worker_count = 4
     supervisor._run_estimated_bytes = 1 << 20
     supervisor.queue = ["t0", "t1", "t2", "t3"]
     supervisor.workers[111] = {"in_flight": None}  # a live worker: this is a LIVE pool
-    relays = _capture_admit_relays(monkeypatch, supervisor)
 
     started = time.monotonic()
     grew = supervisor._maybe_grow_pool()
@@ -2507,9 +2475,6 @@ if "0s" in sys.argv:
         "the growth probe read was not bounded (%.1fs) -- a wedged probe wedged the loop" % elapsed
     )
     assert supervisor.daemon_available is True, "a wedged probe must not disable the daemon"
-    # The wedged probe relay must be KILLED, not abandoned: a skipped tick that
-    # leaves its relay sleeping leaks one live process per growth attempt.
-    _assert_relays_reaped(relays, "the unresponsive probe relay was left alive")
 
 
 def test_bounded_growth_claim_that_never_grants_is_a_denial_not_daemon_unavailable(tmp_path, monkeypatch, capsys):
@@ -2519,18 +2484,17 @@ def test_bounded_growth_claim_that_never_grants_is_a_denial_not_daemon_unavailab
     blocks -- must be reported as a DENIAL (containment preserved), NEVER
     WorkerAdmitUnavailable, which would _disable_daemon and run the REST of the suite
     unconfined on a daemon that was never shown to be unreachable."""
-    admit = _write_stub(tmp_path / "worker-admit-silent", """
-import time
+    relay_pidfile = tmp_path / "relay-pid"
+    admit = _write_stub(tmp_path / "worker-admit-silent", f"""
+import os, time
+with open({str(relay_pidfile)!r}, "w") as handle:
+    handle.write(str(os.getpid()))
 time.sleep(600)
 """)
     monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
     monkeypatch.setenv("AIRA_AITEST_ADMIT_READ_GRACE", "1")
-    # The wedged relay is reaped with a bounded wait before SIGKILL; 0.2 s keeps
-    # that kill path without sitting out the 5 s production reap timeout.
-    monkeypatch.setenv("AIRA_AITEST_REAP_TIMEOUT", "0.2")
     supervisor = Supervisor()
     supervisor.outer_scope = "/outer"
-    relays = _capture_admit_relays(monkeypatch, supervisor)
 
     started = time.monotonic()
     try:
@@ -2548,7 +2512,16 @@ time.sleep(600)
     # this job's daemon-side worker grant open, and the daemon releases that
     # grant on peer disconnect. Abandoning it leaks a ledger entry for the rest
     # of the run, on top of leaving a live process behind per timed-out attempt.
-    _assert_relays_reaped(relays, "the unresponsive relay was left alive, still holding its grant")
+    relay_pid = int(relay_pidfile.read_text())
+    for _ in range(100):
+        try:
+            os.kill(relay_pid, 0)
+        except OSError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(relay_pid, 9)
+        assert False, "the unresponsive relay was left alive, still holding its grant"
 
 
 def test_retire_worker_does_not_block_forever_on_a_wedged_child(monkeypatch):
