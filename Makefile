@@ -76,17 +76,27 @@ dist:
 # those firing in one package can approach go test's silent 10m default, which aborts
 # the whole binary with a goroutine dump and hides the named failure the backstops
 # exist to produce. -race multiplies both the run time and the backstops.
+#
+# AIRA-357. TEST_TMPDIR runs go test with TMPDIR on a short per-run tmpfs
+# directory (/dev/shm/t.XXXX) on a local box, and unchanged under CI (CI set)
+# or when /dev/shm is missing or short of space; the store's synchronous(FULL)
+# fsyncs dominate these suites on the WSL disk (measured: internal/store
+# 656 s -> 124 s, internal/daemon 343 s -> 132 s). The script's header has the
+# rules, the fallback threshold and the stale-directory sweep that cleans up
+# after a hard-killed run. `AIRA_TEST_TMPFS=0 make test` opts out for one run.
+TEST_TMPDIR := bash .githooks/test-tmpdir
+
 test:
-	$(GO) test ./... -count=1 -timeout 20m
+	$(TEST_TMPDIR) $(GO) test ./... -count=1 -timeout 20m
 
 # AIRA-315. Called by .githooks/pre-push when every pushed path is under docs/
 # or .aira/tickets/: internal/store is the package that parses the repository's
 # own ticket files (TestTheRepositorysOwnTicketFilesAreReadable).
 test-store:
-	$(GO) test ./internal/store -count=1 -timeout 20m
+	$(TEST_TMPDIR) $(GO) test ./internal/store -count=1 -timeout 20m
 
 race:
-	$(GO) test ./... -race -count=1 -timeout 40m
+	$(TEST_TMPDIR) $(GO) test ./... -race -count=1 -timeout 40m
 
 cover:
 	$(GO) test ./... -coverprofile=coverage.out -timeout 20m
@@ -146,4 +156,4 @@ ci:
 
 install-hooks:
 	git config core.hooksPath .githooks
-	chmod +x .githooks/pre-commit .githooks/pre-push .githooks/ci-pass
+	chmod +x .githooks/pre-commit .githooks/pre-push .githooks/ci-pass .githooks/test-tmpdir

@@ -150,6 +150,42 @@ type ceilingCgroupFixture struct {
 	exited chan struct{}
 }
 
+// tmpfsMagic is TMPFS_MAGIC from linux/magic.h (the statfs f_type of tmpfs).
+const tmpfsMagic = 0x01021994
+
+// ceilingFixtureDiskDir returns the directory the helper's "file" growth is
+// written to. AIRA-357: it must be on a DISK filesystem, never tmpfs. The
+// fixture models reclaimable PAGE CACHE, and a file on tmpfs is shared memory,
+// which the cgroup charges as non-reclaimable. Measured on /dev/shm:
+// TestSliceCeilingRealCgroupFixtureSurvivesWorstCaseGrowth saw a 3.16 GB
+// non-reclaimable footprint against the modelled 2.16 GB, and
+// TestSliceCeilingRealCgroupSignalTracksRealAccounting saw 629 MB of "page
+// cache growth" move the anon signal by 629 MB. A local `make test` points
+// TMPDIR at /dev/shm (.githooks/test-tmpdir) and names the original disk
+// directory in AIRA_TEST_DISK_TMPDIR; without that variable the normal temp
+// dir is used. A tmpfs directory fails the test rather than letting it judge
+// the wrong kind of memory.
+func ceilingFixtureDiskDir(t *testing.T) string {
+	t.Helper()
+	base := os.Getenv("AIRA_TEST_DISK_TMPDIR")
+	if base == "" {
+		base = os.TempDir()
+	}
+	dir, err := os.MkdirTemp(base, "aira-ceiling-")
+	if err != nil {
+		t.Fatalf("create the fixture's disk directory under %s: %v", base, err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		t.Fatalf("statfs %s: %v", dir, err)
+	}
+	if st.Type == tmpfsMagic {
+		t.Fatalf("%s is on tmpfs: the fixture's file growth must be real page cache on a disk filesystem; point AIRA_TEST_DISK_TMPDIR (or TMPDIR) at a disk directory", dir)
+	}
+	return dir
+}
+
 func newCeilingCgroupFixture(t *testing.T) *ceilingCgroupFixture {
 	t.Helper()
 	parent := cgrouptest.IsolatedScopeParent(t)
@@ -174,7 +210,7 @@ func newCeilingCgroupFixture(t *testing.T) *ceilingCgroupFixture {
 	}
 	defer scopeFD.Close()
 
-	dir := t.TempDir()
+	dir := ceilingFixtureDiskDir(t)
 	cmd := exec.Command(os.Args[0], "-test.run=^TestSliceCeilingAllocHelper$")
 	cmd.Env = append(os.Environ(),
 		"AIRA_SLICE_CEILING_HELPER=1",
