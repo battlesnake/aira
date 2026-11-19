@@ -1,6 +1,6 @@
 # Small-job lane (AIRA-350): appendix, history and superseded designs
 
-Companion to `2026-11-18-fixed-small-lane-design.md` (round 4). Nothing here is part of the
+Companion to `2026-11-18-fixed-small-lane-design.md` (round 6). Nothing here is part of the
 decided design; it records why earlier forms were dropped, so they are not re-proposed. The full
 round-3 text is `git show 0bca5aab:docs/superpowers/specs/2026-11-18-fixed-small-lane-design.md`.
 The withdrawn dynamic lane is `2026-11-18-small-job-lane-design.md` (four rounds, not approved).
@@ -14,7 +14,8 @@ The withdrawn dynamic lane is `2026-11-18-small-job-lane-design.md` (four rounds
 | Fixed lane, round 2 | A partition: the lane out of the ceiling and gated on the whole-slice fit `W` | Review: 2 P1 and 6 P2, of which six of the eight substantive findings were fix-induced (families A, C). Sol was OOM-killed at its 1 GiB cap. |
 | Fixed lane, round 3 | The fork stated with a proof; rows A-D (below); derived pools; blocked on the owner | Superseded by the owner's 2026-11-19 decision. |
 | Round 4 | Priority and a cap of `x` inside the one ceiling, guard G | Review: 3 P1, 12 P2 (§A7). |
-| Round 5 | Round 4 with its review fixed; the pre-pass skipped while a queued sub-reservation fits | This spec. |
+| Round 5 | Round 4 with its review fixed; the pre-pass skipped while a queued sub-reservation fits | Review: 7 P2, no P1 (§A9). |
+| Round 6 | Round 5 with its review fixed: guarantee premise and R11, R10, test oracles, yield range | This spec. |
 
 ## A2. Why round 4 drops what it drops
 
@@ -126,10 +127,11 @@ a residual with its witness, not patched.
 - **Yield biases in full.** Upward: no ceiling-room gate (a hold proves room for one withheld job,
   not for all the replay admits); no CPU gate in the first two rows; the 20-row retention cap thins
   small jobs (186 signatures at the cap, M), so lane occupancy is understated; servers absent
-  (replay 1b). G never bound in RAM, so leaving it out biases nothing. Downward: in the hold-gated
-  rows, small jobs taking freed room before earlier larger waiters outside holds; small jobs moved
-  to the lane leave room for others. CPU rows: replay 1e's slot model (5 retained jobs ran at the
-  incident, M; 32 reported, R); `x = 8` buys 9-10 points over 4 without a CPU limit, 4 at 24 unseen
+  (replay 1b); suite parents keep their historical waits, so the wait the lane adds to them (R10)
+  is not netted out. G never bound in RAM, so leaving it out biases nothing. Downward: in the
+  hold-gated rows, small jobs taking freed room before earlier larger waiters outside holds; small
+  jobs moved to the lane leave room for others. CPU rows: replay 1e's slot model (5 retained jobs
+  ran at the incident, M; 32 reported, R); `x = 8` buys 9-10 points over 4 without a CPU limit, 4 at 24 unseen
   slots, 0 at 27 (E). Why the hold-gated row: a hold is the one state in which today's evaluator
   withholds a job that fits (`admit.go:2762-2769`); outside holds the lane only reorders who gets
   freed room. The journal records no bookings or room at grant, so no row gates on ceiling room.
@@ -137,3 +139,37 @@ a residual with its witness, not patched.
   release rate (about 2.7 GB/min, round-3 query part 4). They assumed small-job turnover reaches the
   head, which the pre-pass prevents while small demand lasts. Round 4's acceptance threshold
   ("large-job wait rises by at most 1.4 min, R1's p90") went with them.
+
+## A9. Round 5 review (7 findings, all P2) and round 6's disposition
+
+Every finding was checked against the code at `45f68afd` (the worktree's `internal/` and `cmd/`
+are identical to it) and against the replay; every one held, none is rejected. Four were
+fix-induced, written in round 5 (`e663dd4a`): T24's fixture, T7a's extra pass, the 0-30% yield
+claim and R6's containment ceiling. T6's unspecified budget dates from round 4 and survived round
+5's rewrite. The guarantee's missing premise and R10 date from round 4. By root cause:
+
+| Family | Findings | Root cause | Disposition (round 6) |
+|---|---|---|---|
+| G, guarantee premises | The guarantee omitted the RAM physical floor. Witness: `E` 45056, head 40960, small pins 1792 at equality with `H(4)` 2304, real use 2048 (256 in no lease), room 40704 | §2.3 argued on the ledger and pins, but today's fit charges `max(effectiveCurrent, outstanding)` (`admit.go:2906-2921`) | Premise added to §2.3; R11 with the operator's view (`slice_current_bytes`, `slice_reclaimable_bytes`, `confine_manage.go:758-759`); T4e |
+| T, test oracles | T6 and T24 pass 3 ignored the main fallback: a fresh budget grants the `kept` waiter in main (`admit.go:2688-2697`). T24's fixture gave room 40832, not 10000. T7a added a pass: once a pushed head is granted no head is left, so the main walk grants fitting small waiters in the same pass | Rows hand-computed against the intent, not the pseudo-code (the same family as round 4's T) | The seam defines "budget spent" (`bypassed` at budget, hold phase, no backstop), and T6 uses it. T24 gains a 30768 main lease and asserts the fallback grant (`bypassed` 512). T7a and §2.2 assert the same-pass main grant. Three new mutation entries |
+| Y, yield | 0-30% conflated occupied slots with the replay's window-wide unseen-slot allowance (`aira-350-fixed-lane-replay.py:266-268`) | An instantaneous count read as a window-wide parameter | §7 states a 0-84% range with conditional rows and picks none. The 24-slot row (29 occupied beside the incident's 5 retained jobs) gives 65-69% |
+| W, wording | R6 cited the retired AIRA-15 containment ceiling | A stale code comment (`admit.go:1189-1192`) was trusted over `protocol.go:133-136` and `confine_linux.go:1121-1137` | R6 says the parent's cap is its pin, at or above its booking (discount, resize, `confine_resize.go:124-127`). The stale comment is left for the build to correct |
+| P, price of priority | Missed residual: small jobs the lane does not serve are passed by every later eligible job | Excluding parents was costed only for their workers | R10 with its witness and a veto; a §7 bias; §8 counts parents in "small" and reports them alone (base about 81 s per job: 20.4 h over 903 rows) |
+
+**Re-derived here:** T24: `45056 - H(3) - (2048 + 30768) = 10000`; eight grants leave `10000 - 8 x
+1088 = 1296`; pass 2 `1296 + 2112 = 3408`, A's grant back to 1296; pass 3 `1296 + 1088 = 2384`;
+G against B `45056 - H(9) - 7680 = 34752`; the veto form stops at 5 (`45056 - H(7) - 6144 = 36416
+< 36864`). T6 from `vramAdmitAvailable` (`vram.go:53-63`): pass 1 G 16384 then 12288, pass 2 head
+fit `min(21504, 19456 - 1024) - 2048 = 16384`. T4e: `45056 - H(4) - max(2048, 1792) = 40704`.
+Acceptance bases: `128.2 h / 9281 = 49.7 s`, `83.7 h / 2660 = 113.3 s` (replay §0). No replay was
+re-run; every figure in §7 is from the committed `.out.txt`.
+
+**Non-convergence check.** Round 6 is the second fix round of the owner's design. Severity fell
+(round 4: 3 P1; round 5: none), and no finding shows the design unsound: the one ceiling, the cap,
+the host bound and G hold; the findings are a missing premise, two missed or misstated residuals,
+a misread replay parameter and oracle arithmetic. Family T has now recurred in two reviews: oracle
+rows computed by hand in prose. The change that removes it is to compute them by running the seam,
+which is the build's first, RED-first step; another prose round cannot. Recommendation: put the
+residuals (§4) and the build order to the plan gate and the owner now, and let the build's seam
+tests settle oracle arithmetic, with any oracle the build finds wrong corrected in the spec in the
+same PR.
