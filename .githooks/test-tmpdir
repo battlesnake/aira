@@ -61,6 +61,13 @@ AIRA_TEST_TMPFS_OWNER_VERSION='aira-test-tmpdir v1'
 # fixture's files on disk. 1 GiB is about 9 times that, so a run neither fills
 # /dev/shm (failing tests for a reason unrelated to the code) nor takes the
 # last of the box's shared memory. AIRA_TEST_TMPFS_MIN_KB overrides it.
+# Reproduce: while `aira confine -- make test` runs, sample
+# `du -sk /dev/shm/t.????` every 2 s and keep the maximum. The speed-up
+# reproduces as `aira confine -- make test` against
+# `AIRA_TEST_TMPFS=0 aira confine -- make test` (2026-11-19, load average
+# 30-100: whole run 10m27s and 12m05s on disk, 3m14s and 3m41s on tmpfs;
+# internal/store 596-717 s -> 101-105 s, internal/daemon 321-351 s ->
+# 129-135 s).
 AIRA_TEST_TMPFS_DEFAULT_MIN_KB=1048576
 
 # aira_test_proc_start <pid> prints the start time of <pid> (field 22 of
