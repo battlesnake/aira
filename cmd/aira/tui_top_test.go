@@ -659,12 +659,19 @@ func (d *topSmokeDispatcher) Dispatch(_ context.Context, scope daemon.WorktreeSc
 		SliceCurrentBytes: 8 * gib, SliceMaxBytes: 32 * gib,
 		SliceHighBytes: 28 * gib, SliceHighState: runner.ConfineSliceHighSet,
 		GrantedBytes: 10 * gib, CeilingBytes: 20 * gib, Jobs: 2, ScopeJobs: 2, FreezePhase: "idle",
+		// AIRA-361: the small-job lane is on and holds bravo.
+		GrantedEstablished: true, LaneCapacityBytes: 8 * gib, LaneJobMaxBytes: gib, LaneUsedBytes: gib, LaneJobs: 1,
 	}, topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 3*gib),
-		topTestRecord("CONFINE-bravo-102-bb", "bravo", 6*gib, 5*gib)))
+		topSmallRecord(topTestRecord("CONFINE-bravo-102-bb", "bravo", gib, gib/2))))
 	if err != nil {
 		return core.Response{Code: "E_INTERNAL", Error: err.Error()}
 	}
 	return core.Response{OK: true, Code: "OK", RawData: raw}
+}
+
+func topSmallRecord(record runner.ConfineRecord) runner.ConfineRecord {
+	record.Small = true
+	return record
 }
 
 func (d *topSmokeDispatcher) snapshot() (int, []string) {
@@ -699,7 +706,7 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 		rendered = runtime.topBar.GetText(true)
 		return strings.Contains(rendered, "total ")
 	}, "the top bar never rendered its totals")
-	if !strings.Contains(rendered, "total 65536M") || !strings.Contains(rendered, "soft (memory.high) 28672M") {
+	if !strings.Contains(rendered, "total 65536M") || !strings.Contains(rendered, "┊ soft 28672M") {
 		t.Fatalf("bar text=%q, want the totals and the soft-limit legend", rendered)
 	}
 	if !strings.Contains(rendered, "█") {
@@ -728,6 +735,15 @@ func TestTopRuntimeRendersAndQuits(t *testing.T) {
 	}
 	if count := onUI(t, runtime, func() int { return runtime.tables[viewTop].GetRowCount() }); count != 3 { // one header plus two scopes
 		t.Fatalf("table rows=%d, want a header and two scopes", count)
+	}
+	// AIRA-361: the lane gauge and the small-lease marker reach the terminal. The
+	// gauge is read from the DRAWN cells (the panel title), not widget text.
+	if want, drawnText := "System RAM · small-job lane 1024M/8192M, 1 job, max 1024M each",
+		onUI(t, runtime, func() string { return simulationText(screen) }); !strings.Contains(drawnText, want) {
+		t.Fatalf("screen=\n%s\nwant the lane gauge %q", drawnText, want)
+	}
+	if cell := onUI(t, runtime, func() string { return runtime.tables[viewTop].GetCell(2, 5).Text }); !strings.Contains(cell, "1024M lane") {
+		t.Fatalf("bravo RESERVATION cell=%q, want the small-lease marker", cell)
 	}
 	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
 	select {
