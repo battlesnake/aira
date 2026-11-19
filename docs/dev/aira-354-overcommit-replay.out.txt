@@ -1,0 +1,169 @@
+# AIRA-354 overcommit replay
+window 1794736612 .. 1795036217 (unix s), 83.2 h; grid 10 s; 12524 timeline rows (0 with an unknown peak, bounded at cap)
+
+## 1. Journal (all jobs): host MemAvailable, slice anon, effective ceiling
+samples=29961  MemAvailable GiB: min 29.44 p1 36.42 p5 39.84 p50 47.38
+sliceAnon GiB: p50 8.82 p99 19.34 max 25.14;  effective ceiling GiB: min 38.00 p50 49.00 max 51.25
+observed seconds with MemAvailable <  8 GiB: 0
+observed seconds with MemAvailable < 10 GiB: 0
+observed seconds with MemAvailable < 12 GiB: 0
+observed seconds with MemAvailable < 16 GiB: 0
+observed seconds with MemAvailable < 20 GiB: 0
+sliceAnon / L (L = ceiling - 2.06 GiB): p50 0.190 p90 0.316 p99 0.415 max 0.545
+
+## 2. Visible timeline (store rows): sum of held peaks / sum of bookings of the RUNNING set
+instants with visible booking >= 8 GiB: 21499 of 29961
+held-peak ratio rho_vis: p50 0.699 p90 0.827 p99 0.915 max 1.000
+visible held peaks / real sliceAnon: p10 0.00 p50 1.11 p90 2.39 (above 1: held peaks and page cache overstate; below 1: hidden jobs)
+visible running jobs: p50 5 p90 8 max 18 (the live list shows the full count, part 6)
+
+## 3. Correlated-peak estimates
+(a) block bootstrap by clock hour (73 hours, 1000 draws): p99 of rho_vis 90% interval [0.901, 0.932]
+(b) each running job's peak redrawn from its own signature's retained peaks (400 instants x 200): p50 0.681 p99 0.902 p99.9 0.938 max 0.998
+(c) every running job at its signature's LARGEST retained peak at once: p50 0.777 p99 0.942 max 1.000
+model I uses rho = 0.915 (the larger of (b) p99 and rho_vis p99)
+(d) breach ratio r*(k) = (L + H) / (k L): the running set's use / bookings at which host MemAvailable reaches 8 GiB with the ledger full at k L (outside memory unchanged). A margin, not a probability.
+  k=1.10: r* p50 0.949 (min 0.947); share at or above r*: (b) 0.0009 of draws, (c) 0.0060 of instants; same-mix model (all use x k): max sliceAnon/E 0.521 against 1/k = 0.909
+  k=1.25: r* p50 0.835 (min 0.834); share at or above r*: (b) 0.0618 of draws, (c) 0.2891 of instants; same-mix model (all use x k): max sliceAnon/E 0.521 against 1/k = 0.800
+  k=1.40: r* p50 0.746 (min 0.744); share at or above r*: (b) 0.2844 of draws, (c) 0.6113 of instants; same-mix model (all use x k): max sliceAnon/E 0.521 against 1/k = 0.714
+
+## 4. Counterfactual host MemAvailable (seconds below a threshold; min MA')
+models: Q = real queued jobs admitted FIFO into X(t) at held peaks; Qb = same, backfill; I = X(t) x rho; W = X(t) at 100%%; S = (k-1) x real sliceAnon (same mix scaled)
+rules: 'k only' X = (k-1)L (the pre-registered test); 'spec' X = min((k-1)L, slice memory.max - H - L, L - sliceAnon)
+
+[k only]
+k      Q<10     Qb<10    I<10     W<8      W<10     S<10     minW     minQb    medX      HS1 HS2 HS3
+1.00   0        0        0        0        0        0        29.44    29.44    0.00      pass pass pass
+1.10   0        0        0        0        0        0        24.89    27.68    4.69      pass pass pass
+1.15   0        0        0        0        0        0        22.62    27.68    7.04      pass pass pass
+1.20   0        0        0        0        0        0        20.35    26.37    9.39      pass pass pass
+1.25   0        0        0        0        0        0        18.08    19.74    11.73     pass pass pass
+1.30   0        0        0        0        0        0        15.81    18.26    14.08     pass pass pass
+1.40   0        0        0        0        0        0        11.26    18.23    18.77     pass pass pass
+1.50   0        0        120      60       300      0        6.72     17.79    23.47     pass FAIL FAIL
+1.75   0        0        32050    44240    81970    0        -4.64    13.46    35.20     pass FAIL FAIL
+2.00   0        0        241990   250100   279810   300      -16.00   13.46    46.94     pass FAIL FAIL
+CHOSEN k [k only] (largest meeting HS1-HS3): 1.4
+
+[spec]
+k      Q<10     Qb<10    I<10     W<8      W<10     S<10     minW     minQb    medX      HS1 HS2 HS3
+1.00   0        0        0        0        0        0        29.44    29.44    0.00      pass pass pass
+1.10   0        0        0        0        0        0        24.89    27.68    4.69      pass pass pass
+1.15   0        0        0        0        0        0        22.62    27.68    7.04      pass pass pass
+1.20   0        0        0        0        0        0        20.35    26.37    9.39      pass pass pass
+1.25   0        0        0        0        0        0        18.08    19.74    11.73     pass pass pass
+1.30   0        0        0        0        0        0        15.81    18.26    14.00     pass pass pass
+1.40   0        0        0        0        0        0        12.49    18.23    15.00     pass pass pass
+1.50   0        0        0        0        0        0        11.34    18.23    15.00     pass pass pass
+1.75   0        0        0        0        120      0        8.18     18.23    15.00     pass pass pass
+2.00   0        0        0        0        120      300      8.18     18.23    15.00     pass pass pass
+CHOSEN k [spec] (largest meeting HS1-HS3): 2.0
+additive variant, X fixed (GiB): seconds W<8, I<10
+  X= 4 GiB: W<8 0 s, I<10 0 s
+  X= 8 GiB: W<8 0 s, I<10 0 s
+  X=12 GiB: W<8 0 s, I<10 0 s
+  X=16 GiB: W<8 0 s, I<10 0 s
+static worst case (every job at its cap at once), at the window's largest L = 49.19 GiB:
+  k=1.00: MemAvailable >= 10.06 GiB
+  k=1.10: MemAvailable >= 5.14 GiB
+  k=1.15: MemAvailable >= 2.68 GiB
+  k=1.20: MemAvailable >= 0.23 GiB
+  k=1.25: MemAvailable >= -2.23 GiB
+  k=1.30: MemAvailable >= -4.69 GiB
+  k=1.40: MemAvailable >= -9.61 GiB
+  k=1.50: MemAvailable >= -14.53 GiB
+  k=1.75: MemAvailable >= -26.83 GiB
+  k=2.00: MemAvailable >= -39.12 GiB
+physical room L - sliceAnon over the window: min 20.28 p1 26.60 p50 37.44 GiB (the 'backed' term binds when it is below (k-1)L)
+journal-only models over the whole journal, 168.2 h (60534 samples): seconds I<10, W<8, W<10; min W
+  [k only] k=1.00: I<10 0 s, W<8 0 s, W<10 0 s, min W 29.44 GiB
+  [k only] k=1.10: I<10 0 s, W<8 0 s, W<10 0 s, min W 24.89 GiB
+  [k only] k=1.15: I<10 0 s, W<8 0 s, W<10 0 s, min W 22.62 GiB
+  [k only] k=1.20: I<10 0 s, W<8 0 s, W<10 0 s, min W 20.35 GiB
+  [k only] k=1.25: I<10 0 s, W<8 0 s, W<10 0 s, min W 18.08 GiB
+  [k only] k=1.30: I<10 0 s, W<8 0 s, W<10 0 s, min W 15.81 GiB
+  [k only] k=1.40: I<10 0 s, W<8 0 s, W<10 0 s, min W 11.26 GiB
+  [k only] k=1.50: I<10 130 s, W<8 70 s, W<10 320 s, min W 6.72 GiB
+  [k only] k=1.75: I<10 42260 s, W<8 62230 s, W<10 122870 s, min W -4.64 GiB
+  [k only] k=2.00: I<10 471260 s, W<8 491460 s, W<10 562930 s, min W -16.00 GiB
+  [spec] k=1.00: I<10 0 s, W<8 0 s, W<10 0 s, min W 29.44 GiB
+  [spec] k=1.10: I<10 0 s, W<8 0 s, W<10 0 s, min W 24.89 GiB
+  [spec] k=1.15: I<10 0 s, W<8 0 s, W<10 0 s, min W 22.62 GiB
+  [spec] k=1.20: I<10 0 s, W<8 0 s, W<10 0 s, min W 20.35 GiB
+  [spec] k=1.25: I<10 0 s, W<8 0 s, W<10 0 s, min W 18.08 GiB
+  [spec] k=1.30: I<10 0 s, W<8 0 s, W<10 0 s, min W 15.81 GiB
+  [spec] k=1.40: I<10 0 s, W<8 0 s, W<10 0 s, min W 12.49 GiB
+  [spec] k=1.50: I<10 0 s, W<8 0 s, W<10 0 s, min W 11.34 GiB
+  [spec] k=1.75: I<10 0 s, W<8 0 s, W<10 120 s, min W 8.18 GiB
+  [spec] k=2.00: I<10 0 s, W<8 0 s, W<10 120 s, min W 8.18 GiB
+
+## 5. Queue wait removed (model Q, FIFO, static per instant; RAM only, then a CPU-slot cap)
+visible jobs that waited >= 1 s: 5961, wait-hours 213.7
+CPU cap: free slots = 32 - visible running - 24 hidden (live median jobs less the visible median; ESTIMATED)
+  k=1.10 RAM only       wait-hours removed 59.6 (28%)
+  k=1.10 RAM+CPU (est.) wait-hours removed 36.7 (17%)
+  k=1.15 RAM only       wait-hours removed 88.8 (42%)
+  k=1.15 RAM+CPU (est.) wait-hours removed 50.4 (24%)
+  k=1.20 RAM only       wait-hours removed 112.8 (53%)
+  k=1.20 RAM+CPU (est.) wait-hours removed 59.8 (28%)
+  k=1.25 RAM only       wait-hours removed 138.4 (65%)
+  k=1.25 RAM+CPU (est.) wait-hours removed 72.0 (34%)
+  k=1.30 RAM only       wait-hours removed 160.3 (75%)
+  k=1.30 RAM+CPU (est.) wait-hours removed 80.5 (38%)
+  k=1.40 RAM only       wait-hours removed 177.0 (83%)
+  k=1.40 RAM+CPU (est.) wait-hours removed 84.1 (39%)
+  k=1.50 RAM only       wait-hours removed 178.5 (84%)
+  k=1.50 RAM+CPU (est.) wait-hours removed 84.2 (39%)
+  k=1.75 RAM only       wait-hours removed 178.9 (84%)
+  k=1.75 RAM+CPU (est.) wait-hours removed 84.2 (39%)
+  k=2.00 RAM only       wait-hours removed 178.9 (84%)
+  k=2.00 RAM+CPU (est.) wait-hours removed 84.2 (39%)
+
+## 6. Live `aira confine --list` samples (every job: totals from the daemon)
+AIRA-324 enforce 0.9 was on: pin discount in the ledger p50 1.41 GiB max 3.24 GiB; real use / full-pin bookings p50 0.333 max 0.441
+samples 180 over 59.9 min
+real use / booked (slice current - reclaimable over granted): p50 0.345 p90 0.384 max 0.451
+granted GiB p50 44.47; ceiling p50 44.56; real use p50 15.22 max 19.97; MemAvailable min 36.60
+samples with a queue: 179; of them RAM-bound (granted >= ceiling - 1 GiB): 166
+jobs (CPU slots, 1 each by default): p50 29 max 32 of 32; queued p50 14 max 27
+slice CPU utilisation (of 16 cores): p50 0.81 p90 0.86 max 0.90
+per-job memory.current / reserve (cache included), all samples: p50 0.34 p90 0.62 p99 1.00
+queued bytes per sample: p50 27.01 GiB max 47.97 GiB
+  k=1.10: queued jobs admitted now, RAM only p50 1 max 4; RAM+CPU p50 1 max 4 (3.25 GiB p50); MemAvailable if all of those used their whole booking at once: min 32.83 GiB
+  k=1.15: queued jobs admitted now, RAM only p50 3 max 8; RAM+CPU p50 2 max 7 (5.00 GiB p50); MemAvailable if all of those used their whole booking at once: min 31.71 GiB
+  k=1.20: queued jobs admitted now, RAM only p50 4 max 12; RAM+CPU p50 2 max 8 (5.50 GiB p50); MemAvailable if all of those used their whole booking at once: min 28.71 GiB
+  k=1.25: queued jobs admitted now, RAM only p50 5 max 12; RAM+CPU p50 3 max 8 (5.50 GiB p50); MemAvailable if all of those used their whole booking at once: min 28.71 GiB
+  k=1.30: queued jobs admitted now, RAM only p50 7 max 17; RAM+CPU p50 3 max 8 (5.50 GiB p50); MemAvailable if all of those used their whole booking at once: min 23.71 GiB
+  k=1.40: queued jobs admitted now, RAM only p50 8 max 17; RAM+CPU p50 3 max 9 (5.50 GiB p50); MemAvailable if all of those used their whole booking at once: min 22.71 GiB
+net of track 1 (AIRA-324 discount added back: full pins booked, the configuration overbook enforce requires):
+  samples with a queue 179: RAM-bound with a free CPU slot 140; CPU slots full 33 (slots estimated as one per granted waiter: the list carries no CPU-ledger total)
+  ceiling for ANY RAM rule (RAM unlimited, CPU slots only): queued jobs admitted p50 3 mean 3.33 max 11, none in 34 of 180 (CPU slots full)
+  k=1.10: extra room net of the 324 discount GiB min 1.21 p50 3.03 max 4.39
+          stacked FIFO+CPU p50 1 mean 1.21 max 4, none admitted in 52 of 180
+          net     FIFO+CPU p50 0 mean 0.57 max 3, none admitted in 107 of 180
+          net     skip-misfit+CPU (upper bound) p50 2 mean 1.64 max 7, none admitted in 37 of 180
+  k=1.15: extra room net of the 324 discount GiB min 3.41 p50 5.19 max 6.72
+          stacked FIFO+CPU p50 2 mean 2.29 max 7, none admitted in 36 of 180
+          net     FIFO+CPU p50 1 mean 1.66 max 7, none admitted in 44 of 180
+          net     skip-misfit+CPU (upper bound) p50 2 mean 2.23 max 7, none admitted in 34 of 180
+  k=1.20: extra room net of the 324 discount GiB min 5.60 p50 7.36 max 9.04
+          stacked FIFO+CPU p50 2 mean 2.76 max 8, none admitted in 34 of 180
+          net     FIFO+CPU p50 2 mean 2.44 max 7, none admitted in 35 of 180
+          net     skip-misfit+CPU (upper bound) p50 2 mean 2.68 max 7, none admitted in 34 of 180
+  k=1.25: extra room net of the 324 discount GiB min 7.79 p50 9.56 max 11.36
+          stacked FIFO+CPU p50 3 mean 2.99 max 8, none admitted in 34 of 180
+          net     FIFO+CPU p50 2 mean 2.79 max 8, none admitted in 34 of 180
+          net     skip-misfit+CPU (upper bound) p50 2 mean 2.94 max 8, none admitted in 34 of 180
+  k=1.30: extra room net of the 324 discount GiB min 9.99 p50 11.74 max 13.59
+          stacked FIFO+CPU p50 3 mean 3.12 max 8, none admitted in 34 of 180
+          net     FIFO+CPU p50 3 mean 2.98 max 8, none admitted in 34 of 180
+          net     skip-misfit+CPU (upper bound) p50 3 mean 3.08 max 8, none admitted in 34 of 180
+  k=1.40: extra room net of the 324 discount GiB min 11.26 p50 13.80 max 16.10
+          stacked FIFO+CPU p50 3 mean 3.19 max 9, none admitted in 34 of 180
+          net     FIFO+CPU p50 3 mean 3.10 max 8, none admitted in 34 of 180
+          net     skip-misfit+CPU (upper bound) p50 3 mean 3.13 max 8, none admitted in 34 of 180
+
+## 7. AIRA-324 watcher (factor 0.9 enforce, 2026-11-16/17): inferred sliceAnon = ceiling + 8 - MemAvailable
+samples 92: inferred real use / booked p50 0.109 p90 0.286 max 0.431; queued max 23; running max 32
+
+LIMITS: see the module docstring (journal held values, 20-row retention, hidden jobs, held cache-inclusive peaks, CPU).
