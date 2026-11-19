@@ -6,9 +6,16 @@
 package cgrouptest
 
 import (
+	"errors"
 	"os"
 	"testing"
 )
+
+// CurrentCgroupChildError reports the capability absent: cgroup-v2 is
+// Linux-only.
+func CurrentCgroupChildError() error {
+	return errors.New("cgroup-v2 requires linux")
+}
 
 // IsolatedScopeParent skips the calling test: real cgroup-v2 scope isolation is
 // Linux-only. Under AIRA_REAL_CGROUP=1 (mandatory-real mode) it hard-fails instead

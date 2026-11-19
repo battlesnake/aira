@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1264,9 +1265,6 @@ func TestWatchdogProcHelper(t *testing.T) {
 }
 
 func TestRealProcObserveSelectsClaudeChildWithoutSignalling(t *testing.T) {
-	if os.Getenv("AIRA_WATCHDOG_REAL_PROC") != "1" {
-		t.Skip("set AIRA_WATCHDOG_REAL_PROC=1 to run the real-/proc fixture")
-	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestWatchdogProcHelper$")
 	cmd.Env = append(os.Environ(), "AIRA_WATCHDOG_PROC_HELPER=1")
 	stdout, err := cmd.StdoutPipe()
@@ -1285,6 +1283,8 @@ func TestRealProcObserveSelectsClaudeChildWithoutSignalling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Killing the helper alone would leave its sleep child running for 30 s.
+	t.Cleanup(func() { _ = unix.Kill(childPID, unix.SIGKILL) })
 	mount, mountErr := runner.UnifiedCgroupMount()
 	var procs map[int]watchdogProc
 	foundTree := false
@@ -1305,8 +1305,26 @@ func TestRealProcObserveSelectsClaudeChildWithoutSignalling(t *testing.T) {
 	}
 	child := procs[childPID]
 	child.cgroup.uncapped = true
-	child.rss = 4096
+	// The snapshot is the whole box's /proc, so a real agent's heavy uncapped
+	// child (any process under a "claude" ancestor) would outrank a small RSS
+	// here. The child is made the heaviest process so that selection depends
+	// only on the predicates this test checks, computed from the real tree.
+	child.rss = 1 << 62
 	procs[childPID] = child
+	// Where the test itself runs in system.slice (GitHub's hosted runner runs
+	// the job in a system.slice service), the real child is protected by its
+	// cgroup path. Check that verdict on the real path, with every other
+	// predicate met, then place the child outside system.slice so the rest of
+	// the test can check selection and observe mode.
+	if slices.Contains(strings.Split(child.cgroup.path, "/"), "system.slice") {
+		selected, verdicts := selectOffender(procs, 1024, os.Getpid(), "/not-the-helper")
+		want := watchdogPredicates{Uncapped: true, AgentAttributable: true, Heavy: true, NotProtected: false}
+		if (selected != nil && selected.pid == childPID) || verdicts[childPID] != want {
+			t.Fatalf("child in %s: selected=%+v verdict=%+v, want not selected with verdict %+v", child.cgroup.path, selected, verdicts[childPID], want)
+		}
+		child.cgroup.path = "/user.slice/aira-watchdog-test.scope"
+		procs[childPID] = child
+	}
 	if selected, _ := selectOffender(procs, 1024, os.Getpid(), "/not-the-helper"); selected == nil || selected.pid != childPID {
 		t.Fatalf("selected=%+v want child pid %d", selected, childPID)
 	}

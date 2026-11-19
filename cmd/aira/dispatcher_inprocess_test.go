@@ -67,12 +67,8 @@ func TestTimeCLIExitPassthroughHumanSuppressionAndStructuredRead(t *testing.T) {
 	}
 }
 
-// This discriminator needs a real AF_UNIX listener. The Codex sandbox cannot
-// bind it; AIRA_REAL_SOCKET=1 is the Opus real-hardware mode and fails closed.
+// This discriminator needs a real AF_UNIX listener.
 func TestCommandsRoutedDaemonParityAndPairedDrillRealSocket(t *testing.T) {
-	if os.Getenv("AIRA_REAL_SOCKET") != "1" {
-		t.Skip("real Unix-socket parity requires AIRA_REAL_SOCKET=1")
-	}
 	root := t.TempDir()
 	gitInit(t, root)
 	if err := os.MkdirAll(filepath.Join(root, ".aira"), 0o755); err != nil {
@@ -1383,9 +1379,6 @@ func TestStoreFreeRealCLIRegistersOnlyThroughDaemon(t *testing.T) {
 }
 
 func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
-	if os.Getenv("AIRA_REAL_SOCKET") != "1" {
-		t.Skip("real Unix-socket D7b e2e requires AIRA_REAL_SOCKET=1")
-	}
 	root := t.TempDir()
 	gitInit(t, root)
 	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("launch\n"), 0o644); err != nil {
@@ -1428,14 +1421,36 @@ func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
 	if exit, stdout, stderr := invoke("time", "--no-prefix", "--", "/bin/true"); exit != 0 {
 		t.Fatalf("time exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
 	}
+	// `run` creates its cgroup scope under this process's own cgroup. Where the
+	// test user cannot create a child there (GitHub's hosted runner puts the job
+	// in a root-owned system.slice service), the run legs can only be refused, so
+	// they assert that refusal and the rows they would have written go unchecked;
+	// every other leg still runs. The probe is a bare mkdir that runs no AIRA
+	// code, so a broken run path cannot select the refused mode.
+	scopeErr := cgrouptest.CurrentCgroupChildError()
+	if scopeErr != nil {
+		if os.Getenv("AIRA_REAL_CGROUP") == "1" {
+			t.Fatalf("AIRA_REAL_CGROUP=1 but no child cgroup can be created here: %v", scopeErr)
+		}
+		t.Logf("run legs check only the refusal: no child cgroup can be created here: %v", scopeErr)
+	}
+	runLeg := func(name string, argv ...string) {
+		t.Helper()
+		exit, stdout, stderr := invoke(argv...)
+		if scopeErr == nil {
+			if exit != 0 {
+				t.Fatalf("%s exit=%d stdout=%q stderr=%q", name, exit, stdout, stderr)
+			}
+			return
+		}
+		if exit == 0 || !strings.Contains(stdout, `"code":"E_RUN_SCOPE_UNAVAILABLE"`) {
+			t.Fatalf("%s with no creatable cgroup: exit=%d stdout=%q stderr=%q, want E_RUN_SCOPE_UNAVAILABLE", name, exit, stdout, stderr)
+		}
+	}
 	reportScript := `printf '%s\n' '{"Action":"run","Package":"pkg","Test":"TestOne"}' '{"Action":"pass","Package":"pkg","Test":"TestOne","Elapsed":0.1}' '{"Action":"pass","Package":"pkg","Elapsed":0.1}'`
-	if exit, stdout, stderr := invoke("run", "--no-admit", "--report", "go-json", "--suite", "unit", "--shard", "1/1", "--", "/bin/sh", "-c", reportScript); exit != 0 {
-		t.Fatalf("run --report exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
-	}
-	if exit, stdout, stderr := invoke("run", "--no-admit", "--tool", "codex", "--", "/bin/true"); exit != 0 {
-		t.Fatalf("run --tool exit=%d stdout=%q stderr=%q", exit, stdout, stderr)
-	}
-	if exit, stdout, stderr := invoke("spend", "ls"); exit != 0 || !strings.Contains(stdout, head) || !strings.Contains(stdout, `"git_context"`) {
+	runLeg("run --report", "run", "--no-admit", "--report", "go-json", "--suite", "unit", "--shard", "1/1", "--", "/bin/sh", "-c", reportScript)
+	runLeg("run --tool", "run", "--no-admit", "--tool", "codex", "--", "/bin/true")
+	if exit, stdout, stderr := invoke("spend", "ls"); exit != 0 || (scopeErr == nil && (!strings.Contains(stdout, head) || !strings.Contains(stdout, `"git_context"`))) {
 		t.Fatalf("spend ls exit=%d stdout=%q stderr=%q want head=%q", exit, stdout, stderr, head)
 	}
 	if exit, stdout, stderr := invoke("reconcile"); exit != 0 {
@@ -1449,7 +1464,11 @@ func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	for table, wantAtLeast := range map[string]int{"command_events": 1, "test_reports": 1, "compute_events": 1} {
+	wantRows := map[string]int{"command_events": 1}
+	if scopeErr == nil {
+		wantRows["test_reports"], wantRows["compute_events"] = 1, 1
+	}
+	for table, wantAtLeast := range wantRows {
 		var count int
 		if err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
 			t.Fatal(err)
@@ -1458,12 +1477,14 @@ func TestD7bRealCLIStoreTouchingVerbsRelayThroughDaemon(t *testing.T) {
 			t.Fatalf("%s rows=%d want at least %d", table, count, wantAtLeast)
 		}
 	}
-	var storedHead, storedStatus string
-	if err := db.QueryRow(`SELECT head_hash,head_hash_status FROM compute_events ORDER BY at_seq DESC LIMIT 1`).Scan(&storedHead, &storedStatus); err != nil {
-		t.Fatal(err)
-	}
-	if storedHead != head || storedStatus != "value" {
-		t.Fatalf("persisted compute head=(%q,%q) want=(%q,value)", storedHead, storedStatus, head)
+	if scopeErr == nil {
+		var storedHead, storedStatus string
+		if err := db.QueryRow(`SELECT head_hash,head_hash_status FROM compute_events ORDER BY at_seq DESC LIMIT 1`).Scan(&storedHead, &storedStatus); err != nil {
+			t.Fatal(err)
+		}
+		if storedHead != head || storedStatus != "value" {
+			t.Fatalf("persisted compute head=(%q,%q) want=(%q,value)", storedHead, storedStatus, head)
+		}
 	}
 	registry, err := os.ReadFile(paths.RegistryPath)
 	if err != nil {

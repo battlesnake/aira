@@ -398,7 +398,7 @@ instead); folding `time`/`run` telemetry into a single op.
   surfaces from the daemon.
 - **Protocol replacement.** A live proto-3 (D7a) daemon + a proto-4 store-op → the
   client replaces it and retries (monotonic, no unknown-op failure).
-- **e2e (real CLI, `AIRA_REAL_SOCKET=1`).** `time -- <cmd>` (frequent), `run --report`
+- **e2e (real CLI, real socket; ungated since AIRA-362).** `time -- <cmd>` (frequent), `run --report`
   (large report), `reconcile`, `gate run` through the daemon; assert the DB effect is
   present **and** the client opened no *writable* `state.db` (fd/inode or `mode=ro`).
 
