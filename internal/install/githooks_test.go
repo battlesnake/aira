@@ -53,6 +53,12 @@ func gitEnv(t *testing.T, home, extraPath string) []string {
 			// AIRA-348: the hook reads it; a value in the test's own
 			// environment would decide what the hooks under test ask for.
 			continue
+		case name == "MAKEFLAGS" || name == "MFLAGS" || name == "MAKELEVEL" || name == "GNUMAKEFLAGS" || name == "GO":
+			// AIRA-355: under the gate these tests run inside `make ci`, and
+			// a real make a test starts would inherit the gate's flags (and
+			// .githooks/ci-pass reads them), so a test would behave
+			// differently under `make ci` than under a bare `go test`.
+			continue
 		}
 		env = append(env, kv)
 	}

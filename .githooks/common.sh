@@ -87,3 +87,93 @@ aira_hook_run_make() {
 	fi
 	exec aira confine -- make -C "$root" "$@"
 }
+
+# ---------------------------------------------------------------------------
+# AIRA-355: recorded `make ci` passes, keyed on the tree hash.
+#
+# `make ci` (through .githooks/ci-pass) writes one marker per tree that passed
+# every step from a CLEAN worktree, under the git COMMON dir, so every worktree
+# of this repository on this machine shares them: the same tree on the same
+# machine gives the same result. The pre-push hook skips its full `make ci` only
+# when EVERY pushed branch's tree has one. Nothing in a marker is trusted beyond
+# its existence as a regular file and its first line being the version line
+# below; its mtime is shown to the user and never decides anything. A marker is
+# written to a temporary name and renamed into place as the last action, so a
+# hard kill (a confined job has no graceful shutdown) leaves no marker.
+AIRA_CI_PASS_VERSION='aira-ci-pass v1'
+
+# aira_ci_pass_dir <root> prints the absolute marker directory.
+aira_ci_pass_dir() {
+	local common
+	common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+	case "$common" in /?*) ;; *) return 1 ;; esac
+	[ -d "$common" ] || return 1
+	printf '%s/aira-ci-pass\n' "$common"
+}
+
+# aira_ci_pass_is_hash <s> succeeds only for a full lowercase object id (SHA-1
+# or SHA-256), so a marker name can never be a path or an option.
+aira_ci_pass_is_hash() {
+	case "$1" in "" | *[!0-9a-f]*) return 1 ;; esac
+	[ "${#1}" -eq 40 ] || [ "${#1}" -eq 64 ]
+}
+
+# aira_ci_pass_marker <root> <tree> prints the marker's path and succeeds only
+# when a valid marker for exactly that tree exists.
+aira_ci_pass_marker() {
+	local dir file line
+	aira_ci_pass_is_hash "$2" || return 1
+	dir="$(aira_ci_pass_dir "$1")" || return 1
+	file="$dir/$2"
+	if [ ! -f "$file" ] || [ -L "$file" ]; then return 1; fi
+	IFS= read -r line <"$file" || return 1
+	[ "$line" = "$AIRA_CI_PASS_VERSION" ] || return 1
+	printf '%s\n' "$file"
+}
+
+# aira_ci_pass_clean_tree <root> prints HEAD's tree and succeeds only when <root>
+# is the top of its worktree and that worktree is clean: no staged, unstaged or
+# untracked (non-ignored) change. --untracked-files=all overrides a user's
+# status.showUntrackedFiles=no, which would otherwise hide untracked files.
+aira_ci_pass_clean_tree() {
+	local root="$1" top status tree
+	top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null)" || return 1
+	[ -n "$top" ] || return 1
+	[ "$(cd -- "$root" && pwd -P)" = "$(cd -- "$top" && pwd -P)" ] || return 1
+	status="$(git -C "$root" --no-optional-locks status --porcelain --untracked-files=all --ignore-submodules=none 2>/dev/null)" || return 1
+	[ -z "$status" ] || return 1
+	# assume-unchanged / skip-worktree files hide edits from `status`: any index
+	# entry not in the plain cached state ('H') refuses the clean verdict.
+	if git -C "$root" --no-optional-locks ls-files -v 2>/dev/null | grep -q -v '^H '; then return 1; fi
+	tree="$(git -C "$root" rev-parse --verify --quiet 'HEAD^{tree}')" || return 1
+	aira_ci_pass_is_hash "$tree" || return 1
+	printf '%s\n' "$tree"
+}
+
+# aira_ci_pass_record <root> <tree> writes the marker for <tree>, then prunes:
+# markers (and stale temporary files) older than 14 days go, and only the
+# newest 200 markers are kept. A pruning failure never fails the record.
+aira_ci_pass_record() {
+	local root="$1" tree="$2" dir tmp
+	aira_ci_pass_is_hash "$tree" || return 1
+	dir="$(aira_ci_pass_dir "$root")" || return 1
+	mkdir -p -- "$dir" || return 1
+	tmp="$(mktemp "$dir/.tmp.XXXXXX")" || return 1
+	if ! printf '%s\n' "$AIRA_CI_PASS_VERSION" >"$tmp" || ! mv -f -- "$tmp" "$dir/$tree"; then
+		rm -f -- "$tmp"
+		return 1
+	fi
+	aira_ci_pass_prune "$dir" || true
+}
+
+aira_ci_pass_prune() {
+	local dir="$1" name kept=0
+	find "$dir" -maxdepth 1 -type f -mmin +20160 -delete 2>/dev/null || true
+	# Marker names are bare hex ids, so `ls` output is unambiguous; only they
+	# count toward the 200, and the count cap leaves anything else alone.
+	ls -1t -- "$dir" 2>/dev/null | while IFS= read -r name; do
+		aira_ci_pass_is_hash "$name" || continue
+		kept=$((kept + 1))
+		if [ "$kept" -gt 200 ]; then rm -f -- "$dir/$name"; fi
+	done
+}
