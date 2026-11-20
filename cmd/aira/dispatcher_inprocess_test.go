@@ -91,6 +91,11 @@ func TestCommandsRoutedDaemonParityAndPairedDrillRealSocket(t *testing.T) {
 	}
 	zero, wall := int64(0), int64(12)
 	_, err = s.AddCommandEvent(context.Background(), domain.CommandEventInput{Key: "go test", KeySource: domain.CommandKeyProgramSubcommand, Program: "go", Status: domain.CommandExited, ExitCode: &zero, WallMS: &wall})
+	if err == nil {
+		// AIRA-366. A second, non-matching row, so the query must filter: with
+		// one row a daemon that drops the query returns the same answer.
+		_, err = s.AddCommandEvent(context.Background(), domain.CommandEventInput{Key: "make ci", KeySource: domain.CommandKeyProgramSubcommand, Program: "make", Status: domain.CommandExited, ExitCode: &zero, WallMS: &wall})
+	}
 	if closeErr := s.Close(); err == nil {
 		err = closeErr
 	}
@@ -103,7 +108,20 @@ func TestCommandsRoutedDaemonParityAndPairedDrillRealSocket(t *testing.T) {
 	}
 	startCommandDaemon(t, daemon.NewServer(paths))
 	request := core.Request{Verb: "commands", Args: map[string]any{"subverb": "ls", "query": "key-source:program-subcommand key:go test"}}
-	routed := (&daemonDispatcher{paths: paths, jsonOutput: true, startWait: time.Second}).Dispatch(context.Background(), scope, request)
+	// AIRA-366. Count the `commands` frames that cross the real socket, so a
+	// client that answers `commands` itself (with rows equal to the daemon's)
+	// fails here rather than passing on result parity alone.
+	var forwarded atomic.Int32
+	exchange := func(ctx context.Context, socket string, frame daemon.RequestFrame) (daemon.ResponseFrame, error) {
+		if frame.Request.Verb == "commands" {
+			forwarded.Add(1)
+		}
+		return daemon.Exchange(ctx, socket, frame)
+	}
+	routed := (&daemonDispatcher{paths: paths, jsonOutput: true, startWait: time.Second, exchange: exchange}).Dispatch(context.Background(), scope, request)
+	if got := forwarded.Load(); got != 1 {
+		t.Fatalf("commands frames forwarded to the daemon = %d, want 1", got)
+	}
 	inProcess := (&inProcessDispatcher{jsonOutput: true}).Dispatch(context.Background(), scope, request)
 	if !routed.OK || !inProcess.OK {
 		t.Fatalf("routed=%#v in-process=%#v", routed, inProcess)
@@ -116,6 +134,11 @@ func TestCommandsRoutedDaemonParityAndPairedDrillRealSocket(t *testing.T) {
 	}
 	if !reflect.DeepEqual(normalise(routed.Data), normalise(inProcess.Data)) {
 		t.Fatalf("routed rows=%#v in-process rows=%#v", routed.Data, inProcess.Data)
+	}
+	// The parity above is vacuous if the query filters nothing on either path.
+	matched, _ := normalise(inProcess.Data).(map[string]any)
+	if rows, _ := matched["rows"].([]any); len(rows) != 1 || matched["total"] != float64(1) {
+		t.Fatalf("query matched %#v of 2 seeded rows, want total 1 and one row", matched)
 	}
 	if canonical, route := core.Classify("commands", "ls"); canonical != "commands" || route != core.RouteDaemon {
 		t.Fatalf("route=%q/%v", canonical, route)
