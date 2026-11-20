@@ -507,11 +507,13 @@ func assertNoOrphanAfterParentKill(t *testing.T, outer string, workers []populat
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	// The dir removal above is the whole proof: rmdir needs an empty cgroup, and a
-	// killed process leaves its cgroup before it is reaped, so a removed worker
-	// scope means no worker process is still running. A per-pid liveness probe
-	// added nothing to that and false-failed on an unreaped zombie or a reused
-	// pid (AIRA-364), so it is not repeated here.
+	// The dir removal above is the proof that no worker is still running in its
+	// scope: rmdir needs an empty cgroup, and a killed process leaves its cgroup
+	// before it is reaped. It assumes no worker migrated OUT of its scope (this
+	// fixture and the daemon never move one); a descendant that escapes its scope
+	// is witnessed by the descendant-escape attestation, not by this test. A
+	// per-pid liveness probe added nothing under that assumption and false-failed
+	// on an unreaped zombie or a reused pid (AIRA-364), so it is not repeated.
 }
 
 // startBlockingAitestPool launches a real pytest aitest pool whose fixture tests
