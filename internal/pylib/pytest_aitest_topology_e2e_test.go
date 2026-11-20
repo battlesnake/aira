@@ -655,12 +655,20 @@ func TestRealPytestAitestParentKillLeavesNoOrphanPostRestart(t *testing.T) {
 	}
 }
 
+// multiSupervisorTests is each supervisor's suite. Four 1.5 s tests on three
+// asked-for workers keep both supervisors demanding more than the 2-worker
+// ceiling for the whole overlap; eight only made the run longer.
+var multiSupervisorTests = []string{
+	"test_slow_passing.py::test_s0", "test_slow_passing.py::test_s1",
+	"test_slow_passing.py::test_s2", "test_slow_passing.py::test_s3",
+}
+
 // TestRealPytestAitestMultiSupervisorSafe is Gate C (AIRA-232): two independent
 // aitest supervisors (the `make -j` shape) under one slice, driven by one daemon,
 // cannot jointly breach the slice ledger. The ledger is pinned so exactly TWO
-// pytest workers fit; both supervisors continuously demand workers (8 slow tests
-// each), so their combined demand far exceeds the ceiling. The daemon serialises
-// them against the ONE ledger: at every sampled instant the combined granted
+// pytest workers fit; both supervisors continuously demand workers (4 slow tests
+// each, 3 workers asked), so their combined demand exceeds the ceiling. The
+// daemon serialises them against the ONE ledger: at every sampled instant the combined granted
 // worker set is <= 2 and Σ(reserve) <= 2 workers' worth — there is no client
 // aggregate, no sibling-sum, no cross-process TOCTOU that could let each
 // supervisor admit up to its own limit independently.
@@ -709,7 +717,7 @@ func TestRealPytestAitestMultiSupervisorSafe(t *testing.T) {
 	defer cancelRun()
 
 	launch := func(scopeID string, outerFile *os.File, outerPath string) chan runOutcome {
-		command := exec.CommandContext(runCtx, h.pytest, "-q", "--aitest-workers=3", "test_slow_passing.py")
+		command := exec.CommandContext(runCtx, h.pytest, append([]string{"-q", "--aitest-workers=3"}, multiSupervisorTests...)...)
 		command.Dir = filepath.Join(h.aitestDir, "testdata")
 		command.WaitDelay = 15 * time.Second
 		command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(outerFile.Fd())}
@@ -804,8 +812,8 @@ func TestRealPytestAitestMultiSupervisorSafe(t *testing.T) {
 		if strings.Contains(text, "falling back to") || strings.Contains(text, "UNCONFINED") {
 			t.Fatalf("supervisor %s fell back to unconfined execution (containment stripped):\n%s", name, text)
 		}
-		if !strings.Contains(text, "8 passed") {
-			t.Fatalf("supervisor %s did not report all 8 slow tests passed:\nerr=%v\n%s", name, o.err, text)
+		if !strings.Contains(text, strconv.Itoa(len(multiSupervisorTests))+" passed") {
+			t.Fatalf("supervisor %s did not report all its slow tests passed:\nerr=%v\n%s", name, o.err, text)
 		}
 		if o.err != nil {
 			t.Fatalf("supervisor %s exited nonzero: %v\n%s", name, o.err, text)
