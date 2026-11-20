@@ -364,7 +364,10 @@ func TestRestartMergeGateAitestPoolReanchorsAcrossRestart(t *testing.T) {
 	//    too: their relay keepers reconnect at 2/sec and re-anchor once B is up.
 	cancelA()
 	awaitServerShutdown(t, doneA)
-	time.Sleep(testdeadline.Wait(3 * time.Second))
+	// A fixed gap, not testdeadline.Wait (a liveness backstop that floors at
+	// 5 s): it must outlast at least one 1 s growth-probe tick
+	// (_GROWTH_PROBE_INTERVAL_SECONDS) so a probe really dials the dead socket.
+	time.Sleep(2500 * time.Millisecond)
 	serverB, cancelB, doneB := h.startServer(t)
 	defer func() { cancelB(); awaitServerShutdown(t, doneB) }()
 
