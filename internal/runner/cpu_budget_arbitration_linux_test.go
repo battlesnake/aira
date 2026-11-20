@@ -77,11 +77,7 @@ func killIntentEvents(t *testing.T, r *Runner) int {
 }
 
 func TestAIRA136CPUBudgetAgainstAlreadyExitedLeaderArbitratesToExited(t *testing.T) {
-	// One iteration is enough: the gated-stdin hold outlasts the deadline, so
-	// every iteration takes the same branch, and the arbitrated == 0 guard
-	// below fails closed if it ever does not. The genuine race is the
-	// env-gated straddle soak.
-	const iterations = 1
+	const iterations = 4
 	const budget = 50 * time.Millisecond
 	arbitrated := 0
 	for i := 0; i < iterations; i++ {
