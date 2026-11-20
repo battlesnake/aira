@@ -379,85 +379,6 @@ func newRealDaemonAndCgroupTestHarness(t *testing.T) realDaemonAndCgroupTestHarn
 	}
 }
 
-func TestRealPytestAitestEndToEndRealDaemonAndCgroupPassFailOnly(t *testing.T) {
-	// The default tier previously had no real daemon/cgroup coverage because
-	// the existing full-fixture test below includes test_oom.py. AIRA-35's
-	// host-dependent OOM convergence is orthogonal to bootstrap, admission,
-	// delegation, and worker placement, so exclude only that hazardous file.
-	harness := newRealDaemonAndCgroupTestHarness(t)
-
-	runCtx, cancelRun := context.WithTimeout(context.Background(), testdeadline.Wait(time.Minute))
-	defer cancelRun()
-	command := exec.CommandContext(runCtx, harness.pytest, "-q", "--aitest-workers=2", "test_pass.py", "test_fail.py")
-	command.Dir = filepath.Join(harness.aitestDir, "testdata")
-	// WaitDelay is load-bearing on a real-cgroup run, not defensive padding.
-	// CommandContext kills the pytest process at the deadline, but
-	// CombinedOutput then waits for the output PIPES to close, and a
-	// grandchild holding a duplicate write end keeps them open regardless --
-	// the same inherited-write-end property AIRA-40 documents for the worker
-	// result pipe. Found by deliberately mutating CreateWorkerScope to restore
-	// memory.high and running this test: the context fired at its deadline and
-	// the run still hung until Go's own 10-MINUTE package timeout, because the
-	// worker was stuck in mem_cgroup_handle_over_high in an unkillable D-state
-	// (observed live: state DN, wchan __mem_cgroup_handle_over_high, 7107
-	// memory.high events and ZERO memory.max events after 640 s). That is the
-	// AIRA-35 hazard itself, and it is exactly what an UN-GATED test must not
-	// be able to inflict on a shared machine when someone regresses the fix.
-	//
-	// Re-measured with this line in place, same mutant: the run fails in 76 s
-	// (the 60 s context plus this delay) instead of 600 s. Not an absolute
-	// guarantee -- a task wedged in an uninterruptible kernel path cannot be
-	// bounded from userspace at all, which is the whole point of removing the
-	// path rather than policing it -- but it turns the common case from Go's
-	// 10-minute package timeout into a prompt, attributable failure.
-	command.WaitDelay = 15 * time.Second
-
-	command.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(harness.outerFile.Fd())}
-	command.Env = append(environForRealDaemonAitest(),
-		"PYTHONPATH="+filepath.Dir(harness.aitestDir),
-		"PYTHONDONTWRITEBYTECODE=1",
-		"AIRA_AITEST_LIB="+harness.pythonDir,
-		// S2a: the launcher hands the supervisor its outer scope and admission
-		// grade in the environment (no aitest-bootstrap subprocess). This is the
-		// real absolute cgroup path the supervisor is placed into above, exactly
-		// what the daemon resolves worker sub-reservations against.
-		"AIRA_AITEST_OUTER_SCOPE="+harness.outerFile.Name(),
-		"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
-		"AIRA_AITEST_WORKER_ADMIT_CMD="+harness.binary,
-		"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(32<<20),
-		"AIRA_REAL_CGROUP=1",
-	)
-	output, err := command.CombinedOutput()
-	text := string(output)
-	if !strings.Contains(text, "test_pass.py::test_one passed") {
-		t.Fatalf("pytest output missing expected pass line: %v\n%s", err, text)
-	}
-	if !strings.Contains(text, "test_fail.py::test_deliberate_failure failed") {
-		t.Fatalf("pytest output missing expected fail line: %v\n%s", err, text)
-	}
-	// Positive proof this test actually exercises the GRANTED (confined)
-	// path, not a silent total fallback to unconfined execution (found by
-	// Sol build-review, AIRA-38 review wave): the fallback-mode pytest run
-	// (TestRealPytestAitestEndToEndFallback) produces these IDENTICAL
-	// pass/fail lines, so checking only those two lines cannot distinguish
-	// real containment from a bootstrap/placement regression that fell
-	// back silently -- exactly the AIRA-38 class of bug this branch
-	// already had once (the aggregate guard's supervisor-scope read).
-	// _disable_daemon (supervisor.py) emits this exact warning on EVERY
-	// path that disables daemon-backed admission -- its absence is direct
-	// evidence containment held throughout this run.
-	if strings.Contains(text, "falling back to") || strings.Contains(text, "UNCONFINED") {
-		t.Fatalf("real daemon+cgroup run unexpectedly fell back to unconfined execution:\n%s", text)
-	}
-	// Slice 2: a real CONFINED worker's TestReport must survive the round trip
-	// too, not only a fallback worker's -- the confined path forks through
-	// spawn_worker/place_self rather than _spawn_fallback_worker, and both must
-	// converge on the same child-init and event wire.
-	if !strings.Contains(text, "this test is meant to fail") {
-		t.Fatalf("confined run lost the replayed failure traceback:\n%s", text)
-	}
-}
-
 func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	// UN-GATED since AIRA-35. This test was opt-in-only (AIRA_AITEST_SLOW_E2E=1)
 	// because a worker's deliberate over-allocation could sit in the kernel's
@@ -484,13 +405,13 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	// rather than assert something the host cannot deliver.
 	if _, err := os.Stat(filepath.Join(filepath.Dir(harness.outerFile.Name()), "memory.swap.max")); err != nil {
 		t.Skipf("this host exposes no memory.swap.max (%v), so per-worker swap containment "+
-			"cannot be established here -- the OOM leg of this e2e is unevaluated, not passing", err)
+			"cannot be established here -- this e2e (its confined pass/fail and OOM legs) is unevaluated, not passing", err)
 	}
 
 	// Hard bound: this must NEVER be able to hang the test run indefinitely.
 	// 60 s replaces the old 4 minutes now that convergence is sub-second: the
-	// pass/fail parts complete in well under a second (per the sibling
-	// pass/fail-only test) and the OOM leg adds the kill plus one requeue. It
+	// pass/fail parts complete in well under a second and the OOM leg adds the
+	// kill plus one requeue. It
 	// stays a generous multiple of the real cost so a loaded shared machine
 	// does not flake, while still turning any return of the multi-minute
 	// throttle into a finite, diagnosable failure rather than an unbounded hang.
@@ -550,6 +471,25 @@ func TestRealPytestAitestEndToEndRealDaemonAndCgroup(t *testing.T) {
 	}
 	if !strings.Contains(text, "test_fail.py::test_deliberate_failure failed") {
 		t.Fatalf("pytest output missing expected fail line: %v\n%s", err, text)
+	}
+	// Positive proof this test actually exercises the GRANTED (confined)
+	// path, not a silent total fallback to unconfined execution (found by
+	// Sol build-review, AIRA-38 review wave): the fallback-mode pytest run
+	// (TestRealPytestAitestEndToEndFallback) produces these IDENTICAL
+	// pass/fail lines, so checking only those two lines cannot distinguish
+	// real containment from a bootstrap/placement regression that fell
+	// back silently. _disable_daemon (supervisor.py) emits this exact
+	// warning on EVERY path that disables daemon-backed admission -- its
+	// absence is direct evidence containment held throughout this run.
+	if strings.Contains(text, "falling back to") || strings.Contains(text, "UNCONFINED") {
+		t.Fatalf("real daemon+cgroup run unexpectedly fell back to unconfined execution:\n%s", text)
+	}
+	// A real CONFINED worker's TestReport must survive the round trip too,
+	// not only a fallback worker's -- the confined path forks through
+	// spawn_worker/place_self rather than _spawn_fallback_worker, and both
+	// must converge on the same child-init and event wire.
+	if !strings.Contains(text, "this test is meant to fail") {
+		t.Fatalf("confined run lost the replayed failure traceback:\n%s", text)
 	}
 	// The OOM test exceeds its 32 MiB worker cap deterministically on both
 	// the original attempt and the one requeue-once retry (Task 15) --
