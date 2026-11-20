@@ -544,6 +544,16 @@ func TestLiveTeeForcedCloseDisablesBlockedSink(t *testing.T) {
 }
 
 func TestLiveTeeCancelDuringNormalJoinKeepsCaptureComplete(t *testing.T) {
+	// AIRA-364: the test used to cancel after a fixed 50 ms sleep, which on a
+	// loaded gate landed either inside collectCapture (a correct forced close,
+	// so a false fail) or before the join began (the ctx.Err pre-check, so the
+	// join's own cancel arm went untested). The seam fires once Launch has
+	// collected the capture, committed the terminal record and entered the join.
+	joining := make(chan struct{})
+	var joinOnce sync.Once
+	previousJoinHook := liveJoinHook
+	liveJoinHook = func() { joinOnce.Do(func() { close(joining) }) }
+	t.Cleanup(func() { liveJoinHook = previousJoinHook })
 	r := realRunner(t)
 	sink := newBlockingSink()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -564,36 +574,34 @@ func TestLiveTeeCancelDuringNormalJoinKeepsCaptureComplete(t *testing.T) {
 	case <-testdeadline.After(2 * time.Second):
 		t.Fatal("live sink did not become blocked")
 	}
-	var path string
-	deadline := testdeadline.After(2 * time.Second)
-	for path == "" {
-		if record, err := r.Get("RUN-1"); err == nil {
-			path = record.OutputRefs["out"].Path
-			if path != "" {
-				if data, readErr := os.ReadFile(path); readErr == nil && string(data) == "cancel-join" {
-					break
-				}
-				path = ""
-			}
-		}
-		select {
-		case <-deadline:
-			t.Fatal("capture did not reach EOF-complete bytes before cancel")
-		default:
-			time.Sleep(5 * time.Millisecond)
-		}
+	select {
+	case <-joining:
+	case item := <-outcome:
+		t.Fatalf("launch returned without joining the blocked live writer: %+v", item)
+	case <-testdeadline.After(10 * time.Second):
+		t.Fatal("launch did not reach the live-writer join")
 	}
-	// Let Launch pass the completed capture result into collectCapture and
-	// reach the normal live-writer join before exercising cancellation.
-	time.Sleep(50 * time.Millisecond)
 	cancel()
 	select {
 	case item := <-outcome:
 		if item.err != nil || item.record == nil || !item.record.CaptureComplete || item.record.CaptureForcedClosed {
-			t.Fatalf("cancel join launch=%+v", item)
+			if item.record == nil {
+				t.Fatalf("cancel join launch err=%v record=nil", item.err)
+			}
+			t.Fatalf("cancel join launch err=%v complete=%v forced=%v codes=%v", item.err, item.record.CaptureComplete, item.record.CaptureForcedClosed, item.record.ErrorCodes)
 		}
-		if item.record.OutputRefs["out"].Digest == "" {
+		ref := item.record.OutputRefs["out"]
+		if ref.Digest == "" {
 			t.Fatal("cancel join lost capture digest")
+		}
+		// A complete flag says the drain saw EOF; only the bytes on disk prove
+		// the capture holds every byte the child wrote.
+		data, err := os.ReadFile(ref.Path)
+		if err != nil {
+			t.Fatalf("read capture %q: %v", ref.Path, err)
+		}
+		if string(data) != "cancel-join" {
+			t.Fatalf("cancel join capture = %q, want %q", data, "cancel-join")
 		}
 	case <-testdeadline.After(3 * time.Second):
 		t.Fatal("cancel during normal live join did not return")

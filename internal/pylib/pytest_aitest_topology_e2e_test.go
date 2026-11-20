@@ -438,14 +438,6 @@ func readCgroupProcs(dir string) []int {
 	return pids
 }
 
-// processAlive reports whether a pid is a live process (signal 0 probe). Used
-// only as corroboration of the primary "scope dir is gone" proof — pid reuse
-// makes it weaker, so the dir-removal check is authoritative (rmdir requires an
-// empty cgroup, so a removed worker scope PROVES no process survived in it).
-func processAlive(pid int) bool {
-	return syscall.Kill(pid, 0) == nil
-}
-
 // waitScopePopulated polls a worker scope's cgroup.procs until it holds at least
 // one process (the worker forked in the parent leaf and place_self'd into its
 // sibling scope, then pulled a nodeid and began its blocked test — a small window
@@ -466,24 +458,22 @@ func waitScopePopulated(t *testing.T, dir string, timeout time.Duration) []int {
 }
 
 // populatedWorkerScope is one live worker sibling scope captured before the
-// parent kill: its directory (WorkerScopeChildPath == <slice>/.aira-<id>) and the
-// pids it held while populated.
+// parent kill: its directory (WorkerScopeChildPath == <slice>/.aira-<id>).
 type populatedWorkerScope struct {
-	id   string
-	dir  string
-	pids []int
+	id  string
+	dir string
 }
 
 // capturePopulatedWorkerScopes waits for each granted worker lease's sibling scope
-// to become populated and records its dir + pids — the pre-kill state the orphan
+// to become populated and records its dir — the pre-kill state the orphan
 // check is asserted against.
 func capturePopulatedWorkerScopes(t *testing.T, leases map[string]int64, slice string) []populatedWorkerScope {
 	t.Helper()
 	out := make([]populatedWorkerScope, 0, len(leases))
 	for id := range leases {
 		dir := runner.WorkerScopeChildPath(slice, id)
-		pids := waitScopePopulated(t, dir, testdeadline.Wait(15*time.Second))
-		out = append(out, populatedWorkerScope{id: id, dir: dir, pids: pids})
+		waitScopePopulated(t, dir, testdeadline.Wait(15*time.Second))
+		out = append(out, populatedWorkerScope{id: id, dir: dir})
 	}
 	return out
 }
@@ -517,15 +507,13 @@ func assertNoOrphanAfterParentKill(t *testing.T, outer string, workers []populat
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	// Corroboration: every process we saw in a worker scope is now dead. (The
-	// dir-removal above is the authoritative proof — rmdir needs an empty cgroup.)
-	for _, w := range workers {
-		for _, pid := range w.pids {
-			if processAlive(pid) {
-				t.Fatalf("worker %s process %d survived the parent kill (its scope dir was removed but the pid is still alive — pid reuse, or a real leak)", w.id, pid)
-			}
-		}
-	}
+	// The dir removal above is the proof that no worker is still running in its
+	// scope: rmdir needs an empty cgroup, and a killed process leaves its cgroup
+	// before it is reaped. It assumes no worker migrated OUT of its scope (this
+	// fixture and the daemon never move one); a descendant that escapes its scope
+	// is witnessed by the descendant-escape attestation, not by this test. A
+	// per-pid liveness probe added nothing under that assumption and false-failed
+	// on an unreaped zombie or a reused pid (AIRA-364), so it is not repeated.
 }
 
 // startBlockingAitestPool launches a real pytest aitest pool whose fixture tests

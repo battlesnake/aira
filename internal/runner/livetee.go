@@ -14,6 +14,11 @@ var liveQueueDepth = 64
 // leaves it nil.
 var liveStreamCreateHook func()
 
+// liveJoinHook is a package-local test seam: finishLiveStreams calls it once it
+// has committed to the normal live-writer join, just before waiting on it.
+// Production code leaves it nil.
+var liveJoinHook func()
+
 const liveMarkerFormat = "[aira: %d bytes elided from live view — see run-log]"
 
 type liveChunk struct {
