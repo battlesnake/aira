@@ -47,17 +47,27 @@ const grantedRelayHoldDwell = 1 * time.Second
 // on a correct build and still fails a wedged one.
 const grantedRelayExitBudget = 30 * time.Second
 
-// buildAiraBinary compiles the real CLI for a subprocess boundary test. Shared
-// by the two worker-admit CLI boundary tests so they cannot drift on how the
-// binary under test is produced.
+// buildAiraBinary returns the real CLI for a subprocess boundary test, built
+// once per test binary (airaBuild, main_test.go): every caller only executes
+// it, so the worker-admit CLI and AIRA-108 tests share one build of the tree
+// and cannot drift on how the binary under test is produced. A failed build
+// fails every caller with the same output.
 func buildAiraBinary(t *testing.T) string {
 	t.Helper()
-	binary := filepath.Join(t.TempDir(), "aira")
-	build := exec.Command("go", "build", "-o", binary, "aira/cmd/aira")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build aira binary: %v\n%s", err, output)
+	airaBuild.once.Do(func() {
+		dir, err := os.MkdirTemp("", "aira-bin-")
+		if err != nil {
+			airaBuild.err = err
+			return
+		}
+		airaBuild.dir = dir
+		airaBuild.path = filepath.Join(dir, "aira")
+		airaBuild.output, airaBuild.err = exec.Command("go", "build", "-o", airaBuild.path, "aira/cmd/aira").CombinedOutput()
+	})
+	if airaBuild.err != nil {
+		t.Fatalf("build aira binary: %v\n%s", airaBuild.err, airaBuild.output)
 	}
-	return binary
+	return airaBuild.path
 }
 
 // relayLine is the relay's first stdout line, read by the goroutine that owns

@@ -157,14 +157,7 @@ func newRestartGateHarness(t *testing.T, needPytest bool) *restartGateHarness {
 		}
 	}
 
-	binary := filepath.Join(t.TempDir(), "aira")
-	// A plain build: it runs inside the outer `aira confine -- go test` scope and
-	// is charged to it (AIRA-315; a nested confine queued for its own admission
-	// with no time limit inside the package's go-test timeout).
-	build := exec.Command("go", "build", "-o", binary, "aira/cmd/aira")
-	if buildOutput, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build aira binary: %v\n%s", err, buildOutput)
-	}
+	binary := builtAiraBinary(t)
 
 	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
 	t.Setenv("XDG_RUNTIME_DIR", shortE2ERuntimeDir(t))
