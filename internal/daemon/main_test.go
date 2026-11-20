@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"os"
+	"sync"
 	"testing"
 
 	"aira/internal/runner"
@@ -26,5 +27,19 @@ func TestMain(m *testing.M) {
 		os.Exit(runner.RunConfineSetup(os.Args[2:], os.Stderr))
 	}
 	_ = os.Setenv("AIRA_DAEMON_SCOPE_REAP_INTERVAL", "disabled")
-	os.Exit(m.Run())
+	code := m.Run()
+	if airaBuild.dir != "" {
+		_ = os.RemoveAll(airaBuild.dir)
+	}
+	os.Exit(code)
+}
+
+// airaBuild is the real aira CLI built once per test binary by buildAiraBinary
+// (Linux only); TestMain removes its directory.
+var airaBuild struct {
+	once   sync.Once
+	dir    string
+	path   string
+	output []byte
+	err    error
 }

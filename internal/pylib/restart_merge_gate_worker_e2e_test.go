@@ -157,14 +157,7 @@ func newRestartGateHarness(t *testing.T, needPytest bool) *restartGateHarness {
 		}
 	}
 
-	binary := filepath.Join(t.TempDir(), "aira")
-	// A plain build: it runs inside the outer `aira confine -- go test` scope and
-	// is charged to it (AIRA-315; a nested confine queued for its own admission
-	// with no time limit inside the package's go-test timeout).
-	build := exec.Command("go", "build", "-o", binary, "aira/cmd/aira")
-	if buildOutput, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build aira binary: %v\n%s", err, buildOutput)
-	}
+	binary := builtAiraBinary(t)
 
 	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
 	t.Setenv("XDG_RUNTIME_DIR", shortE2ERuntimeDir(t))
@@ -364,7 +357,10 @@ func TestRestartMergeGateAitestPoolReanchorsAcrossRestart(t *testing.T) {
 	//    too: their relay keepers reconnect at 2/sec and re-anchor once B is up.
 	cancelA()
 	awaitServerShutdown(t, doneA)
-	time.Sleep(testdeadline.Wait(3 * time.Second))
+	// A fixed gap, not testdeadline.Wait (a liveness backstop that floors at
+	// 5 s): it must outlast at least one 1 s growth-probe tick
+	// (_GROWTH_PROBE_INTERVAL_SECONDS) so a probe really dials the dead socket.
+	time.Sleep(2500 * time.Millisecond)
 	serverB, cancelB, doneB := h.startServer(t)
 	defer func() { cancelB(); awaitServerShutdown(t, doneB) }()
 

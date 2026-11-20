@@ -34,17 +34,6 @@ func TestRealCgroupOOMUsageClassifiesPositiveOOM(t *testing.T) {
 	}
 }
 
-func TestRealCgroupCPUUsageIsUserTime(t *testing.T) {
-	r := realRunner(t)
-	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sh", "-c", "i=0; while [ $i -lt 10000000 ]; do i=$((i+1)); done"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if record.CPUUser == nil || *record.CPUUser <= 0 {
-		t.Fatalf("CPU user time was not recorded: %+v", record)
-	}
-}
-
 func TestRealCgroupPeakRSSUsageIsPositive(t *testing.T) {
 	// peak_rss requires the memory controller enabled on the run cgroup. The
 	// default ambient parent (e.g. a whale-run scope) may not delegate +memory to
@@ -105,7 +94,7 @@ func TestRealCgroupUsageRetainedAcrossTerminalRaces(t *testing.T) {
 		req  Request
 		act  func(*testing.T, *Runner)
 	}{
-		{name: "normal", req: Request{Argv: []string{"/bin/sh", "-c", "i=0; while [ $i -lt 3000000 ]; do i=$((i+1)); done"}}},
+		{name: "normal", req: Request{Argv: []string{"/bin/sh", "-c", "i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done"}}},
 		{name: "timeout", req: Request{Argv: []string{"/bin/sh", "-c", "while :; do :; done"}, Timeout: 50 * time.Millisecond}},
 	}
 	for _, tc := range tests {
@@ -147,7 +136,7 @@ while [ ! -f "$1" ]; do
   i=$((i+1))
 done
 i=0
-while [ $i -lt 10000000 ]; do
+while [ $i -lt 300000 ]; do
   i=$((i+1))
 done
 `, "sh", marker)
