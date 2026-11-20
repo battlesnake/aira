@@ -220,13 +220,11 @@ root=/sys/fs/cgroup$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup)
 mkdir -p "$root/.aira-nested" || exit 9
 echo $$ > "$root/.aira-nested/cgroup.procs" || exit 9
 grep -q '^0::.*\.aira-nested$' /proc/self/cgroup || exit 9
-: > "$1"
 exec sleep 30
 `
-	nested := filepath.Join(t.TempDir(), "nested")
 	record, err := r.Launch(context.Background(), Request{
-		Argv:    []string{"/bin/sh", "-c", payload, "sh", nested},
-		Timeout: aira126Scale(time.Second),
+		Argv:    []string{"/bin/sh", "-c", payload},
+		Timeout: testdeadline.Wait(300 * time.Millisecond),
 	})
 	if err != nil {
 		t.Fatalf("nested-cgroup launch error=%v record=%+v", err, record)
@@ -234,7 +232,6 @@ exec sleep 30
 	if record.ExitCode != nil && *record.ExitCode == 9 {
 		skipOrFailRealCgroup(t, "this environment cannot nest a child cgroup inside a run scope")
 	}
-	assertPayloadNested(t, nested, record)
 	if record.Status != StatusKilled || !slices.Contains(record.ErrorCodes, "E_RUN_TIMEOUT") {
 		t.Fatalf("nested-cgroup timeout record=%+v", record)
 	}

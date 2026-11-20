@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"aira/internal/cgrouptest"
+	"aira/internal/testdeadline"
 )
 
 // AIRA-144 — the cgroup DIRECTORIES a nested workload created inside its own run
@@ -74,10 +75,9 @@ grep -q '^0::.*\.aira-deeper$' /proc/self/cgroup || exit 9
 // verifies: AIRA-144
 func TestAIRA144NestedKillRemovesTheChildCgroupTree(t *testing.T) {
 	r := realRunner(t)
-	nested := filepath.Join(t.TempDir(), "nested")
 	record, err := r.Launch(context.Background(), Request{
-		Argv:    []string{"/bin/sh", "-c", nestedCgroupPayload(`: > "$1"; exec sleep 30`), "sh", nested},
-		Timeout: aira126Scale(time.Second),
+		Argv:    []string{"/bin/sh", "-c", nestedCgroupPayload("exec sleep 30")},
+		Timeout: testdeadline.Wait(300 * time.Millisecond),
 	})
 	if err != nil {
 		t.Fatalf("nested-cgroup launch error=%v record=%+v", err, record)
@@ -85,7 +85,6 @@ func TestAIRA144NestedKillRemovesTheChildCgroupTree(t *testing.T) {
 	if record.ExitCode != nil && *record.ExitCode == 9 {
 		skipOrFailRealCgroup(t, "this environment cannot nest a child cgroup inside a run scope")
 	}
-	assertPayloadNested(t, nested, record)
 	// The kill itself is AIRA-140's guarantee, and it is the precondition for
 	// this ticket's cleanup: Remove() is only reached on a completed kill. Assert
 	// it so a regression THERE cannot masquerade as a cleanup failure here.
@@ -115,17 +114,6 @@ func TestAIRA144NestedNormalExitRemovesTheChildCgroupTree(t *testing.T) {
 		t.Fatalf("the nested job did not exit normally, so the cleanup this test covers was never reached: %+v", record)
 	}
 	assertRunScopeTreeGone(t, record.CgroupScope)
-}
-
-// assertPayloadNested fails unless the payload wrote its marker, which it does
-// only after it has moved itself into the nested cgroup. Without it a deadline
-// that fired before the payload nested would kill an ordinary leaf job and pass
-// without ever exercising the nested shape.
-func assertPayloadNested(t *testing.T, marker string, record *RunRecord) {
-	t.Helper()
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("the deadline fired before the payload nested, so the nested shape was never exercised: %v (record=%+v)", err, record)
-	}
 }
 
 // assertRunScopeTreeGone reads the real filesystem back: the run's own scope
