@@ -2618,7 +2618,9 @@ func TestConfineRealOOMGroupWrittenAndEffective(t *testing.T) {
 	if observation.oomGroup != "1" {
 		t.Fatalf("memory.oom.group=%q, want 1", observation.oomGroup)
 	}
-	time.Sleep(2200 * time.Millisecond)
+	// No sleep before this check. If the group kill were ineffective the OOM
+	// killer would take python alone and the shell's `wait` would return only
+	// after the subshell wrote the marker, so the marker already exists here.
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("non-OOMing sibling survived group OOM: marker err=%v", err)
 	}

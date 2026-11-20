@@ -258,7 +258,9 @@ func TestRealRunScopeMemoryCapIsolation(t *testing.T) {
 	if observation.maximum != strconv.FormatInt(32<<20, 10) || observation.oomGroup != "1" {
 		t.Fatalf("scope read-back=%+v", observation)
 	}
-	time.Sleep(2200 * time.Millisecond)
+	// No sleep before this check. If the group kill were ineffective the OOM
+	// killer would take python alone and the shell's `wait` would return only
+	// after the subshell wrote the marker, so the marker already exists here.
 	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("same-scope child survived group OOM: %v", err)
 	}
