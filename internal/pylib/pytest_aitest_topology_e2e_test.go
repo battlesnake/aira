@@ -656,8 +656,8 @@ func TestRealPytestAitestParentKillLeavesNoOrphanPostRestart(t *testing.T) {
 }
 
 // multiSupervisorTests is each supervisor's suite. Four 1.5 s tests on three
-// asked-for workers keep both supervisors demanding more than the 2-worker
-// ceiling for the whole overlap; eight only made the run longer.
+// asked-for workers keep both supervisors demanding more than the ledger holds
+// for the whole overlap; eight only made the run longer.
 var multiSupervisorTests = []string{
 	"test_slow_passing.py::test_s0", "test_slow_passing.py::test_s1",
 	"test_slow_passing.py::test_s2", "test_slow_passing.py::test_s3",
@@ -665,8 +665,11 @@ var multiSupervisorTests = []string{
 
 // TestRealPytestAitestMultiSupervisorSafe is Gate C (AIRA-232): two independent
 // aitest supervisors (the `make -j` shape) under one slice, driven by one daemon,
-// cannot jointly breach the slice ledger. The ledger is pinned so exactly TWO
-// pytest workers fit; both supervisors continuously demand workers (4 slow tests
+// cannot jointly breach the slice ledger. The ledger is pinned to two 256 MiB
+// workers' worth, and each lease is 512 MiB, so in practice ONE worker fits at a
+// time (every passing run logs "max combined granted workers=1"); the sum check
+// below is what bites, and the "more than 2 leases" arm cannot fire (a pre-existing
+// property, recorded in AIRA-367). Both supervisors continuously demand workers (4 slow tests
 // each, 3 workers asked), so their combined demand exceeds the ceiling. The
 // daemon serialises them against the ONE ledger: at every sampled instant the combined granted
 // worker set is <= 2 and Σ(reserve) <= 2 workers' worth — there is no client
