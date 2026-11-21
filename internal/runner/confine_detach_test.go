@@ -283,3 +283,106 @@ func TestListConfineDetachStatusesIsOwnerScopedAndNewestFirst(t *testing.T) {
 		t.Fatalf("listing is not newest-first: %q then %q", listed[0].Record.ScopeID, listed[1].Record.ScopeID)
 	}
 }
+
+// supervisorListedCommand renders a detached supervisor's command exactly as
+// `confine --list` does: the shim's /proc/<pid>/cmdline (argv[0] is the self
+// path), read through the same bound readProcCmdline applies.
+func supervisorListedCommand(argv []string) (string, bool) {
+	data := []byte("/proc/self/exe\x00" + strings.Join(argv, "\x00") + "\x00")
+	if len(data) > ConfineCommandWireLimit+1 {
+		data = data[:ConfineCommandWireLimit+1]
+	}
+	return confineCommandFromCmdline(data)
+}
+
+// TestConfineSupervisorArgvListsTheJobNotTheLauncher pins AIRA-368: a detached
+// supervisor's own command line carries a display copy of the job's argv after
+// its first bare `--`, so the listing shows the job rather than the
+// `__confine-supervise --control ...` launcher line, while the hidden verb's
+// flags still parse to the control file and are not reachable from job argv.
+//
+// verifies: AIRA-368
+func TestConfineSupervisorArgvListsTheJobNotTheLauncher(t *testing.T) {
+	const control = "/state/confine-detach-1.ctrl"
+	for _, tc := range []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{"plain", []string{"sleep", "120"}, "sleep 120"},
+		{"inner separator", []string{"git", "log", "--", "file"}, "git log -- file"},
+		{"spoofed flags", []string{"--control", "/evil", "--ready-fd", "9"}, "--control /evil --ready-fd 9"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shim := confineSupervisorArgv(control, tc.argv)
+			if shim[0] != ConfineSupervisorVerb {
+				t.Fatalf("argv[1] = %q, want the hidden verb", shim[0])
+			}
+			got, ok := supervisorListedCommand(shim)
+			if !ok || got != tc.want {
+				t.Fatalf("listed command = %q (ok=%v), want %q", got, ok, tc.want)
+			}
+			gotControl, readyFD, ackFD, err := ParseConfineSupervisorArgs(shim[1:])
+			if err != nil || gotControl != control || readyFD != 3 || ackFD != 4 {
+				t.Fatalf("parse = %q %d %d %v, want the launcher's own flags", gotControl, readyFD, ackFD, err)
+			}
+		})
+	}
+}
+
+// TestConfineSupervisorArgvBoundsTheDisplayCopy: the display copy must stay near
+// the listing's read bound however large the job's argv is (it is an extra copy
+// on the shim's own exec), and the listing must still mark it elided.
+//
+// verifies: AIRA-368
+func TestConfineSupervisorArgvBoundsTheDisplayCopy(t *testing.T) {
+	many := make([]string, 4000)
+	for i := range many {
+		many[i] = "argument-" + strings.Repeat("x", 20)
+	}
+	for _, tc := range []struct {
+		name string
+		argv []string
+	}{
+		{"many arguments", many},
+		{"one huge argument", []string{"sh", "-c", strings.Repeat("é", 100000)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shim := confineSupervisorArgv("/c", tc.argv)
+			display := shim[8:]
+			size := 0
+			for _, arg := range display {
+				size += len(arg) + 1
+			}
+			if size > ConfineCommandWireLimit+2 {
+				t.Fatalf("display copy is %d bytes, want at most %d", size, ConfineCommandWireLimit+2)
+			}
+			got, ok := supervisorListedCommand(shim)
+			if !ok || !strings.HasSuffix(got, " …") || !strings.HasPrefix(got, tc.argv[0]+" ") {
+				t.Fatalf("listed command = %.80q... (ok=%v), want the job's argv marked elided", got, ok)
+			}
+		})
+	}
+	// An argv that fits is passed whole, not cut short.
+	shim := confineSupervisorArgv("/c", many[:10])
+	if got := len(shim) - 8; got != 10 {
+		t.Fatalf("a small argv was cut to %d arguments, want all 10", got)
+	}
+}
+
+// verifies: AIRA-368
+func TestParseConfineSupervisorArgsRefusesMalformedFlags(t *testing.T) {
+	for _, argv := range [][]string{
+		{},
+		{"--"},
+		{"--", "--control", "/c", "--ready-fd", "3", "--ack-fd", "4"},
+		{"--control", "/c", "--", "--ready-fd", "3", "--ack-fd", "4"},
+		{"--control", "/c", "--ready-fd", "3"},
+		{"--control", "/c", "--ready-fd", "3", "--ack-fd"},
+		{"--control", "/c", "--ready-fd", "3", "--ack-fd", "4", "stray"},
+	} {
+		if _, _, _, err := ParseConfineSupervisorArgs(argv); err == nil {
+			t.Fatalf("argv %q parsed, want a refusal", argv)
+		}
+	}
+}

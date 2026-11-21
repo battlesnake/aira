@@ -82,7 +82,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if len(argv) > 0 && argv[0] == "__supervise" {
 		return runSupervisor(argv[1:], stderr)
 	}
-	if len(argv) > 0 && argv[0] == "__confine-supervise" {
+	if len(argv) > 0 && argv[0] == runner.ConfineSupervisorVerb {
 		return runConfineSupervisor(argv[1:])
 	}
 	if len(argv) > 0 && strings.ToLower(argv[0]) == "daemon" {
@@ -2034,31 +2034,15 @@ func writeConfineStatusJSON(payload any, stdout, stderr io.Writer) int {
 }
 
 // runConfineSupervisor is the hidden `__confine-supervise` verb: the setsid'd
-// process that owns a detached confine job for its whole life. It mirrors
-// runSupervisor's argument handling, including reporting a malformed invocation
-// down the ready channel so the launcher learns rather than waiting out its
-// timeout.
+// process that owns a detached confine job for its whole life. Its flags are
+// parsed only up to the bare `--`; what follows is the job argv's display copy
+// (AIRA-368), which the supervisor never reads: the control file says what runs.
 func runConfineSupervisor(argv []string) int {
-	values := map[string]string{}
-	for i := 0; i < len(argv); i += 2 {
-		if i+1 >= len(argv) || !strings.HasPrefix(argv[i], "--") {
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
-		}
-		name := strings.TrimPrefix(argv[i], "--")
-		if name != "control" && name != "ready-fd" && name != "ack-fd" {
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
-		}
-		if _, exists := values[name]; exists {
-			return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
-		}
-		values[name] = argv[i+1]
-	}
-	readyFD, readyErr := strconv.Atoi(values["ready-fd"])
-	ackFD, ackErr := strconv.Atoi(values["ack-fd"])
-	if values["control"] == "" || readyErr != nil || ackErr != nil || readyFD < 0 || ackFD < 0 {
+	control, readyFD, ackFD, err := runner.ParseConfineSupervisorArgs(argv)
+	if err != nil {
 		return codes.ExitForCode("E_CONFINE_ARGUMENT_INVALID")
 	}
-	if err := superviseConfineDetached(context.Background(), values["control"], readyFD, ackFD); err != nil {
+	if err := superviseConfineDetached(context.Background(), control, readyFD, ackFD); err != nil {
 		// fd 2 is the job's supervisor.log by the time the supervisor has a record
 		// store, so this is the one place an operator can later read WHY a
 		// detached job ended the way it did. Dropping it would leave an empty log

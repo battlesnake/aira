@@ -34,31 +34,27 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	fakeSupervisorEnv       = "AIRA_CONFINE_FAKE_SUPERVISOR"
-	detachStateDirEnv       = "AIRA_CONFINE_TEST_STATE_DIR"
-	detachLaunchArgvEnv     = "AIRA_CONFINE_TEST_ARGV"
-	detachLaunchSliceEnv    = "AIRA_CONFINE_TEST_SLICE"
-	detachLaunchNoAckEnv    = "AIRA_CONFINE_TEST_SKIP_ACK"
-	detachLaunchSummaryEnv  = "AIRA_CONFINE_TEST_SUMMARY_FILE"
-	detachSuperviseHoldEnv  = "AIRA_CONFINE_TEST_HOLD"
-	detachLaunchDoneMarker  = "AIRA_CONFINE_TEST_LAUNCH_MARKER"
-	detachSuperviseRealMode = ""
+	fakeSupervisorEnv        = "AIRA_CONFINE_FAKE_SUPERVISOR"
+	fakeSupervisorCmdlineEnv = "AIRA_CONFINE_FAKE_SUPERVISOR_CMDLINE"
+	detachStateDirEnv        = "AIRA_CONFINE_TEST_STATE_DIR"
+	detachLaunchArgvEnv      = "AIRA_CONFINE_TEST_ARGV"
+	detachLaunchSliceEnv     = "AIRA_CONFINE_TEST_SLICE"
+	detachLaunchNoAckEnv     = "AIRA_CONFINE_TEST_SKIP_ACK"
+	detachLaunchSummaryEnv   = "AIRA_CONFINE_TEST_SUMMARY_FILE"
+	detachSuperviseHoldEnv   = "AIRA_CONFINE_TEST_HOLD"
+	detachLaunchDoneMarker   = "AIRA_CONFINE_TEST_LAUNCH_MARKER"
+	detachSuperviseRealMode  = ""
 )
 
 // runRealConfineSupervisor is the production entry point, invoked exactly as
 // cmd/aira invokes it, so the real-cgroup end-to-end test exercises the shipped
 // code rather than a test double.
 func runRealConfineSupervisor(argv []string) int {
-	values := map[string]string{}
-	for i := 0; i+1 < len(argv); i += 2 {
-		values[strings.TrimPrefix(argv[i], "--")] = argv[i+1]
-	}
-	readyFD, readyErr := strconv.Atoi(values["ready-fd"])
-	ackFD, ackErr := strconv.Atoi(values["ack-fd"])
-	if readyErr != nil || ackErr != nil {
+	control, readyFD, ackFD, err := ParseConfineSupervisorArgs(argv)
+	if err != nil {
 		return 2
 	}
-	if err := SuperviseConfineDetached(context.Background(), values["control"], readyFD, ackFD); err != nil {
+	if err := SuperviseConfineDetached(context.Background(), control, readyFD, ackFD); err != nil {
 		return 1
 	}
 	return 0
@@ -69,9 +65,19 @@ func runRealConfineSupervisor(argv []string) int {
 // the ready fd, one ack byte back) and uses the REAL record store, so what it
 // fakes is only the confinement itself.
 func runFakeConfineSupervisor(mode string, argv []string) int {
-	values := map[string]string{}
-	for i := 0; i+1 < len(argv); i += 2 {
-		values[strings.TrimPrefix(argv[i], "--")] = argv[i+1]
+	control, readyFD, ackFD, parseErr := ParseConfineSupervisorArgs(argv)
+	if parseErr != nil {
+		return 2
+	}
+	if mode == "cmdline" {
+		// AIRA-368: record this shim's own /proc/self/cmdline, which is exactly
+		// what `confine --list` and `ps` read for a detached job, then refuse so
+		// no job is left behind.
+		data, err := os.ReadFile("/proc/self/cmdline")
+		if err != nil || os.WriteFile(os.Getenv(fakeSupervisorCmdlineEnv), data, 0o600) != nil {
+			return 3
+		}
+		mode = "refuse"
 	}
 	if mode == "silent" {
 		// Exit without reporting anything: the launcher must treat this as a
@@ -87,7 +93,6 @@ func runFakeConfineSupervisor(mode string, argv []string) int {
 		// Report a FOREGROUND code with a detail that does NOT repeat it, which is
 		// what forces the launcher to attach the code itself rather than relying on
 		// every supervisor message happening to start with one.
-		readyFD, _ := strconv.Atoi(values["ready-fd"])
 		ready := os.NewFile(uintptr(readyFD), "ready")
 		if ready == nil {
 			return 3
@@ -97,8 +102,6 @@ func runFakeConfineSupervisor(mode string, argv []string) int {
 		})
 		return 4
 	}
-	readyFD, _ := strconv.Atoi(values["ready-fd"])
-	ackFD, _ := strconv.Atoi(values["ack-fd"])
 	ready := os.NewFile(uintptr(readyFD), "ready")
 	ack := os.NewFile(uintptr(ackFD), "ack")
 	if ready == nil || ack == nil {
@@ -106,7 +109,7 @@ func runFakeConfineSupervisor(mode string, argv []string) int {
 	}
 	announce := &detachSignal{file: ready}
 	var request ConfineRequest
-	if err := consumeControlValue(values["control"], &request); err != nil {
+	if err := consumeControlValue(control, &request); err != nil {
 		_ = announce.send(confineDetachReady{Code: CodeConfineDetachFailed, Error: err.Error()})
 		return 3
 	}
@@ -1047,6 +1050,13 @@ type superviseOutcome struct {
 // test (build review, Fable).
 func runSuperviseSubprocess(t *testing.T, request ConfineRequest, acknowledge bool) superviseOutcome {
 	t.Helper()
+	return runSuperviseSubprocessShowing(t, request, acknowledge, request.Argv)
+}
+
+// runSuperviseSubprocessShowing is runSuperviseSubprocess with the display argv
+// on the supervisor's command line chosen independently of the control file's.
+func runSuperviseSubprocessShowing(t *testing.T, request ConfineRequest, acknowledge bool, display []string) superviseOutcome {
+	t.Helper()
 	control, err := writeControlValue(request.DetachStateDir, "confine-detach-*.ctrl", request)
 	if err != nil {
 		t.Fatalf("control: %v", err)
@@ -1059,7 +1069,7 @@ func runSuperviseSubprocess(t *testing.T, request ConfineRequest, acknowledge bo
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	cmd := exec.Command(os.Args[0], "__confine-supervise", "--control", control, "--ready-fd", "3", "--ack-fd", "4")
+	cmd := exec.Command(os.Args[0], confineSupervisorArgv(control, display)...)
 	cmd.Env = append(os.Environ(), fakeSupervisorEnv+"=")
 	cmd.ExtraFiles = []*os.File{readyW, ackR}
 	if err := cmd.Start(); err != nil {
@@ -1382,6 +1392,10 @@ func TestConfineListAndKillTargetTheDetachedSupervisorPID(t *testing.T) {
 	if listed.Owner != "session-test" {
 		t.Fatalf("owner=%q, want the launching owner", listed.Owner)
 	}
+	// AIRA-368: the row names the job, not the `__confine-supervise` launcher.
+	if want := "/bin/sh -c echo started; sleep 10"; listed.Command == nil || *listed.Command != want {
+		t.Fatalf("command=%v, want %q", listed.Command, want)
+	}
 	// Kill BY SUPERVISOR PID, which is only possible because the surviving
 	// supervisor minted the id.
 	killed, err := KillConfine(context.Background(), parent, strconv.Itoa(handle.SupervisorPID), "session-test", false, nil)
@@ -1528,5 +1542,98 @@ func TestConfineDetachEndToEndSurvivesTheLauncherAndCapturesTheOutcome(t *testin
 	}
 	if record.EnvDigest == "" || record.Cwd == "" || len(record.Argv) == 0 {
 		t.Fatalf("the record cannot be used to reconstruct the run: %+v", record)
+	}
+}
+
+// launchedSupervisorCommand launches a detached job through the REAL launcher
+// (spawnDetachedShim and the production argv) against a fake supervisor that
+// records its own /proc/self/cmdline and then refuses, and returns that cmdline
+// rendered exactly as `confine --list` renders a detached row.
+func launchedSupervisorCommand(t *testing.T, argv []string) (string, bool) {
+	t.Helper()
+	capture := filepath.Join(t.TempDir(), "cmdline")
+	t.Setenv(fakeSupervisorEnv, "cmdline")
+	t.Setenv(fakeSupervisorCmdlineEnv, capture)
+	_, err := LaunchConfineDetached(context.Background(), ConfineRequest{
+		Name: "argv", Owner: "session-test", Argv: argv,
+		SelfPath: os.Args[0], DetachStateDir: t.TempDir(),
+	})
+	if err == nil || !strings.HasPrefix(err.Error(), "E_CONFINE_UNAVAILABLE:") {
+		t.Fatalf("launch = %v, want the fake supervisor's refusal (it never started if this is a spawn error)", err)
+	}
+	data, readErr := os.ReadFile(capture)
+	if readErr != nil {
+		t.Fatalf("the supervisor never recorded its cmdline: %v", readErr)
+	}
+	if len(data) > ConfineCommandWireLimit+1 {
+		data = data[:ConfineCommandWireLimit+1]
+	}
+	return confineCommandFromCmdline(data)
+}
+
+// TestDetachedSupervisorCmdlineShowsTheJobArgv pins AIRA-368 across the real
+// launch: a detached supervisor's /proc/<pid>/cmdline, which is what `confine
+// --list`, `aira top` and `ps` read, names the job and not the
+// `__confine-supervise --control ...` launcher line. A queued job has no child
+// process yet, so the supervisor's own cmdline is the only live source.
+//
+// verifies: AIRA-368
+func TestDetachedSupervisorCmdlineShowsTheJobArgv(t *testing.T) {
+	got, ok := launchedSupervisorCommand(t, []string{"/bin/sh", "-c", "echo hi -- there", "--", "x"})
+	if want := "/bin/sh -c echo hi -- there -- x"; !ok || got != want {
+		t.Fatalf("listed command = %q (ok=%v), want %q", got, ok, want)
+	}
+}
+
+// TestDetachedSupervisorSpawnsWithAnArgvPastARGMAX: the display copy is an
+// extra copy of the job's argv on the shim's own exec, so an unbounded copy
+// would make the launch itself fail with E2BIG for a large argv. The bounded
+// copy launches, and the listing marks the command elided.
+//
+// verifies: AIRA-368
+func TestDetachedSupervisorSpawnsWithAnArgvPastARGMAX(t *testing.T) {
+	argv := []string{"/bin/echo"}
+	for i := 0; i < 48; i++ {
+		argv = append(argv, strings.Repeat("a", 64<<10))
+	}
+	// Precondition: this argv really is past the exec limit here, or the test
+	// proves nothing about the bound.
+	if err := exec.Command(argv[0], argv[1:]...).Run(); err == nil || !errors.Is(err, syscall.E2BIG) {
+		t.Skipf("a %d-argument 3 MiB argv did not hit E2BIG on this kernel (%v); the bound is not exercised", len(argv), err)
+	}
+	got, ok := launchedSupervisorCommand(t, argv)
+	if !ok || !strings.HasPrefix(got, "/bin/echo aaaa") || !strings.HasSuffix(got, " …") {
+		t.Fatalf("listed command = %.60q... (ok=%v), want the job's argv marked elided", got, ok)
+	}
+}
+
+// TestDetachedSupervisorRunsTheControlFileArgvNotItsDisplayArgs: the argv after
+// the supervisor's `--` is display only. A supervisor that ran it would run
+// whatever its command line said, so the two are made to differ here and only
+// the control file's job may run.
+//
+// verifies: AIRA-368
+func TestDetachedSupervisorRunsTheControlFileArgvNotItsDisplayArgs(t *testing.T) {
+	parent := cgrouptestIsolatedParent(t)
+	state := t.TempDir()
+	evidence := t.TempDir()
+	right, wrong := filepath.Join(evidence, "control-file-job"), filepath.Join(evidence, "display-job")
+	outcome := runSuperviseSubprocessShowing(t, ConfineRequest{
+		Slice: parent, Name: "display", Owner: "session-test",
+		Argv:           []string{"/bin/sh", "-c", "touch " + right},
+		DetachStateDir: state, SelfPath: os.Args[0],
+		MemoryReserve: 64 << 20, MemoryReservePinned: true,
+	}, true, []string{"/bin/sh", "-c", "touch " + wrong})
+	if outcome.message.ScopeID == "" || outcome.exitCode != 0 {
+		t.Fatalf("the supervisor did not run the job: exit=%d %+v", outcome.exitCode, outcome.message)
+	}
+	if _, err := os.Stat(wrong); err == nil {
+		t.Fatal("the supervisor ran the display argv from its own command line")
+	}
+	if _, err := os.Stat(right); err != nil {
+		t.Fatalf("the control file's job did not run: %v", err)
+	}
+	if record := soleDetachRecord(t, state); record.Exit == nil || *record.Exit != 0 {
+		t.Fatalf("record = %+v, want the control file's job to exit 0", record)
 	}
 }
