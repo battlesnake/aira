@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-368","project":"aira","title":"confine --list / aira top: show the job's real argv for detached jobs, not the __confine-supervise launcher line","status":"planned","kind":"bug","severity":"P3","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-368","project":"aira","title":"confine --list / aira top: show the job's real argv for detached jobs, not the __confine-supervise launcher line","status":"done","kind":"bug","severity":"P3","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
 ---
 
 In `aira top` / `confine --list` a `--detach` job's row showed the hidden
