@@ -347,12 +347,15 @@ func TestConfineStatusWithNoSelectorListsTheCallersOwnJobs(t *testing.T) {
 // silently supervised the wrong thing.
 //
 // verifies: AIRA-22
+// verifies: AIRA-368
 func TestConfineSuperviseVerbRejectsMalformedArguments(t *testing.T) {
 	original := superviseConfineDetached
 	t.Cleanup(func() { superviseConfineDetached = original })
 	called := false
-	superviseConfineDetached = func(context.Context, string, int, int) error {
+	gotControl := ""
+	superviseConfineDetached = func(_ context.Context, control string, _, _ int) error {
 		called = true
+		gotControl = control
 		return nil
 	}
 	for _, argv := range [][]string{
@@ -362,6 +365,7 @@ func TestConfineSuperviseVerbRejectsMalformedArguments(t *testing.T) {
 		{"__confine-supervise", "--control", "/c", "--ready-fd", "3", "--ack-fd", "-1"},
 		{"__confine-supervise", "--nope", "1", "--control", "/c", "--ready-fd", "3", "--ack-fd", "4"},
 		{"__confine-supervise", "--control", "/c", "--control", "/d", "--ready-fd", "3", "--ack-fd", "4"},
+		{"__confine-supervise", "--", "--control", "/c", "--ready-fd", "3", "--ack-fd", "4"},
 	} {
 		if exit := runWithInput(argv, io.Discard, io.Discard, strings.NewReader("")); exit != 2 {
 			t.Fatalf("argv %v exit=%d, want 2", argv, exit)
@@ -373,6 +377,13 @@ func TestConfineSuperviseVerbRejectsMalformedArguments(t *testing.T) {
 	if exit := runWithInput([]string{"__confine-supervise", "--control", "/c", "--ready-fd", "3", "--ack-fd", "4"},
 		io.Discard, io.Discard, strings.NewReader("")); exit != 0 || !called {
 		t.Fatalf("a well-formed invocation did not reach the supervisor (exit=%d called=%v)", exit, called)
+	}
+	// AIRA-368: the job argv's display copy after `--` is ignored, so a job
+	// argument cannot replace the control file the launcher named.
+	called = false
+	if exit := runWithInput([]string{"__confine-supervise", "--control", "/c", "--ready-fd", "3", "--ack-fd", "4",
+		"--", "--control", "/evil", "--", "x"}, io.Discard, io.Discard, strings.NewReader("")); exit != 0 || !called || gotControl != "/c" {
+		t.Fatalf("display args changed the supervision (exit=%d called=%v control=%q)", exit, called, gotControl)
 	}
 }
 

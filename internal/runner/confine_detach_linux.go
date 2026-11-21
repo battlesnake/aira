@@ -106,9 +106,7 @@ func LaunchConfineDetached(ctx context.Context, request ConfineRequest) (*Confin
 		_ = readyW.Close()
 		return nil, fmt.Errorf("%s: %w", CodeConfineDetachFailed, err)
 	}
-	cmd, err := spawnDetachedShim(self,
-		[]string{"__confine-supervise", "--control", control, "--ready-fd", "3", "--ack-fd", "4"},
-		[]*os.File{readyW, ackR})
+	cmd, err := spawnDetachedShim(self, confineSupervisorArgv(control, request.Argv), []*os.File{readyW, ackR})
 	if err != nil {
 		closeOutputFiles(map[string]*os.File{"ready-r": readyR, "ready-w": readyW, "ack-r": ackR, "ack-w": ackW})
 		return nil, fmt.Errorf("%s: start supervisor: %w", CodeConfineDetachFailed, err)

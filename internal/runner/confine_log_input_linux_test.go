@@ -364,7 +364,7 @@ func startSuperviseSubprocess(t *testing.T, request ConfineRequest) *superviseHa
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	cmd := exec.Command(os.Args[0], "__confine-supervise", "--control", control, "--ready-fd", "3", "--ack-fd", "4")
+	cmd := exec.Command(os.Args[0], confineSupervisorArgv(control, request.Argv)...)
 	cmd.Env = append(os.Environ(), fakeSupervisorEnv+"=")
 	cmd.ExtraFiles = []*os.File{readyW, ackR}
 	if err := cmd.Start(); err != nil {

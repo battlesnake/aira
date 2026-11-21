@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -402,4 +403,74 @@ func FormatConfineDetachStatus(status ConfineDetachStatus) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// ConfineSupervisorVerb is the hidden verb a `confine --detach` launcher re-execs
+// itself as. It is the one spelling shared by the launcher, the CLI dispatch and
+// the tests.
+const ConfineSupervisorVerb = "__confine-supervise"
+
+// confineSupervisorArgv is the detached supervisor's command line:
+//
+//	__confine-supervise --control C --ready-fd 3 --ack-fd 4 -- <job argv...>
+//
+// Everything after the `--` is DISPLAY ONLY (AIRA-368). The supervisor stays
+// resident and runs the job as a child, so without it /proc/<pid>/cmdline, `ps`
+// and `confine --list` (which shows everything after the first bare `--` of the
+// supervisor's cmdline) would show this launcher line instead of the job, and a
+// queued job has no child to read at all. The supervisor never reads these
+// arguments: the control file stays the one source of what runs.
+//
+// The copy is BOUNDED: the listing reads at most ConfineCommandWireLimit+1 bytes
+// of a cmdline, so whole arguments are passed until that budget is spent and the
+// one that crosses it is cut short. The supervisor's cmdline then still overruns
+// the read bound, so the listing marks the command elided, and the shim's own
+// exec can never grow towards ARG_MAX however large the job's argv is.
+func confineSupervisorArgv(control string, argv []string) []string {
+	out := []string{ConfineSupervisorVerb, "--control", control, "--ready-fd", "3", "--ack-fd", "4", "--"}
+	remaining := ConfineCommandWireLimit + 1
+	for _, arg := range argv {
+		if remaining <= 0 {
+			break
+		}
+		if len(arg) >= remaining {
+			out = append(out, arg[:remaining])
+			break
+		}
+		out = append(out, arg)
+		remaining -= len(arg) + 1
+	}
+	return out
+}
+
+// ParseConfineSupervisorArgs parses the hidden verb's arguments (argv after the
+// verb itself). Flags are read in `--name value` pairs only up to the first bare
+// `--` in a flag position; what follows is the display copy of the job's argv
+// and is ignored, so a job argument such as `--control /x` cannot reach the
+// flags. Every flag is required exactly once; anything else is refused.
+func ParseConfineSupervisorArgs(argv []string) (control string, readyFD, ackFD int, err error) {
+	invalid := errors.New("E_CONFINE_ARGUMENT_INVALID: malformed " + ConfineSupervisorVerb + " invocation")
+	values := map[string]string{}
+	for i := 0; i < len(argv); i += 2 {
+		if argv[i] == "--" {
+			break
+		}
+		if i+1 >= len(argv) || !strings.HasPrefix(argv[i], "--") {
+			return "", 0, 0, invalid
+		}
+		name := strings.TrimPrefix(argv[i], "--")
+		if name != "control" && name != "ready-fd" && name != "ack-fd" {
+			return "", 0, 0, invalid
+		}
+		if _, exists := values[name]; exists {
+			return "", 0, 0, invalid
+		}
+		values[name] = argv[i+1]
+	}
+	readyFD, readyErr := strconv.Atoi(values["ready-fd"])
+	ackFD, ackErr := strconv.Atoi(values["ack-fd"])
+	if values["control"] == "" || readyErr != nil || ackErr != nil || readyFD < 0 || ackFD < 0 {
+		return "", 0, 0, invalid
+	}
+	return values["control"], readyFD, ackFD, nil
 }
