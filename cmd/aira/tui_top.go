@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"aira/internal/runner"
 
@@ -1083,21 +1084,50 @@ func topPeakWithin(peak *int64, used int64, reserved int64) (int64, bool) {
 // colour-tag syntax is neutralised so an argument like `[red]` is displayed
 // rather than swallowed as markup. Truncation for WIDTH is not done here — the
 // table already clamps a cell that does not fit, and a second scheme layered on
-// top of it would only disagree with it.
+// top of it would only disagree with it. The one bound applied here,
+// topCellMaxRunes, is for draw cost, not width.
 func topCommandCell(command *string) string {
 	return topUntrustedCell(command)
 }
 
-// topUntrustedCell is the render boundary for the last column's text (AIRA-276:
-// the command, or the launch directory — both arbitrary bytes from another
-// process), with topCommandCell's rules: "unevaluated" when unknown, and
-// non-printing runes and tview colour tags neutralised.
+// topUntrustedCell is the render boundary for a cell of untrusted text: the last
+// column's (AIRA-276: the command, or the launch directory — both arbitrary bytes
+// from another process) and the SESSION column's tmux pane label (AIRA-277). It
+// applies topCommandCell's rules: "unevaluated" when unknown, and non-printing
+// runes and tview colour tags neutralised. It also bounds the text to
+// topCellMaxRunes input runes (AIRA-374).
 func topUntrustedCell(text *string) string {
 	if text == nil {
 		return "unevaluated"
 	}
-	return tview.Escape(topPrintable(*text))
+	// Cut BEFORE escaping, so the cut can never split an escape sequence.
+	value, cut := *text, ""
+	if utf8.RuneCountInString(value) > topCellMaxRunes {
+		value, cut = string([]rune(value)[:topCellMaxRunes]), "…"
+	}
+	return tview.Escape(topPrintable(value)) + cut
 }
+
+// topCellMaxRunes bounds an untrusted cell's text (AIRA-374), for cost rather
+// than width. tview measures the full grapheme width of every visible cell on
+// every draw (three passes: column sizing, printing, the ellipsis check), and it
+// draws after every keypress, so long supervisor argvs (nine of ~4 KB on the
+// owner's box) made every arrow key pay for text no terminal shows. Measured
+// (BenchmarkTopKeypress / BenchmarkTopTick, CPU per op, 200x50, the recorded
+// listing) from unbounded to this bound: a keypress ~23 ms to ~10 ms, a refresh
+// tick ~25 ms to ~14 ms.
+//
+// What an operator sees: on terminals up to a few hundred columns the screen is
+// identical, the table clamping the cell at the edge as before. From roughly 600
+// columns the cut itself can be on screen, marked by its trailing "…". On a
+// bounded cell of double-width runes the table's own edge ellipsis can be lost
+// (the text shown is unchanged, only that mark).
+//
+// The bound counts INPUT runes, before escaping. topPrintable expands each
+// control character into a 6-12 character escape, so for an argv of control
+// characters the cell can still be several times this long: cost is bounded
+// tightly only for printable text, which is the case that occurs.
+const topCellMaxRunes = 512
 
 // topPrintable escapes text's non-printing runes, so another process's bytes
 // cannot rewrite the line they are shown on. Colour tags are left alone: a
@@ -1148,7 +1178,8 @@ func topKillText(record runner.ConfineRecord) string {
 //     an inferred owner is not mistaken for a claimed session
 //     (runner.ConfineOwnerIsAttested). No width-truncation happens here — the
 //     table clamps a cell to the terminal, and topViewModel's tests pin that the
-//     viewmodel never pre-truncates a value.
+//     viewmodel does not shorten a value a terminal could show. (Only text past
+//     topCellMaxRunes runes is cut, for draw cost: see topUntrustedCell.)
 //   - a 64-hex worktree owner: shown as its 8-character PREFIX, enough to GROUP a
 //     worktree's un-annotated jobs (two jobs from one worktree share it, which the
 //     PID column cannot show) without the hex re-crowding the table.
