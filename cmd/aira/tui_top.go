@@ -1698,10 +1698,15 @@ func topFooter(result runner.ConfineListResult) string {
 		// split is the same fabricated zeros; report it unevaluated in lockstep.
 		populationClause = "populations unevaluated"
 	}
-	parts := []string{
-		grantedClause,
-		populationClause,
+	var parts []string
+	// AIRA-370. The machine's CPU load, said once and only when it is high:
+	// context for long waits, never an admission reason (the rows name those).
+	// First: the footer is one unwrapped line and the granted clause alone can
+	// fill 80 columns, so anywhere later is clipped off a real terminal.
+	if pressure, busy := runner.ConfineBoxCPUBusy(reserve); busy {
+		parts = append(parts, fmt.Sprintf("box CPU busy %.0f%%", pressure))
 	}
+	parts = append(parts, grantedClause, populationClause)
 	if reserve.FreezePhase != "" {
 		parts = append(parts, fmt.Sprintf("%d queued, freeze %s", reserve.Queued, reserve.FreezePhase))
 	}
@@ -1713,11 +1718,6 @@ func topFooter(result runner.ConfineListResult) string {
 	if len(result.Queued) < reserve.Queued {
 		parts = append(parts, fmt.Sprintf("showing %d of %d queued (some queued jobs have no row, e.g. per-test reservations; at most %d are listed)",
 			len(result.Queued), reserve.Queued, runner.ConfineQueuedRowLimit))
-	}
-	// AIRA-370. The machine's CPU load, said once and only when it is high:
-	// context for long waits, never an admission reason (the rows name those).
-	if pressure, busy := runner.ConfineBoxCPUBusy(reserve); busy {
-		parts = append(parts, fmt.Sprintf("box CPU busy %.0f%%", pressure))
 	}
 	if reserve.Exclusive != nil {
 		exclusive := "EXCLUSIVE " + reserve.Exclusive.State

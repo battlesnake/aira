@@ -123,7 +123,7 @@ func requireBlocked(t *testing.T, waiter *admitWaiter, want ...string) {
 	t.Helper()
 	got := admitBlockedTokens(waiter.blocked, waiter.heldByHead)
 	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("waiter %d blocked_by=%v, want %v", waiter.seq, got, want)
+		diagnosisMismatch(t, "waiter %d blocked_by=%v, want %v", waiter.seq, got, want)
 	}
 }
 
@@ -1549,11 +1549,14 @@ func TestSmallLaneT23OneRoom(t *testing.T) {
 				server.evaluateAdmitQueue(queue)
 				// AIRA-370: a refused lone small waiter carries no lane token, and
 				// the main walk names exactly the resources that did not fit.
-				if lane && small.state != admitGranted && (small.laneWait != "" || small.blocked == 0 || small.heldByHead) {
-					t.Fatalf("row %+v: refused with laneWait %q blocked %v, want no lane token and a resource", r, small.laneWait, admitBlockedTokens(small.blocked, small.heldByHead))
+				if lane && small.state != admitGranted && (small.laneWait != "" || small.heldByHead) {
+					t.Fatalf("row %+v: refused with laneWait %q heldByHead %v, want no lane token", r, small.laneWait, small.heldByHead)
+				}
+				if lane && small.state != admitGranted && small.blocked == 0 {
+					diagnosisMismatch(t, "row %+v: refused with no resource named", r)
 				}
 				if lane && r.cpuFull != (small.state != admitGranted && small.blocked&admitBlockedCPU != 0) {
-					t.Fatalf("row %+v: cpu named=%v, want %v", r, small.blocked&admitBlockedCPU != 0, r.cpuFull)
+					diagnosisMismatch(t, "row %+v: cpu named=%v, want %v", r, small.blocked&admitBlockedCPU != 0, r.cpuFull)
 				}
 				if lane && small.state == admitGranted && small.laneWait != "" {
 					t.Fatalf("row %+v: granted with laneWait %q", r, small.laneWait)

@@ -2,12 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"aira/internal/core"
+	"aira/internal/daemon"
 	"aira/internal/runner"
+	"aira/internal/testdeadline"
+
+	"github.com/gdamore/tcell/v2"
 )
 
 // verifies: AIRA-370 — a queued row's LIVE cell names the lane's verdict and
@@ -81,6 +87,63 @@ func TestTopFooterSaysTheBoxCPUIsBusy(t *testing.T) {
 }
 
 func floatPointer(value float64) *float64 { return &value }
+
+// topListingDispatcher answers every confine-list with one fixed listing.
+type topListingDispatcher struct{ raw []byte }
+
+func (d topListingDispatcher) Dispatch(_ context.Context, _ daemon.WorktreeScope, request core.Request) core.Response {
+	if request.Verb != "confine-list" {
+		return core.Response{Code: "E_UNKNOWN_VERB", Error: "unexpected " + request.Verb}
+	}
+	return core.Response{OK: true, Code: "OK", RawData: d.raw}
+}
+
+// verifies: AIRA-370 — the box-CPU clause reaches the terminal on the live
+// evidence's busiest footer (27 running, 4 queued with no rows, the ceiling
+// cut and last known, PSI 70%), at 80 columns (the simulation's own size) and
+// at 120: the footer is one unwrapped line, so a clause placed after the long
+// granted and queue clauses is clipped off screen. Mutations: append the
+// clause after the queue clauses (red at 120 and 80); after the granted
+// clause (red at 80).
+func TestTopFooterBoxCPUBusyIsOnScreen(t *testing.T) {
+	pressure := 70.0
+	raw, err := json.Marshal(topTestListing(&runner.ConfineSliceReserve{
+		GrantedEstablished: true, GrantedBytes: 45500 << 20, CeilingBytes: 45600 << 20, CeilingHeld: true,
+		Jobs: 27, ScopeJobs: 27, Queued: 4, FreezePhase: "idle", CPUPressureSomeAvg10: &pressure,
+	}, topTestRecord("CONFINE-alpha-101-aa", "alpha", 4*gib, 3*gib)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	runtime := newTopRuntime(ctx, topListingDispatcher{raw: raw}, nil, nil, nil, screen)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run() }()
+	var drawn string
+	eventuallyOnUI(t, runtime, 2*time.Second, func() bool {
+		drawn = simulationText(screen)
+		return strings.Contains(drawn, "granted 45500M")
+	}, "the footer never rendered")
+	for _, width := range []int{80, 120} {
+		// Init sizes a simulation screen 80x25; a resize takes effect on the
+		// next draw, which onUIDraw forces.
+		onUIDraw(t, runtime, func() bool { screen.SetSize(width, 30); return true })
+		drawn = onUI(t, runtime, func() string { return simulationText(screen) })
+		if got, _ := screen.Size(); got != width {
+			t.Fatalf("screen width %d, want %d", got, width)
+		}
+		if !strings.Contains(drawn, "granted 45500M") || !strings.Contains(drawn, "box CPU busy 70%") {
+			t.Fatalf("width %d: screen=\n%s\nwant the footer with the box CPU clause", width, drawn)
+		}
+	}
+	screen.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	select {
+	case <-done:
+	case <-testdeadline.After(5 * time.Second):
+		t.Fatal("quit timed out")
+	}
+}
 
 // verifies: AIRA-370 — `confine --list` puts the machine's CPU pressure on the
 // slice line when the daemon read it (a real 0 included), and prints nothing

@@ -1150,6 +1150,41 @@ func TestReadConfineCPUFrameKeepsEachSideIndependent(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-370 — the frame carries the box CPU pressure read from the
+// PSI file: a valid `some` line is a known reading (a real 0 included), and a
+// missing, malformed or out-of-range file leaves it unknown with no number.
+// Mutations: drop the pressure read from the frame (the valid rows go red);
+// set PressureKnown unconditionally (the missing row goes red).
+func TestReadConfineCPUFrameReadsTheCPUPressure(t *testing.T) {
+	dir := t.TempDir()
+	for _, test := range []struct {
+		name      string
+		content   string // "": no file
+		wantValue float64
+		wantKnown bool
+	}{
+		{"busy", "some avg10=70.25 avg60=50.00 avg300=40.00 total=123\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n", 70.25, true},
+		{"idle is a reading", "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n", 0, true},
+		{"missing", "", 0, false},
+		{"malformed", "some avg10=lots total=1\n", 0, false},
+		{"no some line", "full avg10=10.00 avg60=0.00 avg300=0.00 total=0\n", 0, false},
+		{"above 100", "some avg10=100.50 avg60=0.00 avg300=0.00 total=1\n", 0, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(dir, strings.ReplaceAll(test.name, " ", "-"))
+			if test.content != "" {
+				if err := os.WriteFile(path, []byte(test.content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			frame := readConfineCPUFrameWith("", path)
+			if frame.PressureKnown != test.wantKnown || frame.PressureSomeAvg10 != test.wantValue {
+				t.Fatalf("pressure=%v known=%v, want %v known=%v", frame.PressureSomeAvg10, frame.PressureKnown, test.wantValue, test.wantKnown)
+			}
+		})
+	}
+}
+
 // AIRA-276. The listing carries the supervisor's working directory, read live
 // from /proc/<pid>/cwd. A real child with a known, distinct directory is listed
 // with NO seam, so the production readlink is what is exercised (a seam-only

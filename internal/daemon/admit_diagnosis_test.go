@@ -32,6 +32,29 @@ func blockedTokens(waiter *admitWaiter) string {
 	return strings.Join(admitBlockedTokens(waiter.blocked, waiter.heldByHead), ",")
 }
 
+// diagnosisProbeEnv names the mutation harness's mode
+// (docs/dev/aira-370-mutation-check.py). Unset, diagnosisMismatch is t.Fatalf.
+// Set to 1, it logs diagnosisMismatchMarker and the test goes on, so every
+// grant and outcome assertion after it still runs: a mutation is diagnosis
+// only when the whole package passes in this mode and at least one marked line
+// was logged. No test-name allowlist: a grant assertion inside a diagnosis test
+// fails the run like any other.
+const (
+	diagnosisProbeEnv       = "AIRA_370_DIAGNOSIS_PROBE"
+	diagnosisMismatchMarker = "AIRA-370-DIAGNOSIS-MISMATCH: "
+)
+
+// diagnosisMismatch reports a failed AIRA-370 wait-diagnosis assertion, and
+// only that: every other assertion in these tests stays a plain t.Fatalf.
+func diagnosisMismatch(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv(diagnosisProbeEnv) == "1" {
+		t.Logf(diagnosisMismatchMarker+format, args...)
+		return
+	}
+	t.Fatalf(format, args...)
+}
+
 // verifies: AIRA-370 — each resource the fit refused is named, and only those:
 // RAM, CPU slots, VRAM and their combinations; ceiling-cut qualifies RAM only
 // while the enforced ceiling is below memory.max, and never appears without
@@ -86,7 +109,7 @@ func TestAdmitDiagnosisNamesTheResourcesThatDidNotFit(t *testing.T) {
 			server.evaluateAdmitQueue(queue)
 
 			if got := blockedTokens(waiter); got != test.want {
-				t.Fatalf("blocked_by=%q, want %q", got, test.want)
+				diagnosisMismatch(t, "blocked_by=%q, want %q", got, test.want)
 			}
 			if granted := waiter.state == admitGranted; granted != (test.want == "") {
 				t.Fatalf("granted=%v with blocked_by %q", granted, test.want)
@@ -112,7 +135,7 @@ func TestAdmitDiagnosisNamesTheGate(t *testing.T) {
 		server.evaluateAdmitQueue(queue)
 		requireLaneGranted(t, waiter, false)
 		if got := blockedTokens(waiter); got != "restart-freeze" {
-			t.Fatalf("blocked_by=%q, want restart-freeze", got)
+			diagnosisMismatch(t, "blocked_by=%q, want restart-freeze", got)
 		}
 		now = now.Add(3 * time.Second)
 		server.evaluateAdmitQueue(queue)
@@ -129,7 +152,7 @@ func TestAdmitDiagnosisNamesTheGate(t *testing.T) {
 		server.evaluateAdmitQueue(queue)
 		requireLaneGranted(t, waiter, false)
 		if got := blockedTokens(waiter); got != "exclusive" {
-			t.Fatalf("blocked_by=%q, want exclusive", got)
+			diagnosisMismatch(t, "blocked_by=%q, want exclusive", got)
 		}
 	})
 	t.Run("behind the head", func(t *testing.T) {
@@ -144,10 +167,10 @@ func TestAdmitDiagnosisNamesTheGate(t *testing.T) {
 		server.evaluateAdmitQueue(queue)
 		requireLaneGranted(t, behind, false)
 		if got := blockedTokens(head); got != "ram" {
-			t.Fatalf("head blocked_by=%q, want ram", got)
+			diagnosisMismatch(t, "head blocked_by=%q, want ram", got)
 		}
 		if got := blockedTokens(behind); got != "head" {
-			t.Fatalf("behind blocked_by=%q, want head", got)
+			diagnosisMismatch(t, "behind blocked_by=%q, want head", got)
 		}
 	})
 }
@@ -168,7 +191,7 @@ func TestAdmitBlockedTokensPrecedence(t *testing.T) {
 		{0, false, nil},
 	} {
 		if got := admitBlockedTokens(test.blocked, test.head); !reflect.DeepEqual(got, test.want) {
-			t.Fatalf("tokens(%b, head=%v)=%v, want %v", test.blocked, test.head, got, test.want)
+			diagnosisMismatch(t, "tokens(%b, head=%v)=%v, want %v", test.blocked, test.head, got, test.want)
 		}
 	}
 }
@@ -188,19 +211,19 @@ func TestAdmitDiagnosisIsClearedEveryPassAndAbsentWhenUnevaluated(t *testing.T) 
 	queue := queueOf(server, lease, waiter)
 	server.evaluateAdmitQueue(queue)
 	if got := blockedTokens(waiter); got != "ram" {
-		t.Fatalf("blocked_by=%q, want ram", got)
+		diagnosisMismatch(t, "blocked_by=%q, want ram", got)
 	}
 	late := laneJob(3, 1000*mib, now)
 	addWaiters(queue, late)
 	if got := blockedTokens(late); got != "" {
-		t.Fatalf("an unevaluated waiter reports %q", got)
+		diagnosisMismatch(t, "an unevaluated waiter reports %q", got)
 	}
 
 	readOK := server.admitReadMemory
 	server.admitReadMemory = func(string) (int64, int64, int64, bool, string) { return 0, 0, 0, false, "unreadable" }
 	server.evaluateAdmitQueue(queue)
 	if got := blockedTokens(waiter); got != "" {
-		t.Fatalf("after an unreadable pass blocked_by=%q, want unevaluated", got)
+		diagnosisMismatch(t, "after an unreadable pass blocked_by=%q, want unevaluated", got)
 	}
 	server.admitReadMemory = readOK
 
@@ -211,14 +234,14 @@ func TestAdmitDiagnosisIsClearedEveryPassAndAbsentWhenUnevaluated(t *testing.T) 
 	server.evaluateAdmitQueue(queue)
 	requireLaneGranted(t, late, true)
 	if got := blockedTokens(waiter); got != "ram" {
-		t.Fatalf("blocked_by=%q, want ram", got)
+		diagnosisMismatch(t, "blocked_by=%q, want ram", got)
 	}
 	behind := laneJob(4, 500*mib, now)
 	addWaiters(queue, behind)
 	spendBudget(queue, waiter, now)
 	server.evaluateAdmitQueue(queue)
 	if got := blockedTokens(behind); got != "head" {
-		t.Fatalf("behind blocked_by=%q, want head", got)
+		diagnosisMismatch(t, "behind blocked_by=%q, want head", got)
 	}
 	// Room comes back: the 8000 is granted; the behind waiter, now unprotected,
 	// is granted in the same pass.
@@ -256,7 +279,7 @@ func TestAdmitDiagnosisSnapshot(t *testing.T) {
 		for scopeID, tokens := range want {
 			snapshot = server.admitSliceSnapshotFor("/slice", scopeID)
 			if !reflect.DeepEqual(snapshot.queuedBlockedBy, tokens) {
-				t.Fatalf("lane=%v probe %s blocked_by=%v, want %v", lane, scopeID, snapshot.queuedBlockedBy, tokens)
+				diagnosisMismatch(t, "lane=%v probe %s blocked_by=%v, want %v", lane, scopeID, snapshot.queuedBlockedBy, tokens)
 			}
 		}
 		if len(snapshot.queuedEntries) != 2 {
@@ -264,14 +287,14 @@ func TestAdmitDiagnosisSnapshot(t *testing.T) {
 		}
 		for _, entry := range snapshot.queuedEntries {
 			if !reflect.DeepEqual(entry.BlockedBy, want[entry.ScopeID]) {
-				t.Fatalf("lane=%v entry %s blocked_by=%v, want %v", lane, entry.ScopeID, entry.BlockedBy, want[entry.ScopeID])
+				diagnosisMismatch(t, "lane=%v entry %s blocked_by=%v, want %v", lane, entry.ScopeID, entry.BlockedBy, want[entry.ScopeID])
 			}
 		}
 		if snapshot.cpuOutstanding != 64 {
 			t.Fatalf("cpuOutstanding=%d, want 64", snapshot.cpuOutstanding)
 		}
 		if other := server.admitSliceSnapshotFor("/slice", "CONFINE-nobody-1-a"); other.queuedBlockedBy != nil {
-			t.Fatalf("an unmatched probe got %v", other.queuedBlockedBy)
+			diagnosisMismatch(t, "an unmatched probe got %v", other.queuedBlockedBy)
 		}
 	}
 }
@@ -299,8 +322,11 @@ func TestConfineListCarriesTheWaitDiagnosis(t *testing.T) {
 	}
 
 	result := reserveListing(t, server)
-	if len(result.Queued) != 1 || !reflect.DeepEqual(result.Queued[0].BlockedBy, []string{"cpu"}) {
-		t.Fatalf("queued rows=%+v, want one row blocked_by [cpu]", result.Queued)
+	if len(result.Queued) != 1 {
+		t.Fatalf("queued rows=%+v, want one", result.Queued)
+	}
+	if !reflect.DeepEqual(result.Queued[0].BlockedBy, []string{"cpu"}) {
+		diagnosisMismatch(t, "queued row blocked_by=%v, want [cpu]", result.Queued[0].BlockedBy)
 	}
 	response := server.confineManagement(context.Background(), core.Request{Verb: "confine-list",
 		Args: map[string]any{"slice": "aira.slice", "owner": "session-a", "scope_id": waiterID}})
@@ -309,7 +335,10 @@ func TestConfineListCarriesTheWaitDiagnosis(t *testing.T) {
 		t.Fatalf("probe response=%+v", response)
 	}
 	reserve := probe.SliceReserve
-	if !reflect.DeepEqual(reserve.BlockedBy, []string{"cpu"}) || reserve.CPUOutstandingCores != 8 || reserve.CPUCeilingCores != 8 {
-		t.Fatalf("probe blocked_by=%v cpu=%d/%d, want [cpu] 8/8", reserve.BlockedBy, reserve.CPUOutstandingCores, reserve.CPUCeilingCores)
+	if !reflect.DeepEqual(reserve.BlockedBy, []string{"cpu"}) {
+		diagnosisMismatch(t, "probe blocked_by=%v, want [cpu]", reserve.BlockedBy)
+	}
+	if reserve.CPUOutstandingCores != 8 || reserve.CPUCeilingCores != 8 {
+		t.Fatalf("probe cpu=%d/%d, want 8/8", reserve.CPUOutstandingCores, reserve.CPUCeilingCores)
 	}
 }

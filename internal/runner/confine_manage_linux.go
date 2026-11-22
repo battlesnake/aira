@@ -137,6 +137,12 @@ const confineCPUStatReadLimit = 4096
 // frame with no established sample instant simply yields no rate downstream. The
 // one thing it never does is publish a zero as a reading.
 func readConfineCPUFrame(slicePath string) ConfineCPUFrame {
+	return readConfineCPUFrameWith(slicePath, confineCPUPressurePath)
+}
+
+// readConfineCPUFrameWith is readConfineCPUFrame with the PSI file named, so a
+// test can reach the pressure read (AIRA-370).
+func readConfineCPUFrameWith(slicePath, pressurePath string) ConfineCPUFrame {
 	// Stamped BEFORE the reads and shared by both. The two ReadFiles are
 	// microseconds apart against a refresh interval measured in seconds, so the
 	// skew they introduce into a Δusec/Δwall rate is far below the width of one
@@ -156,7 +162,7 @@ func readConfineCPUFrame(slicePath string) ConfineCPUFrame {
 	}
 	// AIRA-370. The machine's CPU load beside the counters: PSI `some avg10`.
 	// Unreadable (no PSI, an old kernel) leaves it unknown, never 0.
-	if data, err := readBoundedFile(confineCPUPressurePath, confineCPUStatReadLimit); err == nil {
+	if data, err := readBoundedFile(pressurePath, confineCPUStatReadLimit); err == nil {
 		frame.PressureSomeAvg10, frame.PressureKnown = parseCPUPressureSome(data)
 	}
 	return frame
