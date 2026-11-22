@@ -12,17 +12,23 @@ import time
 import urllib.parse
 
 from aitest.worker import (
+    _CHUNK_LINE_PREFIX,
+    _DEFAULT_MAX_TESTS,
     _DISPATCH_WAIT_TOKEN,
     _EVENT_LINE_PREFIX,
     _RECYCLE_SUFFIX,
+    _env_int,
     _exit_child,
     _untag_tuples,
+    _warn_invalid_env,
     fork_worker,
     run_worker_loop,
 )
 
 
 _STOP_LINE = "__stop__"
+# AIRA-372: the chunk cap. Unset or 1 = batching off (queue and wire unchanged).
+_BATCH_ENV = "AIRA_AITEST_BATCH_MAX_TESTS"
 _DENIAL_RETRY_SECONDS = 1.0
 # S15. The non-blocking PROBE's --max-wait. The daemon reads max_wait_ms
 # present-and-zero as a SNAPSHOT: it reports the unified ledger's current headroom
@@ -137,6 +143,11 @@ def _split_dispatch_wait(line):
     # isascii() too: str.isdigit() accepts digits int() refuses (e.g. "²"), and a
     # ValueError here would escape _drain_worker and end the whole run.
     return head, (int(value) if value.isascii() and value.isdigit() else None)
+
+
+def _histogram(counter):
+    """A Counter of lengths as a JSON object {"<length>": count}, ascending."""
+    return {str(length): counter[length] for length in sorted(counter)}
 
 
 def _pool_occupancy(spans, run_start_us, run_end_us):
@@ -934,6 +945,67 @@ def _drain_available_lines(fd, state):
     return lines
 
 
+def _resolve_batch_cap():
+    """AIRA-372: the chunk cap from AIRA_AITEST_BATCH_MAX_TESTS. Unset or 1 is off (1).
+    A non-integer or a value below 1 warns once and means 1. A cap of 2 or more is
+    clamped to max(1, AIRA_AITEST_WORKER_MAX_TESTS), parsed with the worker's own
+    _env_int: a longer chunk is always cut by the count recycle, and a worker limit of
+    0 or below runs one test per worker, which turns batching off."""
+    raw = os.environ.get(_BATCH_ENV)
+    if raw is None:
+        return 1
+    try:
+        cap = int(raw)
+    except ValueError:
+        cap = 0
+    if cap < 1:
+        _warn_invalid_env(_BATCH_ENV, raw, 1)
+        return 1
+    if cap == 1:
+        return 1
+    return min(cap, max(1, _env_int("AIRA_AITEST_WORKER_MAX_TESTS", _DEFAULT_MAX_TESTS)))
+
+
+def _cut_chunks(items, key_of, cap):
+    """AIRA-372 (spec 4.2): cut `items`, in their final order, into lists of
+    consecutive nodeids. A segment is a maximal run with equal key_of(item) =
+    (need, cpu, time, failfast) and equal module (item.path). Segments pack greedily
+    into the current chunk while the key matches and the whole segment fits under the
+    cap; a segment longer than the cap is split into cap-sized pieces whose last piece
+    may absorb following segments. A fail-fast item is always a chunk of one. Never
+    reorders. At cap 1 every chunk is one item."""
+    segments = []
+    for item in items:
+        key = key_of(item)
+        module = item.path
+        if segments and segments[-1][0] == key and segments[-1][1] == module:
+            segments[-1][2].append(item.nodeid)
+        else:
+            segments.append((key, module, [item.nodeid]))
+    chunks = []
+    current = []
+    current_key = None
+    for key, _module, nodeids in segments:
+        if key[3]:  # @aira_failfast: never continued from, never continues anything
+            if current:
+                chunks.append(current)
+                current = []
+            chunks.extend([nodeid] for nodeid in nodeids)
+            continue
+        for start in range(0, len(nodeids), cap):
+            piece = nodeids[start:start + cap]
+            if current and current_key == key and len(current) + len(piece) <= cap:
+                current.extend(piece)
+            else:
+                if current:
+                    chunks.append(current)
+                current = list(piece)
+                current_key = key
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 class _ReadyQueue:
     """The ready queue (AIRA-343): reads as the plain list of nodeids it replaced (iteration
     in queue order, len, ``in``, ``==`` against a list, append, pop(0)/pop(), insert(0, x),
@@ -1176,6 +1248,19 @@ class Supervisor:
         # marked leg trips.
         self._failfast = set()
         self.failfast_triggered = None
+        # AIRA-372: chunk id -> its member nodeids (n >= 2), built in collect(). A chunk
+        # id ("\x01chunk:<index>") is a queue entry, never a nodeid: it never reaches
+        # results, attempts or a report. Empty when batching is off.
+        self._chunks = {}
+        # AIRA-372 counters for the measurement report (spec section 8).
+        self._batch_cap = 1
+        self._chunk_lengths_cut = collections.Counter()
+        self._chunk_lengths_run = collections.Counter()
+        self._worker_crashes = 0
+        self._mid_chunk_crashes = 0
+        self._unstarted_requeued = 0
+        self._oom_group_kills = 0
+        self._queue_empty_wall_us = None
         self.workers = {}
         # Worker scopes whose rmdir failed, for a later hygiene retry. See
         # _forget_worker_scope: since S15 an unremoved scope is a stray empty
@@ -1288,7 +1373,9 @@ class Supervisor:
         # heavy-time oversized test can never block a fitting lighter one), then LPT primary,
         # RAM bin-pack secondary, FIFO tertiary. See _ReadyQueue.
         best = self.queue.pick(budget, cpu_budget, pop)
-        if best is not None and pop:
+        if best is not None and pop and best not in self._chunks:
+            # AIRA-372: a chunk id is charged nothing here; its members are charged
+            # one by one as each becomes in_flight (dispatch, then promotion).
             self.attempts[best] = self.attempts.get(best, 0) + 1
         return best
 
@@ -1400,9 +1487,15 @@ class Supervisor:
                 "marking them unevaluated rather than waiting forever or running unconfined\n" % reason
             )
         while self.queue:
-            nodeid = self.queue.pop(0)
-            self.results.setdefault(nodeid, "unevaluated")
-            self._unevaluated_reasons.setdefault(nodeid, reason)
+            entry = self.queue.pop(0)
+            for nodeid in self._members(entry):
+                self.results.setdefault(nodeid, "unevaluated")
+                self._unevaluated_reasons.setdefault(nodeid, reason)
+
+    def _members(self, entry):
+        """The nodeids a queue entry stands for: a chunk id's members, else the
+        nodeid itself (AIRA-372)."""
+        return self._chunks.get(entry, (entry,))
 
     def collect(self, items):
         """items: the pytest-collected Item objects. Session collection
@@ -1410,7 +1503,6 @@ class Supervisor:
         inherits self.items_by_nodeid by COW, so only nodeids (strings)
         cross the dispatch/result pipes (Task 13)."""
         self.items_by_nodeid = {item.nodeid: item for item in items}
-        self.queue = [item.nodeid for item in items]
         # AIRA-230 v7-2: read each item's aira_mem annotation into a nodeid->bytes
         # map alongside items_by_nodeid (inherited by forked workers via COW).
         # Worker sizing does NOT read this map: reservation_need (below) = worker
@@ -1473,16 +1565,50 @@ class Supervisor:
                 failfast.add(item.nodeid)
         self.aira_mem_bytes = mem_map
         self._annotated = annotated
+        # AIRA-372: cut the final order into chunks of consecutive items. At cap 1
+        # every unit is a single nodeid and the queue is exactly the nodeid list.
+        cap = _resolve_batch_cap()
+        units = _cut_chunks(
+            items,
+            lambda item: (
+                reservation_need[item.nodeid], cpu_need[item.nodeid],
+                time_cost[item.nodeid], item.nodeid in failfast,
+            ),
+            cap,
+        )
+        self._batch_cap = cap
+        self._chunks = {}
+        queue = []
+        for members in units:
+            self._chunk_lengths_cut[len(members)] += 1
+            if len(members) == 1:
+                queue.append(members[0])
+                continue
+            chunk_id = "\x01chunk:%d" % len(self._chunks)
+            self._chunks[chunk_id] = members
+            # Uniform (need, cpu, time) within a chunk, so the pick, the fit filter,
+            # the cover check and growth sizing read a chunk exactly as one test.
+            reservation_need[chunk_id] = reservation_need[members[0]]
+            cpu_need[chunk_id] = cpu_need[members[0]]
+            time_cost[chunk_id] = time_cost[members[0]]
+            queue.append(chunk_id)
+        self.queue = queue
         self.reservation_need = reservation_need
         self.cpu_need = cpu_need
         self.time_cost = time_cost
         self._failfast = failfast
+        if cap > 1:
+            print(
+                "aitest: batching: %d tests in %d chunks, cap %d (%s)"
+                % (len(items), len(queue), cap, _BATCH_ENV)
+            )
 
     def next_nodeid(self):
         if not self.queue:
             return None
         nodeid = self.queue.pop(0)
-        self.attempts[nodeid] = self.attempts.get(nodeid, 0) + 1
+        if nodeid not in self._chunks:
+            self.attempts[nodeid] = self.attempts.get(nodeid, 0) + 1
         return nodeid
 
     def requeue_once(self, nodeid):
@@ -2392,12 +2518,28 @@ class Supervisor:
                         continue
                 if nodeid is None:
                     continue
+                members = self._chunks.get(nodeid)
+                if members is not None:
+                    # AIRA-372: a chunk. Only member 1 becomes in_flight (and is
+                    # charged); the supervisor holds the unstarted rest and promotes
+                    # the next member on each accepted result. Invariant: rest
+                    # non-empty implies in_flight is not None.
+                    line = _CHUNK_LINE_PREFIX + json.dumps(members)
+                    state["chunk_id"] = nodeid
+                    state["rest"] = collections.deque(members[1:])
+                    nodeid = members[0]
+                    self.attempts[nodeid] = self.attempts.get(nodeid, 0) + 1
+                else:
+                    line = nodeid
+                    state["chunk_id"] = None
+                    state["rest"] = collections.deque()
+                state["chunk_pos"] = 1
                 state["in_flight"] = nodeid
                 # Fresh staging buffer per dispatch -- nothing a previous
                 # nodeid left behind may ever be replayed against this one.
                 state["pending_events"] = []
                 try:
-                    state["dispatch_write"].write(nodeid + "\n")
+                    state["dispatch_write"].write(line + "\n")
                     state["dispatch_write"].flush()
                 except BrokenPipeError:
                     # in_flight already correctly holds the nodeid we just
@@ -2543,6 +2685,7 @@ class Supervisor:
         scope_oom = _scope_oom_group_killed(scope)
         if scope_oom:
             self._pool_peak_oom = True
+            self._oom_group_kills += 1
         # AIRA-230 v7-4: retain this worker's (peak, cap, oom, scope_path) for the
         # measurement report, ONLY when enabled. The cap is the converted memory_max
         # above (None where it cannot be read, NEVER a fabricated 0). The scope_path is
@@ -2795,6 +2938,9 @@ class Supervisor:
 
     def _pool_summary_fields(self, honest):
         peak, mean, wall_s = _pool_occupancy(self._worker_spans, self._run_start_wall_us, self._run_end_wall_us)
+        drain_s = None
+        if self._queue_empty_wall_us is not None and self._run_end_wall_us is not None:
+            drain_s = max(0, self._run_end_wall_us - self._queue_empty_wall_us) / 1e6
         return {
             "live_workers_peak": peak,
             "live_workers_mean": honest(mean),
@@ -2803,6 +2949,15 @@ class Supervisor:
             "dispatch_wait_s": honest(self._dispatch_wait_us / 1e6 if self._dispatches_measured else None),
             "dispatches_measured": self._dispatches_measured,
             "tests_completed": self._tests_completed,
+            # AIRA-372 (additive): batching's own readings (spec section 8).
+            "batch_cap": self._batch_cap,
+            "chunk_lengths_cut": _histogram(self._chunk_lengths_cut),
+            "chunk_lengths_run": _histogram(self._chunk_lengths_run),
+            "drain_s": honest(drain_s),
+            "worker_crashes": self._worker_crashes,
+            "mid_chunk_crashes": self._mid_chunk_crashes,
+            "oom_group_kills": self._oom_group_kills,
+            "unstarted_requeued": self._unstarted_requeued,
         }
 
     def pool_summary(self):
@@ -2997,8 +3152,10 @@ class Supervisor:
                 if isinstance(exc, WorkerAdmitRequestInvalid) and \
                         getattr(exc, "reason", None) == WORKER_ADMIT_REASON_EXCEEDS_CEILING:
                     self.queue.remove(nodeid)
-                    self.results.setdefault(nodeid, "unevaluated")
-                    if nodeid in self._annotated:
+                    # AIRA-372: a chunk id stands for its members; uniform need
+                    # implies uniform annotation, so members[0] picks the wording.
+                    members = self._members(nodeid)
+                    if members[0] in self._annotated:
                         knob = "lower its @aira_mem, lower any @aira_cpu, or raise the slice ceiling"
                     else:
                         knob = (
@@ -3007,12 +3164,14 @@ class Supervisor:
                             "add an @aira_mem marker, lower any @aira_cpu marker, or raise the "
                             "slice ceiling"
                         )
-                    self._unevaluated_reasons.setdefault(
-                        nodeid,
+                    reason = (
                         "the daemon refused this test's reservation (%d bytes / %d CPU cores): "
                         "one of them exceeds the slice ceiling. If the slice is busy this may "
-                        "clear with less concurrent load; otherwise %s" % (need, cpu_need, knob),
+                        "clear with less concurrent load; otherwise %s" % (need, cpu_need, knob)
                     )
+                    for member in members:
+                        self.results.setdefault(member, "unevaluated")
+                        self._unevaluated_reasons.setdefault(member, reason)
                     continue
                 self._fail_queue_terminal(str(exc))
                 return
@@ -3237,7 +3396,21 @@ class Supervisor:
             # branch below so its _replace_worker sees the flag and declines to
             # spawn; run() checks the flag after this drain and aborts the pool.
             self._record_result(nodeid, outcome)
-            state["in_flight"] = None
+            rest = state.get("rest")
+            if rest and not recycling:
+                # AIRA-372: the worker has already started the next member (its
+                # nextitem); it becomes in_flight now and is charged now.
+                promoted = rest.popleft()
+                state["in_flight"] = promoted
+                self.attempts[promoted] = self.attempts.get(promoted, 0) + 1
+                state["chunk_pos"] = state.get("chunk_pos", 1) + 1
+            else:
+                if state.get("chunk_id") is not None:
+                    self._chunk_lengths_run[state["chunk_pos"]] += 1
+                state["in_flight"] = None
+                # The one reset that keeps an idle worker's death from reading as a
+                # mid-chunk crash (_handle_worker_exit keys on chunk_pos > 1).
+                state["chunk_pos"] = 0
             # AIRA-344: counted only once the result is accepted (after the batch check),
             # so a result taking the crash path above never counts as completed.
             self._tests_completed += 1
@@ -3247,6 +3420,19 @@ class Supervisor:
                 state["dispatch_wait_us"] = state.get("dispatch_wait_us", 0) + waited_us
                 state["dispatches_measured"] = state.get("dispatches_measured", 0) + 1
             if recycling:
+                if rest:
+                    # AIRA-372 (spec 5.3): a recycle mid-chunk is routine, so the
+                    # unstarted rest goes back to the queue head as ONE entry, still
+                    # uncharged: the reused chunk id for two or more members, else the
+                    # bare nodeid.
+                    remaining = list(rest)
+                    rest.clear()
+                    if len(remaining) >= 2:
+                        self._chunks[state["chunk_id"]] = remaining
+                        self.queue.insert(0, state["chunk_id"])
+                    else:
+                        self.queue.insert(0, remaining[0])
+                    self._unstarted_requeued += len(remaining)
                 self._retire_worker(pid, state)
                 self._replace_worker()
                 return
@@ -3429,6 +3615,13 @@ class Supervisor:
                     inflight,
                     "killed by the fail-fast abort (tripped by %s)" % self.failfast_triggered,
                 )
+            # AIRA-372: the unstarted rest of a chunk this worker held.
+            for member in state.get("rest") or ():
+                self._unevaluated_reasons.setdefault(
+                    member,
+                    "not started: the fail-fast abort (tripped by %s) stopped the pool"
+                    % self.failfast_triggered,
+                )
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
@@ -3456,11 +3649,36 @@ class Supervisor:
         same instant there, and is all there is on a host too old for
         pidfds."""
         nodeid = state["in_flight"]
+        self._worker_crashes += 1
+        chunk_pos = state.get("chunk_pos", 0)
+        if chunk_pos > 1:
+            # AIRA-372 (spec 5.4): said here, before the retry, whatever the retry
+            # does -- a retried member usually passes alone, and a death caused by
+            # what the chunk accumulated would otherwise stay invisible. "lost", not
+            # "died": a live worker whose report batch failed validation lands here
+            # too. chunk_pos > 1 implies in_flight is set, because chunk_pos is
+            # reset to 0 wherever in_flight is cleared.
+            self._mid_chunk_crashes += 1
+            sys.stderr.write(
+                "aira aitest: worker %d was lost while running item %d of a chunk (%s); "
+                "%d earlier items had run with shared fixtures alive; retrying it alone\n"
+                % (pid, chunk_pos, nodeid, chunk_pos - 1)
+            )
+        if nodeid is not None and state.get("chunk_id") is not None:
+            self._chunk_lengths_run[chunk_pos - 1] += 1  # members that completed
+        rest = state.get("rest") or ()
         # BEFORE _retire_worker, which removes the scope directory
         # (_forget_worker_scope's os.rmdir): once it is gone the evidence for
         # WHY this worker died is gone with it.
         death = self._describe_worker_death(pid, state)
         self._retire_worker(pid, state)
+        # AIRA-372 (spec 5.2): the unstarted rest of a chunk goes back to the queue
+        # head as single items, uncharged, in collection order behind the in-flight
+        # member requeued below. Singles because the crash may have been caused by
+        # what the chunk accumulated.
+        for member in reversed(rest):
+            self.queue.insert(0, member)
+        self._unstarted_requeued += len(rest)
         if nodeid is not None and not self.requeue_once(nodeid):
             self.results[nodeid] = "unevaluated"
             self._unevaluated_reasons.setdefault(nodeid, death)
@@ -3735,6 +3953,9 @@ class Supervisor:
                 self._spawn_fallback_worker()
         self._dispatch_to_idle_workers()
         while self.workers:
+            if self._queue_empty_wall_us is None and not self.queue:
+                # AIRA-372 measurement: the drain runs from here to the run's end.
+                self._queue_empty_wall_us = _now_wall_us()
             # AIRA-262: catch a fail-fast trip that fired late in the PREVIOUS
             # iteration -- during _dispatch_to_idle_workers' BrokenPipe give-up or
             # the end-of-queue stop broadcast -- and abort here, before this

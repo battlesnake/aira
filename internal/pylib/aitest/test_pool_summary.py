@@ -96,7 +96,7 @@ def test_worker_wait_counts_a_blocked_send_but_not_its_own_serialization(monkeyp
     monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: clock.now))
     monkeypatch.setattr(worker, "json", SimpleNamespace(dumps=slow_dumps))
     monkeypatch.setattr(worker, "_init_forked_child", lambda config: None)
-    monkeypatch.setattr(worker, "run_one", lambda item: ("passed", [{"kind": "logstart"}]))
+    monkeypatch.setattr(worker, "run_one", lambda item, nextitem=None: ("passed", [{"kind": "logstart"}]))
     items = {"pkg/t.py::a": SimpleNamespace(config=None), "pkg/t.py::b": SimpleNamespace(config=None)}
     pipe_out = _BlockingPipe()
     run_worker_loop(None, items, io.StringIO("pkg/t.py::a\npkg/t.py::b\n__stop__\n"), pipe_out)

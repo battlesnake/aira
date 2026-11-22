@@ -163,9 +163,11 @@ def _fresh_barrier(suite, name):
     return barrier_dir
 
 
-def _run_suite(suite, barrier_dir, xml_path, extra_args, tmp_path):
+def _run_suite(suite, barrier_dir, xml_path, extra_args, tmp_path, extra_env=None):
     pylib_dir = os.path.dirname(os.path.dirname(os.path.abspath(worker_module.__file__)))
     env = dict(os.environ)
+    env.pop("AIRA_AITEST_BATCH_MAX_TESTS", None)
+    env.update(extra_env or {})
     env["PYTHONPATH"] = os.pathsep.join([pylib_dir, str(suite)])
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["AITEST_BARRIER_DIR"] = str(barrier_dir)
@@ -604,3 +606,150 @@ def test_terminal_summary_says_how_many_of_the_reported_failures_are_unevaluated
     assert "0 unevaluated" in clean_output, clean_output
     assert "aitest unevaluated results" not in clean_output, clean_output
     assert "UNEVALUATED" not in clean_output, clean_output
+
+
+
+# ---------------------------------------------------------------------------
+# AIRA-372: consecutive-chunk batching, end to end through a real pytest run.
+# ---------------------------------------------------------------------------
+
+_TEST_MODULE_TEARDOWN_FAILS = """
+import os
+
+import pytest
+
+LOG = os.environ["AITEST_E_LOG"]
+
+
+@pytest.fixture(scope="module")
+def shared():
+    with open(LOG, "a") as handle:
+        handle.write("setup\\n")
+    yield
+    raise RuntimeError("MODULE-TEARDOWN-MARKER")
+
+
+def test_one(shared):
+    pass
+
+
+def test_two(shared):
+    pass
+
+
+def test_three(shared):
+    pass
+"""
+
+
+def test_junit_matches_plain_pytest_for_a_failing_module_teardown_when_batched(tmp_path):
+    """E2. A module fixture whose teardown fails: plain pytest and aitest at a cap of
+    at least the module's size produce the same normalised JUnit XML -- one setup,
+    and the teardown error on the last test only. Mutant: per-test teardown (today's
+    cap-1 behaviour puts the error on every test)."""
+    suite = tmp_path / "teardown"
+    suite.mkdir()
+    (suite / "conftest.py").write_text(_CONFTEST)
+    (suite / "test_teardown.py").write_text(_TEST_MODULE_TEARDOWN_FAILS)
+    runs = {}
+    for name, args, env in (
+        ("plain", [], {}),
+        ("aitest", ["--aitest-workers=1"], {"AIRA_AITEST_BATCH_MAX_TESTS": "10"}),
+    ):
+        log = tmp_path / ("%s.log" % name)
+        xml_path = tmp_path / ("%s.xml" % name)
+        completed = _run_suite(
+            suite, _fresh_barrier(suite, name), xml_path, args, tmp_path,
+            extra_env=dict(env, AITEST_E_LOG=str(log)),
+        )
+        runs[name] = (completed, xml_path, log)
+    plain, plain_xml, plain_log = runs["plain"]
+    aitest, aitest_xml, aitest_log = runs["aitest"]
+    output = aitest.stdout + aitest.stderr
+    assert "aitest: batching: 3 tests in 1 chunks, cap 10" in output, output
+    assert plain_log.read_text() == aitest_log.read_text() == "setup\n"
+    assert _suite_counts(plain_xml) == _suite_counts(aitest_xml), output
+    assert _normalized_cases(plain_xml) == _normalized_cases(aitest_xml), output
+    errored = [
+        key for key, case in _normalized_cases(aitest_xml).items() if _child_text(case, "error") is not None
+    ]
+    assert errored == [("test_teardown", "test_three")], errored
+
+
+_CONFTEST_INTERLEAVE = _CONFTEST + """
+import pytest
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(items):
+    alpha = [item for item in items if "test_alpha" in item.nodeid]
+    beta = [item for item in items if "test_beta" in item.nodeid]
+    items[:] = [item for pair in zip(alpha, beta) for item in pair]
+"""
+
+
+def _interleave_module(tag):
+    return """
+import os
+
+import pytest
+
+LOG = os.environ["AITEST_E_LOG"]
+
+
+def _note(text):
+    with open(LOG, "a") as handle:
+        handle.write(text + "\\n")
+
+
+@pytest.fixture(scope="module")
+def shared():
+    _note("setup %(tag)s")
+    yield
+
+
+def test_1(shared, request):
+    _note("ran " + request.node.nodeid)
+
+
+def test_2(shared, request):
+    _note("ran " + request.node.nodeid)
+
+
+def test_3(shared, request):
+    _note("ran " + request.node.nodeid)
+""" % {"tag": tag}
+
+
+def test_a_trylast_reorder_is_honoured_and_reproduces_serial_setup_counts(tmp_path):
+    """E3. A trylast modifyitems hook interleaving two modules: every result passes,
+    the module-fixture setup count equals serial pytest's for that order, and the
+    execution order equals session.items (the chunk never reorders). Mutant: a
+    chunker that groups by module (reorders, so fewer setups and a different order)."""
+    suite = tmp_path / "interleave"
+    suite.mkdir()
+    (suite / "conftest.py").write_text(_CONFTEST_INTERLEAVE)
+    (suite / "test_alpha.py").write_text(_interleave_module("alpha"))
+    (suite / "test_beta.py").write_text(_interleave_module("beta"))
+    logs = {}
+    for name, args, env in (
+        ("plain", [], {}),
+        ("aitest", ["--aitest-workers=1"], {"AIRA_AITEST_BATCH_MAX_TESTS": "10"}),
+    ):
+        log = tmp_path / ("%s.log" % name)
+        completed = _run_suite(
+            suite, _fresh_barrier(suite, name), tmp_path / ("%s.xml" % name), args, tmp_path,
+            extra_env=dict(env, AITEST_E_LOG=str(log)),
+        )
+        output = completed.stdout + completed.stderr
+        assert completed.returncode == 0, output
+        logs[name] = log.read_text().splitlines()
+    assert "aitest: batching: 6 tests in 1 chunks, cap 10" in output, output
+    assert "6 passed, 0 failed, 0 skipped, 0 error, 0 unevaluated" in output, output
+    ran = [line for line in logs["aitest"] if line.startswith("ran ")]
+    assert ran == [
+        "ran test_%s.py::test_%d" % (module, index)
+        for index in (1, 2, 3) for module in ("alpha", "beta")
+    ]
+    assert logs["aitest"] == logs["plain"]
+    assert sum(1 for line in logs["aitest"] if line.startswith("setup ")) == 6

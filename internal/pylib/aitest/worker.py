@@ -59,6 +59,21 @@ _DISPATCH_WAIT_TOKEN = " __dispatch_wait_us__="
 # never a silently misattributed result.
 _EVENT_LINE_PREFIX = "\x01"
 
+# AIRA-372. A dispatch line carrying a multi-item chunk, supervisor -> worker:
+# _CHUNK_LINE_PREFIX + json.dumps([nodeid_1, ..., nodeid_n]) (n >= 2). Safe for the
+# reason _EVENT_LINE_PREFIX is (no real nodeid starts with \x01); a separate name
+# because it travels the other direction. A single-item unit stays a bare nodeid line,
+# so with batching off (AIRA_AITEST_BATCH_MAX_TESTS unset or 1) the wire is unchanged.
+_CHUNK_LINE_PREFIX = "\x01"
+
+# AIRA-372, TEST-ONLY seam (spec section 10, E4). None in production, where each
+# member's events and result line go out in ONE write. When a test sets it (before the
+# fork), the loop writes and flushes the member's event lines, calls
+# _fault_after_events(nodeid), and only then writes the result line -- so a test can
+# kill a worker after its events reached the supervisor but before any result
+# confirmed them.
+_fault_after_events = None
+
 # Tuple-tagging codec markers. json.dumps/json.loads silently degrades every
 # tuple to a list, and pytest_report_from_serializable does NOT restore them
 # (that restoration only exists on execnet's own typed wire format, which xdist
@@ -328,15 +343,82 @@ def _record_memory_sample(scope_path, nodeid, completed_count):
             current = _read_cgroup_int(scope_path, "memory.current")
         except (OSError, ValueError):
             current = None
+    # AIRA-372: a fourth column, this process's private memory (bytes), the A/B's
+    # per-worker memory reading on every mode including ledger-only (no cgroup).
+    private = _private_memory_bytes()
     try:
         path = os.path.join(measure_dir, "worker-%d.tsv" % os.getpid())
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(
-                "%s\t%s\t%d\n"
-                % (nodeid, "unevaluated" if current is None else current, completed_count)
+                "%s\t%s\t%d\t%s\n"
+                % (
+                    nodeid,
+                    "unevaluated" if current is None else current,
+                    completed_count,
+                    "unevaluated" if private is None else private,
+                )
             )
     except OSError:
         pass
+
+
+def _private_memory_bytes():
+    """Private_Clean + Private_Dirty of this process from /proc/self/smaps_rollup, in
+    bytes, or None when it cannot be read (AIRA-372, spec section 6). Not statm and
+    not ru_maxrss: a forked worker's statm counts the supervisor's copy-on-write image,
+    and ru_maxrss misses copy-on-write growth; the private sum is what this worker
+    itself has made private."""
+    try:
+        total = 0
+        seen = 0
+        with open("/proc/self/smaps_rollup", encoding="ascii", errors="replace") as handle:
+            for line in handle:
+                if line.startswith(("Private_Clean:", "Private_Dirty:")):
+                    total += int(line.split()[1]) * 1024  # the file reports kB
+                    seen += 1
+    except (OSError, ValueError, IndexError):
+        return None
+    return total if seen == 2 else None
+
+
+_FIXTURE_RECORDER_NAME = "aitest-fixture-setup-recorder"
+
+
+def _register_fixture_setup_recorder(config):
+    """AIRA-372 measurement (spec section 8): under AIRA_AITEST_MEASURE_DIR only,
+    register a pytest_fixture_setup hookwrapper that appends one TSV row per fixture
+    CACHE MISS -- pytest calls that hook only when it actually runs a fixture -- with
+    scope, argname, the scope node's nodeid and the setup's wall seconds, to
+    fixture-setup-<pid>.tsv. A normal run registers nothing. Fail-silent like
+    _record_memory_sample. pytest is imported here, not at module scope, because the
+    supervisor imports this module."""
+    measure_dir = os.environ.get("AIRA_AITEST_MEASURE_DIR", "")
+    if not measure_dir.strip():
+        return
+    pm = config.pluginmanager
+    if pm.get_plugin(_FIXTURE_RECORDER_NAME) is not None:
+        return
+    import pytest
+
+    path = os.path.join(measure_dir, "fixture-setup-%d.tsv" % os.getpid())
+
+    class _FixtureSetupRecorder:
+        @pytest.hookimpl(hookwrapper=True)
+        def pytest_fixture_setup(self, fixturedef, request):
+            started = time.monotonic()
+            yield
+            seconds = time.monotonic() - started
+            try:
+                node = getattr(request, "node", None)
+                with open(path, "a", encoding="utf-8") as handle:
+                    handle.write(
+                        "%s\t%s\t%s\t%.6f\n"
+                        % (fixturedef.scope, fixturedef.argname, getattr(node, "nodeid", ""), seconds)
+                    )
+            except Exception:
+                pass
+
+    pm.register(_FixtureSetupRecorder(), name=_FIXTURE_RECORDER_NAME)
 
 
 def fork_worker(scope_path):
@@ -508,38 +590,38 @@ class _OutcomeCollector:
             self.worst = outcome
 
 
-def run_one(item):
+def run_one(item, nextitem=None):
     """Executes one already-collected pytest Item through pytest's own item
     protocol (setup/call/teardown), returning
     (outcome, events) -- outcome being "passed", "failed", "skipped", or
     "error", and events the ordered list of serializable dicts the
     supervisor replays into its own real pytest hooks (Slice 2).
 
-    UNCERTAIN, flagged for verification during implementation: calling
-    item.ihook.pytest_runtest_protocol(item=item, nextitem=None) directly,
-    outside pytest's own Session.main() loop, is not a path this plugin has
-    exercised against a real pytest version yet. It is pytest's own
-    documented per-item hook (the same one xdist's worker calls per design
-    spec 3.2) and SHOULD behave identically to normal collection -- but the
-    exact hookimpl/pluginmanager registration dance below needs a real-pytest
-    verification pass before it is trusted, not a guess presented as
-    certain.
+    It calls item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+    directly, outside pytest's own Session.main() loop: pytest's own per-item
+    hook, the one xdist's worker calls too.
 
-    ACCEPTED SLICE 1 LIMITATION: nextitem=None is pytest's own signal that
-    this is the LAST item in the session, so it tears down and rebuilds the
-    ENTIRE fixture stack -- including session/module/class-scoped fixtures
-    -- after every single test, unlike plain pytest or xdist (which look
-    ahead to supply the real next item so a fixture shared across tests
-    persists). A suite relying on expensive or stateful session-scoped
-    fixtures will see them re-run per test in Slice 1. Real look-ahead
-    dispatch is deferred, a candidate for a later slice (see this task's own
-    Interfaces note and the test proving this behavior below).
+    nextitem is pytest's look-ahead, and it decides what survives this item's
+    teardown: SetupState.teardown_exact(nextitem) tears down only the collectors
+    (and with them the session/package/module/class fixtures) that nextitem does
+    not share. nextitem=None, the default, is pytest's "last item of the session"
+    signal, so the WHOLE fixture stack is torn down after the item. That is what
+    every single-item dispatch does, so with AIRA_AITEST_BATCH_MAX_TESTS unset or
+    1 each test pays for every shared fixture it uses, every time (proved by
+    test_worker.py's test_run_one_tears_down_and_rebuilds_session_scoped_fixtures_per_test).
+
+    AIRA-372: run_worker_loop passes the real next member of a multi-item chunk
+    (consecutive items in the final collection order), so shared fixtures live
+    for the chunk exactly as serial pytest would keep them for that range, and
+    passes None for a chunk's last member and for any member after which the
+    worker retires -- so every teardown happens inside a real protocol call with
+    real reports, and a worker never exits with shared fixtures alive.
     """
     collector = _OutcomeCollector(item.config)
     plugin_manager = item.config.pluginmanager
     plugin_manager.register(collector, name="aitest-outcome-collector")
     try:
-        item.ihook.pytest_runtest_protocol(item=item, nextitem=None)
+        item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
     finally:
         plugin_manager.unregister(collector)
     if collector.worst == "passed":
@@ -562,66 +644,108 @@ def run_worker_loop(scope_path, items_by_nodeid, pipe_in, pipe_out):
     # stay contaminated.
     for item in items_by_nodeid.values():
         _init_forked_child(item.config)
+        _register_fixture_setup_recorder(item.config)
         break
     started_at = time.monotonic()
     completed_count = 0
     # AIRA-344: when this worker last became free for a test (see _DISPATCH_WAIT_TOKEN).
     free_since = time.monotonic()
     for line in pipe_in:
-        nodeid = line.rstrip("\n")
-        if nodeid == "":
+        text = line.rstrip("\n")
+        if text == "":
             continue
-        if nodeid == "__stop__":
+        if text == "__stop__":
             break
         waited_us = max(0, int((time.monotonic() - free_since) * 1_000_000))
-        item = items_by_nodeid[nodeid]
-        outcome, events = run_one(item)
-        completed_count += 1
-        # AIRA-230 v7-4: retain this test's memory.current for the measurement
-        # report (opt-in, fail-silent). Before _should_recycle so a worker that
-        # recycles on THIS test still records the sample that motivated it.
-        _record_memory_sample(scope_path, nodeid, completed_count)
-        recycling = _should_recycle(scope_path, started_at, completed_count)
-        # Every event line goes out BEFORE this nodeid's plain result line,
-        # into the same stream, with ONE flush after the result line: the
-        # supervisor's stage-then-replay contract depends on never seeing the
-        # result line ahead of the events it confirms.
-        #
-        # default=str is required, not optional (v5/v6): a test calling
-        # record_property("x", <non-JSON-serializable object>) otherwise makes
-        # json.dumps raise TypeError inside this child's own hookimpl, which
-        # propagates out through run_one into the broad
-        # `except BaseException: _exit_child(70)` guard and kills the WORKER --
-        # turning a genuinely PASSING test into "unevaluated" once the retry
-        # crashes the same way. str, NOT repr: the real installed junitxml
-        # plugin applies str(propvalue) to a property value, so repr would
-        # silently emit DIFFERENT XML than a plain, non-aitest run for any
-        # object whose __str__/__repr__ differ.
-        #
-        # AIRA-344: the whole message is built BEFORE free_since is stamped, so the
-        # next test's wait starts when this worker begins sending -- a write that
-        # blocks on a full pipe (the supervisor not reading) counts as waiting, and
-        # this worker's own serialization does not. One write of the joined payload
-        # is the same byte stream, still followed by ONE flush.
-        payload = [
-            _EVENT_LINE_PREFIX + json.dumps(_tag_tuples(event), default=str) + "\n"
-            for event in events
-        ]
-        # The recycle decision rides in the SAME line as the result, not a
-        # separate write -- two independent write()+flush() calls left a
-        # real window (not just a buffering artifact; a genuine scheduling
-        # gap between "send result" and "check+send recycle") where the
-        # supervisor could see this worker as idle (in_flight cleared) and
-        # dispatch it a fresh nodeid before the recycle line ever arrived,
-        # silently losing that dispatch with no crash/EOF to detect it by
-        # (worker.py's own recycle check runs strictly after the result is
-        # already sent). One atomic message removes the window entirely.
-        line = "%s %s%s%d" % (nodeid, outcome, _DISPATCH_WAIT_TOKEN, waited_us)
-        if recycling:
-            line += _RECYCLE_SUFFIX
-        payload.append(line + "\n")
-        free_since = time.monotonic()
+        if text.startswith(_CHUNK_LINE_PREFIX):
+            # AIRA-372. A malformed chunk line (bad JSON, not a list of >= 2 strings,
+            # an unknown nodeid) raises here and takes the caller's
+            # `except BaseException: _exit_child(70)`: the crash path.
+            members = json.loads(text[len(_CHUNK_LINE_PREFIX):])
+            if not isinstance(members, list) or len(members) < 2 or not all(
+                isinstance(member, str) for member in members
+            ):
+                raise ValueError("malformed chunk dispatch line: %r" % (text,))
+        else:
+            members = [text]
+        chunk_items = [items_by_nodeid[member] for member in members]
+        n = len(members)
+        for i, nodeid in enumerate(members):
+            # AIRA-372: every member of a multi-member chunk is pre-checked, member 1
+            # included, with the count it WOULD reach. A trip never skips the member:
+            # it makes this member the worker's last, run with nextitem=None, so its
+            # own protocol tears every shared fixture down and the count bound is
+            # exact. A single-item unit (n == 1) keeps only today's post-item check.
+            recycling = n >= 2 and _should_recycle(scope_path, started_at, completed_count + 1)
+            nextitem = None if (recycling or i == n - 1) else chunk_items[i + 1]
+            outcome, events = run_one(chunk_items[i], nextitem=nextitem)
+            completed_count += 1
+            # AIRA-230 v7-4: retain this test's memory.current for the measurement
+            # report (opt-in, fail-silent). Before _should_recycle so a worker that
+            # recycles on THIS test still records the sample that motivated it.
+            _record_memory_sample(scope_path, nodeid, completed_count)
+            if not recycling and i == n - 1:
+                recycling = _should_recycle(scope_path, started_at, completed_count)
+            free_since = _send_result(
+                pipe_out, nodeid, outcome, events, waited_us if i == 0 else None, recycling
+            )
+            if recycling:
+                return
+
+
+def _send_result(pipe_out, nodeid, outcome, events, waited_us, recycling):
+    """Writes one test's event lines and then its result line, and returns the
+    monotonic instant this worker became free again (AIRA-344). waited_us is None for
+    members 2..n of a chunk (AIRA-372), which carry no wait token and so read as
+    unmeasured dispatches."""
+    # Every event line goes out BEFORE this nodeid's plain result line,
+    # into the same stream, with ONE flush after the result line: the
+    # supervisor's stage-then-replay contract depends on never seeing the
+    # result line ahead of the events it confirms.
+    #
+    # default=str is required, not optional (v5/v6): a test calling
+    # record_property("x", <non-JSON-serializable object>) otherwise makes
+    # json.dumps raise TypeError inside this child's own hookimpl, which
+    # propagates out through run_one into the broad
+    # `except BaseException: _exit_child(70)` guard and kills the WORKER --
+    # turning a genuinely PASSING test into "unevaluated" once the retry
+    # crashes the same way. str, NOT repr: the real installed junitxml
+    # plugin applies str(propvalue) to a property value, so repr would
+    # silently emit DIFFERENT XML than a plain, non-aitest run for any
+    # object whose __str__/__repr__ differ.
+    #
+    # AIRA-344: the whole message is built BEFORE free_since is stamped, so the
+    # next test's wait starts when this worker begins sending -- a write that
+    # blocks on a full pipe (the supervisor not reading) counts as waiting, and
+    # this worker's own serialization does not. One write of the joined payload
+    # is the same byte stream, still followed by ONE flush.
+    payload = [
+        _EVENT_LINE_PREFIX + json.dumps(_tag_tuples(event), default=str) + "\n"
+        for event in events
+    ]
+    # The recycle decision rides in the SAME line as the result, not a
+    # separate write -- two independent write()+flush() calls left a
+    # real window (not just a buffering artifact; a genuine scheduling
+    # gap between "send result" and "check+send recycle") where the
+    # supervisor could see this worker as idle (in_flight cleared) and
+    # dispatch it a fresh nodeid before the recycle line ever arrived,
+    # silently losing that dispatch with no crash/EOF to detect it by
+    # (worker.py's own recycle check runs strictly after the result is
+    # already sent). One atomic message removes the window entirely.
+    line = "%s %s" % (nodeid, outcome)
+    if waited_us is not None:
+        line += "%s%d" % (_DISPATCH_WAIT_TOKEN, waited_us)
+    if recycling:
+        line += _RECYCLE_SUFFIX
+    if _fault_after_events is not None:
+        # AIRA-372 test-only seam (inert in production): the events reach the
+        # supervisor's staging before the result line that would confirm them.
         pipe_out.write("".join(payload))
         pipe_out.flush()
-        if recycling:
-            return
+        _fault_after_events(nodeid)
+        payload = []
+    payload.append(line + "\n")
+    free_since = time.monotonic()
+    pipe_out.write("".join(payload))
+    pipe_out.flush()
+    return free_since

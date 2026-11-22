@@ -121,6 +121,55 @@ what the parent already flushed. A project wanting correct coverage across
 aitest workers owns its own parallel-mode-aware coverage config — as it already
 would for xdist.
 
+### Consecutive-chunk batching (AIRA-372, off by default)
+
+`AIRA_AITEST_BATCH_MAX_TESTS=c` (an integer, 2 or more) makes the supervisor cut
+the final collection order (after every `pytest_collection_modifyitems` hook)
+into chunks of up to `c` consecutive tests and hand each chunk to one worker,
+which runs member `i` with pytest's real `nextitem` (member `i+1`) and the last
+member with `None`. pytest's own `SetupState` then keeps alive exactly what
+serial pytest keeps alive for that range, so a module fixture is set up once
+per chunk instead of once per test. Unset or `1` is off, and the queue and the
+dispatch wire are byte-identical to an unbatched run; a non-integer or a value
+below 1 warns once and means 1. The cap is clamped to
+`AIRA_AITEST_WORKER_MAX_TESTS` (default 200). A batched run prints one line at
+the start: `aitest: batching: N tests in K chunks, cap c (AIRA_AITEST_BATCH_MAX_TESTS)`.
+
+- **Cuts.** Chunks never reorder tests. A chunk holds tests with the same
+  `aira_mem` / `aira_cpu` / `aira_time` values; a module's run of such tests is
+  not split below the cap; an `@aira_failfast` test always runs alone.
+- **Recycling.** Before each member of a chunk the worker checks its time,
+  count and memory-watermark limits. A trip never skips the member: it runs
+  last, with `nextitem=None`, so every teardown happens inside a real test
+  protocol. A worker runs at most `AIRA_AITEST_WORKER_MAX_TESTS` tests. The
+  unstarted rest of a recycled chunk goes back to the queue as one chunk.
+- **Crashes.** Only the member running when a worker is lost is charged a
+  retry; the unstarted rest is requeued as single tests, uncharged. A loss on
+  item `k > 1` prints `aira aitest: worker <pid> was lost while running item k
+  of a chunk (<nodeid>); k-1 earlier items had run with shared fixtures alive;
+  retrying it alone`, because a retried test usually passes alone and a memory
+  build-up across the chunk would otherwise stay invisible.
+- **Teardown errors** of a shared fixture are reported on the test whose
+  teardown ran them: the last user before a scope change, or the chunk's last
+  member -- serial pytest's attribution for the same order.
+- **`-x`, `--maxfail`.** Inside a worker, its own failures can set pytest's
+  `shouldfail`/`shouldstop`, after which pytest forces `nextitem=None`: the rest
+  of that worker's life runs unbatched. Sound, only slower.
+- **Memory.** A worker keeps a chunk's higher-scope fixtures alive until a
+  scope change or the chunk's end, so its peak can rise by one chunk's retained
+  fixtures (what serial pytest holds for that range). On ci-shim ledger-only
+  admission there is no watermark and no kill backstop for that growth.
+- **Measurement** (`AIRA_AITEST_MEASURE_DIR`): `fixture-setup-<pid>.tsv` gets one
+  row per real fixture setup (scope, fixture name, scope node, seconds); each
+  `worker-<pid>.tsv` row gains a fourth column, the worker's private memory in
+  bytes (`/proc/self/smaps_rollup` Private_Clean + Private_Dirty, or
+  `unevaluated`); `pool-report-<pid>.json` adds `batch_cap`,
+  `chunk_lengths_cut`, `chunk_lengths_run`, `drain_s`, `worker_crashes`,
+  `mid_chunk_crashes`, `oom_group_kills` and `unstarted_requeued`.
+
+Design and the A/B plan before the default changes:
+[`docs/superpowers/specs/2026-11-22-aitest-fixture-batching-design.md`](../../../docs/superpowers/specs/2026-11-22-aitest-fixture-batching-design.md).
+
 ### Known gaps, deliberately deferred
 
 - **`-x` / `--maxfail`.** A replayed report does set `session.shouldfail`
@@ -135,8 +184,11 @@ would for xdist.
   the same (now muted) terminalreporter, so a worker's live log lines go
   nowhere rather than to the shared terminal. Forwarding them properly is not
   done here.
-- **Look-ahead dispatch.** `run_one` still passes `nextitem=None`, so
-  session/module/class-scoped fixtures are torn down and rebuilt per test.
+- **Shared fixtures are rebuilt per test unless batching is on.** With
+  `AIRA_AITEST_BATCH_MAX_TESTS` unset or `1` (the default) every test is
+  dispatched alone and `run_one` passes `nextitem=None`, so
+  session/module/class-scoped fixtures are torn down and rebuilt per test. See
+  "Consecutive-chunk batching" below.
 - **`record_xml_attribute`/`record_testsuite_property`** write into the
   child's own COW-forked `LogXML` plugin instance and are lost — same
   limitation as xdist workers, not a regression against the design target.

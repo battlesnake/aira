@@ -4430,3 +4430,575 @@ sys.stdin.buffer.read()
     assert len(results) == 4
     assert all(outcome == "passed" for outcome in results.values()), results
     assert supervisor.daemon_available is True
+
+
+# ---------------------------------------------------------------------------
+# AIRA-372: consecutive-chunk batching, the supervisor side (spec section 10).
+# ---------------------------------------------------------------------------
+
+import collections
+import io
+from types import SimpleNamespace
+
+import aitest.worker as worker_module
+from aitest.supervisor import _cut_chunks, _resolve_batch_cap
+from aitest.worker import _CHUNK_LINE_PREFIX, run_worker_loop
+
+_BATCH = "AIRA_AITEST_BATCH_MAX_TESTS"
+
+
+def _fake_item(module, index):
+    return SimpleNamespace(nodeid="%s::t%d" % (module, index), path=module)
+
+
+def _cut(spec, cap):
+    """spec: [(module, key-tuple-without-failfast, failfast)], one per item, in order.
+    Returns the chunks as lists of nodeids."""
+    items, keys = [], {}
+    for index, (module, key, failfast) in enumerate(spec):
+        item = _fake_item(module, index)
+        items.append(item)
+        keys[item.nodeid] = tuple(key) + (failfast,)
+    return _cut_chunks(items, lambda item: keys[item.nodeid], cap)
+
+
+def _lengths(chunks):
+    return [len(chunk) for chunk in chunks]
+
+
+K = (512, 1, 1)
+J = (1024, 1, 1)
+
+
+@pytest.mark.parametrize("spec, cap, expected", [
+    # one module, one key, under the cap: one chunk
+    ([("a", K, False)] * 5, 10, [5]),
+    # a tuple change cuts, even inside one module
+    ([("a", K, False)] * 2 + [("a", J, False)] * 2, 10, [2, 2]),
+    # module-aware packing: a whole segment that does not fit starts a new chunk
+    # (never split across chunks below the cap)
+    ([("a", K, False)] * 3 + [("b", K, False)] * 3, 4, [3, 3]),
+    # segments of equal key pack across modules while the whole segment fits
+    ([("a", K, False)] * 2 + [("b", K, False)] * 2, 4, [4]),
+    # exactly at the cap packs (<=, not <)
+    ([("a", K, False)] * 2 + [("b", K, False)] * 1, 3, [3]),
+    # a segment longer than the cap splits at the cap ...
+    ([("a", K, False)] * 7, 3, [3, 3, 1]),
+    # ... and its last, shorter piece absorbs following segments
+    ([("a", K, False)] * 7 + [("b", K, False)] * 2, 3, [3, 3, 3]),
+    # a fail-fast item is always a chunk of one, never continued from or into
+    ([("a", K, False), ("a", K, True), ("a", K, True), ("a", K, False)], 10, [1, 1, 1, 1]),
+    # cap 1: every item alone
+    ([("a", K, False)] * 4, 1, [1, 1, 1, 1]),
+])
+def test_chunk_cut_rules(spec, cap, expected):
+    """S1, table-driven over spec 4.2's rules. Mutants: a rule removed or off by one."""
+    chunks = _cut(spec, cap)
+    assert _lengths(chunks) == expected
+    # never reorders
+    assert [n for chunk in chunks for n in chunk] == ["%s::t%d" % (m, i) for i, (m, _k, _f) in enumerate(spec)]
+
+
+@pytest.fixture
+def clear_batch_warnings():
+    worker_module._WARNED_INVALID_ENV_VARS.clear()
+    yield
+    worker_module._WARNED_INVALID_ENV_VARS.clear()
+
+
+@pytest.mark.parametrize("raw, worker_max, expected, warns", [
+    (None, None, 1, False),
+    ("1", None, 1, False),
+    ("5", None, 5, False),
+    ("500", None, 200, False),   # clamped to the default worker count limit
+    ("10", "4", 4, False),       # clamped to AIRA_AITEST_WORKER_MAX_TESTS
+    ("10", "0", 1, False),       # a worker limit <= 0 runs one test: batching off
+    ("abc", None, 1, True),
+    ("0", None, 1, True),
+    ("-3", None, 1, True),
+])
+def test_batch_cap_resolution(monkeypatch, capsys, clear_batch_warnings, raw, worker_max, expected, warns):
+    """S1 (configuration, spec 7)."""
+    if raw is None:
+        monkeypatch.delenv(_BATCH, raising=False)
+    else:
+        monkeypatch.setenv(_BATCH, raw)
+    if worker_max is None:
+        monkeypatch.delenv("AIRA_AITEST_WORKER_MAX_TESTS", raising=False)
+    else:
+        monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", worker_max)
+    assert _resolve_batch_cap() == expected
+    err = capsys.readouterr().err
+    assert (_BATCH + " has invalid value" in err) is warns, err
+
+
+_FOUR_SHARERS = """
+    import pytest
+
+    @pytest.fixture(scope="module")
+    def shared():
+        yield
+
+    def test_a(shared): pass
+    def test_b(shared): pass
+    def test_c(shared): pass
+    def test_d(shared): pass
+"""
+
+
+def test_collect_cuts_on_markers_and_registers_chunk_ids_with_shared_needs(pytester, monkeypatch, capsys):
+    """S1 at collect(): a differing aira_mem cuts; a chunk id carries its members'
+    shared need/cpu/time, never appears as a nodeid, and the run-start line says so."""
+    monkeypatch.setenv(_BATCH, "10")
+    items = pytester.getitems("""
+        import pytest
+
+        def test_a(): pass
+        def test_b(): pass
+
+        @pytest.mark.aira_mem("1G")
+        def test_c(): pass
+
+        @pytest.mark.aira_failfast
+        def test_d(): pass
+        def test_e(): pass
+    """)
+    sup = Supervisor()
+    sup.collect(items)
+    ids = [item.nodeid for item in items]
+    assert len(sup._chunks) == 1
+    (chunk_id, members), = sup._chunks.items()
+    assert members == ids[:2]
+    assert list(sup.queue) == [chunk_id, ids[2], ids[3], ids[4]]
+    assert sup._need_for(chunk_id) == sup._need_for(ids[0])
+    assert sup._cpu_need_for(chunk_id) == sup._cpu_need_for(ids[0])
+    assert sup._time_for(chunk_id) == sup._time_for(ids[0])
+    assert chunk_id not in sup.items_by_nodeid and chunk_id.startswith("\x01")
+    assert "aitest: batching: 5 tests in 4 chunks, cap 10 (AIRA_AITEST_BATCH_MAX_TESTS)" in capsys.readouterr().out
+
+
+def _idle_worker(sup):
+    """A fake idle worker: dispatch lines can be read back, results fed in."""
+    result_read, result_write = os.pipe()
+    os.set_blocking(result_read, False)
+    dispatch_read, dispatch_write = os.pipe()
+    os.set_blocking(dispatch_read, False)
+    pid = 999100 + len(sup.workers) + len(sup.results) * 7
+    while pid in sup.workers:
+        pid += 1
+    state = {
+        "result_fd": result_read, "read_buffer": b"", "result_eof": False,
+        "in_flight": None, "dispatch_write": os.fdopen(dispatch_write, "w"),
+        "admit_process": None, "grant": None, "reservation": None,
+        "pending_events": [], "start_wall_us": None,
+    }
+    sup.workers[pid] = state
+    return SimpleNamespace(pid=pid, state=state, dispatch_read=dispatch_read, result_write=result_write)
+
+
+def _dispatched(worker):
+    try:
+        return os.read(worker.dispatch_read, 1 << 16).decode("utf-8")
+    except BlockingIOError:
+        return ""
+
+
+def _send(sup, worker, *lines, eof=False):
+    for line in lines:
+        os.write(worker.result_write, (line + "\n").encode("utf-8"))
+    if eof:
+        os.close(worker.result_write)
+    sup._drain_worker(worker.pid, worker.state)
+
+
+def _batched_sup(pytester, monkeypatch, cap, source=_FOUR_SHARERS, config=False):
+    monkeypatch.setenv(_BATCH, str(cap))
+    monkeypatch.delenv("AIRA_AITEST_WORKER_MAX_TESTS", raising=False)
+    items = pytester.getitems(source)
+    sup = Supervisor(config=items[0].config if config else None)
+    sup.collect(items)
+    replaced = []
+    monkeypatch.setattr(sup, "_replace_worker", lambda: replaced.append(True))
+    return sup, [item.nodeid for item in items], replaced
+
+
+@pytest.mark.parametrize("raw", [None, "1"])
+def test_batching_off_keeps_the_queue_and_the_wire_byte_identical(pytester, monkeypatch, capsys, raw):
+    """S2, default byte-identity. Unset or 1: the queue is exactly the nodeid list,
+    no chunk exists, no batching line prints, and every dispatch line is a bare
+    nodeid. Mutant: a JSON chunk line always (even for one item)."""
+    if raw is None:
+        monkeypatch.delenv(_BATCH, raising=False)
+    else:
+        monkeypatch.setenv(_BATCH, raw)
+    items = pytester.getitems(_FOUR_SHARERS)
+    ids = [item.nodeid for item in items]
+    sup = Supervisor()
+    sup.collect(items)
+    assert list(sup.queue) == ids
+    assert sup._chunks == {}
+    assert set(sup.reservation_need) == set(ids) == set(sup.cpu_need) == set(sup.time_cost)
+    assert "aitest: batching" not in capsys.readouterr().out
+    monkeypatch.setattr(sup, "_replace_worker", lambda: None)
+    sent = []
+    worker = _idle_worker(sup)
+    for nodeid in ids:
+        sup._dispatch_to_idle_workers()
+        sent.append(_dispatched(worker))
+        _send(sup, worker, "%s passed" % nodeid)
+    os.close(worker.dispatch_read)
+    assert sent == [nodeid + "\n" for nodeid in ids]
+    assert sup.attempts == {nodeid: 1 for nodeid in ids}
+
+
+def test_chunk_attempts_are_charged_on_promotion_not_pop(pytester, monkeypatch):
+    """S3. Dispatching [a,b,c] charges a only; a's result promotes and charges b;
+    c is never charged while unstarted. Mutant: charge every member at pop."""
+    sup, ids, _replaced = _batched_sup(pytester, monkeypatch, 3, source=_FOUR_SHARERS.replace("    def test_d(shared): pass\n", ""))
+    a, b, c = ids
+    worker = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    assert _dispatched(worker) == _CHUNK_LINE_PREFIX + json.dumps([a, b, c]) + "\n"
+    assert sup.attempts == {a: 1}
+    assert worker.state["in_flight"] == a
+    _send(sup, worker, "%s passed __dispatch_wait_us__=5" % a)
+    assert sup.attempts == {a: 1, b: 1}
+    assert worker.state["in_flight"] == b and list(worker.state["rest"]) == [c]
+
+
+def test_a_crash_mid_chunk_requeues_the_rest_as_uncharged_singles(pytester, monkeypatch):
+    """S4. Crash while b (item 2 of [a,b,c,d]) is in flight: the queue head reads
+    [b, c, d], all bare nodeids, b at 1 attempt and c, d at 0; a's result stands. A
+    second crash on b makes b unevaluated and c still runs. Mutants: rest requeued as
+    a chunk, charged, or dropped."""
+    sup, ids, _replaced = _batched_sup(pytester, monkeypatch, 4)
+    a, b, c, d = ids
+    worker = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    _send(sup, worker, "%s passed" % a)
+    _send(sup, worker, eof=True)
+    assert list(sup.queue) == [b, c, d]
+    assert sup.attempts == {a: 1, b: 1}
+    assert sup.results == {a: "passed"}
+
+    retry = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    assert _dispatched(retry) == b + "\n"
+    _send(sup, retry, eof=True)
+    assert sup.results[b] == "unevaluated"
+    last = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    assert _dispatched(last) == c + "\n"
+    _send(sup, last, "%s passed" % c)
+    assert sup.results == {a: "passed", b: "unevaluated", c: "passed"}
+    assert sup.attempts == {a: 1, b: 2, c: 1}
+    assert list(sup.queue) == [d]
+    assert sup._unstarted_requeued == 2
+
+
+def test_a_recycle_mid_chunk_requeues_the_rest_as_one_chunk_reusing_its_id(pytester, monkeypatch):
+    """S5. [a,b,c,d] with the recycle suffix on b: the queue head is ONE entry, the
+    same chunk id now mapping to [c, d], both uncharged; the worker retired and a
+    replacement was requested. A recycle on c instead requeues the bare d. Mutant:
+    rest requeued as singles."""
+    sup, ids, replaced = _batched_sup(pytester, monkeypatch, 4)
+    a, b, c, d = ids
+    (chunk_id,) = sup._chunks
+    worker = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    _send(sup, worker, "%s passed" % a, "%s passed __recycle_next__" % b)
+    assert list(sup.queue) == [chunk_id]
+    assert sup._chunks[chunk_id] == [c, d]
+    assert sup.attempts == {a: 1, b: 1}
+    assert worker.pid not in sup.workers and replaced == [True]
+    assert sup._unstarted_requeued == 2
+
+    again = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    assert _dispatched(again) == _CHUNK_LINE_PREFIX + json.dumps([c, d]) + "\n"
+    _send(sup, again, "%s passed __recycle_next__" % c)
+    assert list(sup.queue) == [d]
+    assert sup.attempts == {a: 1, b: 1, c: 1}
+
+
+def _crash_line_count(err):
+    return err.count("of a chunk (")
+
+
+def test_a_mid_chunk_loss_says_so_before_the_retry_and_counts_it(pytester, monkeypatch, capsys):
+    """S6. A crash while b (item 2) is in flight writes exactly one stderr line --
+    worker, "item 2 of a chunk", b's nodeid -- before the retry, not containing the
+    death reason's "the one retry"; the pool summary's mid-chunk count is 1 after b's
+    retry passes. Mutants: the clause only on the death reason (no line, since the
+    retry passes); _describe_worker_death's text embedded."""
+    sup, ids, _replaced = _batched_sup(pytester, monkeypatch, 3, source=_FOUR_SHARERS.replace("    def test_d(shared): pass\n", ""))
+    a, b, c = ids
+    worker = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    _send(sup, worker, "%s passed" % a)
+    capsys.readouterr()
+    _send(sup, worker, eof=True)
+    err = capsys.readouterr().err
+    assert _crash_line_count(err) == 1, err
+    assert (
+        "aira aitest: worker %d was lost while running item 2 of a chunk (%s); "
+        "1 earlier items had run with shared fixtures alive; retrying it alone" % (worker.pid, b)
+    ) in err
+    assert "the one retry" not in err
+    retry = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    _send(sup, retry, "%s passed" % b)
+    assert sup.results[b] == "passed"
+    fields = sup._pool_summary_fields(lambda value: value)
+    assert fields["mid_chunk_crashes"] == 1 and fields["worker_crashes"] == 1
+    assert _crash_line_count(capsys.readouterr().err) == 0
+
+
+def test_no_mid_chunk_line_for_a_crash_on_item_one_or_an_idle_worker(pytester, monkeypatch, capsys):
+    """S6, the negative cases: a crash on item 1 of a chunk, and a worker that dies
+    idle after its chunk completed, print no line and count nothing. Mutant:
+    chunk_pos not reset when in_flight is cleared (the idle death then prints)."""
+    sup, ids, _replaced = _batched_sup(pytester, monkeypatch, 2, source=_FOUR_SHARERS)
+    a, b, c, d = ids
+    first = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    _send(sup, first, "%s passed" % a, "%s passed" % b)
+    assert first.state["in_flight"] is None
+    _send(sup, first, eof=True)  # idle death after a completed chunk
+    second = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    assert second.state["in_flight"] == c
+    _send(sup, second, eof=True)  # crash on item 1
+    err = capsys.readouterr().err
+    assert _crash_line_count(err) == 0, err
+    assert sup._mid_chunk_crashes == 0 and sup._worker_crashes == 2
+    assert list(sup.queue) == [c, d]
+
+
+def test_exceeds_ceiling_on_a_chunk_marks_every_member_and_never_leaks_the_id(pytester, monkeypatch):
+    """S7. The empty-pool bootstrap refuses a chunk id as exceeds-ceiling: every
+    member is unevaluated with the ceiling reason, and no chunk id appears in results
+    or in any synthesized report."""
+    sup, ids, _replaced = _batched_sup(pytester, monkeypatch, 4, config=True)
+
+    def refuse(*_args, **_kwargs):
+        exc = WorkerAdmitRequestInvalid("worker-admit state=denied class=request-invalid reason=exceeds-ceiling")
+        exc.reason = supervisor_module.WORKER_ADMIT_REASON_EXCEEDS_CEILING
+        raise exc
+
+    monkeypatch.setattr(sup, "_wait_for_admission_or_disable", refuse)
+    sup._bootstrap_from_empty_pool()
+    assert list(sup.queue) == []
+    assert sup.results == {nodeid: "unevaluated" for nodeid in ids}
+    assert all("exceeds the slice ceiling" in sup._unevaluated_reasons[n] for n in ids)
+    with _replay_spy(sup.config) as spy:
+        sup._synthesize_unevaluated_reports()
+    assert sorted(r.nodeid for r in spy.reports) == sorted(ids)
+    assert not any("\x01" in key for key in list(sup.results) + list(sup._unevaluated_reasons))
+
+
+def test_fail_queue_terminal_expands_a_chunk_into_its_members(pytester, monkeypatch, capsys):
+    """S8."""
+    sup, ids, _replaced = _batched_sup(pytester, monkeypatch, 4)
+    sup._fail_queue_terminal("worker-admit state=denied class=contract-violation reason=x")
+    assert sup.results == {nodeid: "unevaluated" for nodeid in ids}
+    assert all(sup._unevaluated_reasons[n].endswith("reason=x") for n in ids)
+    assert not any("\x01" in key for key in sup.results)
+
+
+def test_a_fail_fast_abort_names_the_unstarted_rest_of_another_workers_chunk(pytester, monkeypatch):
+    """S9. A fail-fast leg trips while another worker is mid-chunk: its in-flight
+    member is "killed by the fail-fast abort", its unstarted rest "not started"."""
+    monkeypatch.setenv(_BATCH, "3")
+    items = pytester.getitems("""
+        import pytest
+
+        @pytest.mark.aira_failfast
+        def test_leg(): pass
+
+        def test_a(): pass
+        def test_b(): pass
+        def test_c(): pass
+    """)
+    leg, a, b, c = [item.nodeid for item in items]
+    sup = Supervisor()
+    sup.collect(items)
+    monkeypatch.setattr(sup, "_replace_worker", lambda: None)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)  # fake pids: never signal anything real
+    leg_worker = _idle_worker(sup)
+    chunk_worker = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    assert leg_worker.state["in_flight"] == leg
+    assert chunk_worker.state["in_flight"] == a
+    _send(sup, leg_worker, "%s failed" % leg)
+    assert sup.failfast_triggered == leg
+    sup._abort_pool()
+    assert sup._unevaluated_reasons[a] == "killed by the fail-fast abort (tripped by %s)" % leg
+    for member in (b, c):
+        assert sup._unevaluated_reasons[member] == (
+            "not started: the fail-fast abort (tripped by %s) stopped the pool" % leg
+        )
+
+
+def test_a_chunk_with_a_space_in_a_parametrised_nodeid_round_trips(pytester, monkeypatch):
+    """S10. The supervisor's chunk line, fed to a real worker loop, names every member
+    exactly, spaces included. Mutant: a space-split wire."""
+    sup, ids, _replaced = _batched_sup(pytester, monkeypatch, 5, source="""
+        import pytest
+
+        @pytest.mark.parametrize("value", ["a b", "c  d", "plain"])
+        def test_param(value): pass
+    """)
+    assert any(" " in nodeid for nodeid in ids)
+    worker = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    line = _dispatched(worker)
+    pipe_out = io.StringIO()
+    run_worker_loop(None, sup.items_by_nodeid, io.StringIO(line + "__stop__\n"), pipe_out)
+    result_lines = [l for l in pipe_out.getvalue().splitlines() if not l.startswith(_EVENT_LINE_PREFIX)]
+    _send(sup, worker, *result_lines)
+    assert sup.results == {nodeid: "passed" for nodeid in ids}
+
+
+def test_only_a_chunk_head_carries_a_dispatch_wait_measurement(pytester, monkeypatch):
+    """S11. Members 2..n carry no wait token, so the summary reads "measured on 1 of 3"."""
+    sup, ids, _replaced = _batched_sup(pytester, monkeypatch, 3, source=_FOUR_SHARERS.replace("    def test_d(shared): pass\n", ""))
+    a, b, c = ids
+    worker = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    _send(sup, worker, "%s passed __dispatch_wait_us__=7" % a, "%s passed" % b, "%s passed" % c)
+    assert sup._dispatches_measured == 1 and sup._tests_completed == 3
+    assert "(measured on 1 of 3 tests)" in sup.pool_summary()
+    assert sup._chunk_lengths_run == collections.Counter({3: 1})
+
+
+# --- end to end, real forked workers ------------------------------------------------
+
+def _stub_admission(tmp_path, monkeypatch):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    admit = _write_stub(tmp_path / "worker-admit", f"""
+import os, sys
+scope = os.path.join({str(outer)!r}, "worker-scope-%d" % os.getpid())
+os.makedirs(scope, exist_ok=True)
+print("aira-worker-admit state=granted class=granted containment=enforced scope=%s worker_id=%d memory_max=104857600" % (scope, os.getpid()))
+sys.stdout.flush()
+sys.stdin.buffer.read()
+""")
+    monkeypatch.setenv("AIRA_AITEST_OUTER_SCOPE", str(outer))
+    monkeypatch.setenv("AIRA_AITEST_ADMISSION", "cgroup-sub-scope")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_ADMIT_CMD", admit)
+
+
+def _counting_module(tmp_path, count):
+    log = tmp_path / "events.log"
+    body = f"""
+        import os
+        import pytest
+
+        LOG = {str(log)!r}
+
+        def _note(kind, name):
+            with open(LOG, "a") as handle:
+                handle.write("%s %s %d\\n" % (kind, name, os.getpid()))
+
+        @pytest.fixture(scope="module")
+        def shared():
+            _note("setup", "module")
+            yield
+    """
+    for index in range(1, count + 1):
+        body += f"""
+        def test_m{index}(shared, request):
+            _note("ran", request.node.name)
+    """
+    return log, body
+
+
+def _events(log):
+    return [line.split() for line in log.read_text().splitlines()]
+
+
+@pytest.mark.parametrize("cap, setups", [("5", 2), ("1", 10)])
+def test_real_workers_set_a_module_fixture_up_once_per_chunk(tmp_path, monkeypatch, pytester, cap, setups):
+    """E1. A 10-test module with a module fixture: cap 5 sets it up twice, cap 1 ten
+    times. Mutant: the worker ignores nextitem."""
+    _stub_admission(tmp_path, monkeypatch)
+    monkeypatch.setenv(_BATCH, cap)
+    monkeypatch.delenv("AIRA_AITEST_WORKER_MAX_TESTS", raising=False)
+    log, body = _counting_module(tmp_path, 10)
+    items = pytester.getitems(body)
+    sup = Supervisor()
+    sup.collect(items)
+    results = sup.run(estimated_bytes=100 * (1 << 20), worker_count=2)
+    assert results == {item.nodeid: "passed" for item in items}
+    assert sum(1 for kind, *_ in _events(log) if kind == "setup") == setups
+
+
+def test_a_real_worker_lost_mid_chunk_reruns_only_the_lost_member_and_replays_each_once(tmp_path, monkeypatch, pytester, capsys):
+    """E4. One worker, a chunk of 5 whose member 3 dies on its first run AFTER its
+    event lines reached the supervisor (the test-only _fault_after_events seam), so
+    m3's events sit staged with no result to confirm them. Every nodeid ends with one
+    passing result; m1, m2, m4, m5 ran once and m3 twice; attempts are
+    {m1:1, m2:1, m3:2, m4:1, m5:1}; the replayed reports (what junitxml receives)
+    hold exactly one testcase's worth per nodeid, m3's from its retry only; the S6
+    line appears. Mutants: staged events replayed on arrival or on crash (m3 twice);
+    promotion off by one; rest dropped; m1/m2 replayed twice."""
+    _stub_admission(tmp_path, monkeypatch)
+    monkeypatch.setenv(_BATCH, "5")
+    monkeypatch.delenv("AIRA_AITEST_WORKER_MAX_TESTS", raising=False)
+    log, body = _counting_module(tmp_path, 5)
+    body += """
+        def test_zz_marker_holder():
+            pass
+    """
+    items = pytester.getitems(body)[:5]
+    ids = [item.nodeid for item in items]
+    m3 = ids[2]
+    marker = tmp_path / "m3-died-once"
+
+    def fault(nodeid):
+        if nodeid == m3 and not marker.exists():
+            marker.write_text("1")
+            os._exit(137)
+
+    monkeypatch.setattr(worker_module, "_fault_after_events", fault)
+    sup = Supervisor(config=items[0].config)
+    sup.collect(items)
+    with _replay_spy(items[0].config) as spy:
+        results = sup.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+    assert results == {nodeid: "passed" for nodeid in ids}
+    ran = collections.Counter(name for kind, name, _pid in _events(log) if kind == "ran")
+    assert ran == {"test_m1": 1, "test_m2": 1, "test_m3": 2, "test_m4": 1, "test_m5": 1}
+    assert sup.attempts == {ids[0]: 1, ids[1]: 1, m3: 2, ids[3]: 1, ids[4]: 1}
+    per_node = collections.Counter((r.nodeid, r.when) for r in spy.reports)
+    assert per_node == {(n, w): 1 for n in ids for w in ("setup", "call", "teardown")}
+    assert collections.Counter(n for n, _loc in spy.logstarts) == {n: 1 for n in ids}
+    m3_pids = [pid for kind, name, pid in _events(log) if kind == "ran" and name == "test_m3"]
+    assert len(set(m3_pids)) == 2, "m3's retry ran in a fresh worker"
+    err = capsys.readouterr().err
+    assert "was lost while running item 3 of a chunk (%s)" % m3 in err, err
+
+
+def test_a_real_count_recycle_mid_chunk_requeues_the_rest_as_one_chunk(tmp_path, monkeypatch, pytester):
+    """E5. AIRA_AITEST_WORKER_MAX_TESTS=4, cap 3, six tests in one module, so chunks
+    [1,2,3] and [4,5,6]: six passes, each run once, no worker runs more than 4 tests,
+    and the module fixture is set up 3 times (chunk A; test 4 alone as the tripping
+    member; [5,6] requeued as one chunk). Mutants: rest requeued as singles (4
+    setups); member 1 not pre-checked (a worker runs 5)."""
+    _stub_admission(tmp_path, monkeypatch)
+    monkeypatch.setenv(_BATCH, "3")
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "4")
+    log, body = _counting_module(tmp_path, 6)
+    items = pytester.getitems(body)
+    sup = Supervisor()
+    sup.collect(items)
+    assert [len(m) for m in sup._chunks.values()] == [3, 3]
+    results = sup.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+    assert results == {item.nodeid: "passed" for item in items}
+    events = _events(log)
+    ran = collections.Counter(name for kind, name, _pid in events if kind == "ran")
+    assert ran == {"test_m%d" % i: 1 for i in range(1, 7)}
+    per_pid = collections.Counter(pid for kind, _name, pid in events if kind == "ran")
+    assert max(per_pid.values()) <= 4, per_pid
+    assert sum(1 for kind, *_ in events if kind == "setup") == 3

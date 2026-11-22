@@ -1,6 +1,7 @@
 # aitest consecutive-chunk batching (AIRA-372): design
 
-Status: proposed, 2026-11-22, revised after plan review rounds 1 and 2 (section 14). Not built. Ticket `.aira/tickets/AIRA-372.md`; deferrals in
+Status: approved (plan gate round 3, APPROVE-WITH-NITS, nits folded in at build, section 14); built
+on branch `aira-372-aitest-batching`, default off. Ticket `.aira/tickets/AIRA-372.md`; deferrals in
 `.aira/tickets/AIRA-373.md` (held). Source: the fastest-ee "speed" session's proposal (RANT-156,
 `~/tmp/aitest-batching/2026-11-22-aitest-fixture-batching-design.md`, cited as "speed §N") and two
 independent challenge reviews of it (`~/tmp/aitest-batching/challengers.json`: "minimum" and
@@ -186,8 +187,9 @@ A single nodeid line (n == 1) runs only today's post-item check, so cap 1 is tod
   `rest = deque(members[1:])`, `chunk_id`, `chunk_pos = 1`, write the chunk line. Otherwise
   today's path (`chunk_pos = 1`, `rest` empty).
 - Accepted result (the `in_flight = None` site, `:3240`): if not recycling and `rest` is non-empty,
-  `in_flight = rest.popleft()`, charge its attempt, `chunk_pos += 1`, `pending_events = []`; else
-  `in_flight = None` and `chunk_pos = 0`.
+  `in_flight = rest.popleft()`, charge its attempt, `chunk_pos += 1` (`pending_events` is already
+  reset right after the replay, `:3234`); else `in_flight = None` and `chunk_pos = 0`. This reset is
+  the one mechanism that keeps an idle worker's death from reading as a mid-chunk loss (5.4).
 - `_largest_fitting(pop=True)` and `next_nodeid()` charge attempts only when the popped entry is a
   nodeid, never a chunk id.
 
@@ -241,10 +243,12 @@ without batching (derived, not measured).
 - The death reason string is NOT extended. It reaches a user only when `requeue_once` refuses
   (`supervisor.py:3462-3466`, attempts >= 2), and a chunk member in flight always has attempts 1
   (charged at promotion; requeues are singles or an uncharged rest), so a chunk-position clause
-  there would never print. Instead, when `in_flight is not None` and `chunk_pos > 1`,
-  `_handle_worker_exit` writes one stderr line before retirement, whatever the retry does:
-  "aira aitest: worker <pid> died while running item k of a chunk (<nodeid>); k-1 earlier items had
-  run with shared fixtures alive; retrying it alone". It does not embed `_describe_worker_death`'s
+  there would never print. Instead, when `chunk_pos > 1` (which implies `in_flight` is set, because
+  `chunk_pos` is reset to 0 wherever `in_flight` is cleared, 4.4), `_handle_worker_exit` writes one
+  stderr line before retirement, whatever the retry does: "aira aitest: worker <pid> was lost while
+  running item k of a chunk (<nodeid>); k-1 earlier items had run with shared fixtures alive;
+  retrying it alone". "Lost", not "died": one caller of `_handle_worker_exit` is a live worker whose
+  report batch failed validation (`:3226-3231`). It does not embed `_describe_worker_death`'s
   text, which asserts the retry already failed; the `:3462` unevaluated reason stays byte-identical
   to today. Without the line, a worker killed by memory accumulated across the chunk is retried
   alone, usually passes, and the cause stays invisible. The pool summary counts the same crashes.
@@ -333,7 +337,9 @@ cap c (AIRA_AITEST_BATCH_MAX_TESTS)". No flag, no ini key.
   measure dir is set; a normal run registers nothing.
 - **Private memory per worker**: `_record_memory_sample` appends a fourth column to the existing
   `worker-<pid>.tsv` row, `Private_Clean + Private_Dirty` from `/proc/self/smaps_rollup`
-  (`unevaluated` if unreadable); the first three columns are unchanged.
+  (`unevaluated` if unreadable); the first three columns are unchanged. The two readers that
+  assumed three columns change in the same commit: `pytest_aitest_measurement_e2e_test.go` (now
+  requires four fields and a real private-memory reading) and `test_measurement_report.py`.
 - **Chunk lengths**: the cut histogram (from `collect()`) and the run lengths actually executed
   (members run before a crash, recycle or end), in `pool-report-<pid>.json`.
 - **Drain length**: wall time from the queue first becoming empty to the last worker's retirement.
@@ -433,11 +439,11 @@ Supervisor (`test_supervisor.py`, fake workers as in `_fake_worker_state`):
   mapping to `[c, d]`, with c and d at 0 attempts; worker retired, replacement requested. A recycle
   on c of `[a,b,c,d]` requeues the bare nodeid d. Mutant: rest requeued as singles.
 - **S6** crash while b (item 2) is in flight, with b's retry then passing: exactly one stderr line
-  naming worker, "item 2 of a chunk" and b's nodeid, written before the retry, not containing
+  ("was lost while running item 2 of a chunk") naming worker and b's nodeid, written before the retry, not containing
   "the one retry"; the pool summary's mid-chunk crash count is 1. No line and no count for a crash
   on item 1, nor for an idle worker dying after its chunk completed. Mutants: the clause attached
   to the death reason only (no line, since the retry passes); `_describe_worker_death` text
-  embedded; condition on `chunk_pos` alone (the idle death prints).
+  embedded; `chunk_pos` not reset when `in_flight` is cleared (the idle death prints).
 - **S7** exceeds-ceiling on a chunk id: every member unevaluated with the ceiling reason; no chunk id
   appears in `results` or in any synthesized report. Same for `_fail_queue_terminal` (**S8**).
 - **S9** fail-fast trip while another worker is mid-chunk: its `rest` members carry the abort reason.
@@ -456,9 +462,10 @@ End to end (real fork):
   to serial pytest's for that order, dispatch order within each chunk equal to `session.items`.
   Mutant: chunker groups by module (reorders).
 - **E4** (crash mid-chunk, one worker) a chunk of 5 whose member 3 dies on its first run only
-  (marker file) at a test-only seam: `worker._fault_after_events`, a module attribute that is
-  `None` in production (the payload stays one write). When set, the loop writes and flushes the
-  member's event lines, calls it, and only then writes the result line; the test project's
+  (marker file) at a test-only seam: `worker._fault_after_events(nodeid)`, a module attribute that
+  is `None` in production (the payload stays one write). When set, the loop writes and flushes the
+  member's event lines, calls it once per member with that member's nodeid (in both the single-line
+  and the chunk path), and only then writes the result line; the test project's
   conftest sets it before fork to `os._exit` for m3's first run. So m3's event bytes reach the
   supervisor's `pending_events` and no result confirms them. Asserts: every nodeid has exactly one
   result and all pass; per-nodeid run counts m1, m2, m4, m5 once and m3 twice; attempts
@@ -547,3 +554,17 @@ Plan review round 2 (REVISE; blocker: the crash-line text). Checked against `798
 | Container `memory.peak` boundary | **Applied** (6). |
 | W6 pins only pytest | **Closed by deleting** W6. |
 | Private-memory output under-specified | **Applied** (8): fourth TSV column (`worker.py:332-337`), harness takes the per-pid maximum. |
+
+Plan gate round 3 (APPROVE-WITH-NITS, `~/tmp/aitest-batching/round3-verdict.json`). The four P3 nits,
+folded into the build commit:
+
+| Nit | Disposition |
+|---|---|
+| Fourth TSV column breaks the Go e2e reader (`len(fields) == 3`) and `test_measurement_report.py`'s whole-line match | **Applied** (8): both readers updated in the build commit. |
+| S6's third mutant could not fail while two mechanisms covered the idle death | **Applied** (4.4, 5.4, S6): one mechanism, the `chunk_pos` reset where `in_flight` clears; the condition is `chunk_pos > 1`; mutant renamed "`chunk_pos` not reset when `in_flight` is cleared". |
+| E4 seam signature unstated | **Applied** (E4): `worker._fault_after_events(nodeid)`, once per member after the event flush, both paths. |
+| "died" is wrong for a live worker whose report batch failed validation | **Applied** (5.4, S6): "was lost while running item k of a chunk". |
+
+Build note: E4 runs in-process with real forked workers and asserts on the reports replayed into the
+supervisor's own `pytest_runtest_logreport` hook (the hook junitxml listens on), not on a JUnit file,
+because it also asserts the supervisor's `attempts` map.

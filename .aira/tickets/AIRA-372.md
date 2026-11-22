@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-372","project":"aira","title":"aitest: consecutive-chunk batching, real nextitem inside a chunk so shared fixtures are set up once per chunk (RANT-156 slice 1; default off, A/B before flipping)","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-372","project":"aira","title":"aitest: consecutive-chunk batching, real nextitem inside a chunk so shared fixtures are set up once per chunk (RANT-156 slice 1; default off, A/B before flipping)","status":"in-progress","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
 ---
 Source: fastest-ee 'speed' session design hand-over (RANT-156, relayed 2026-11-22; design note /home/mark/tmp/aitest-batching/2026-11-22-aitest-fixture-batching-design.md), reduced by the challenge pass recorded in the spec this ticket lands (docs/superpowers/specs/2026-11-22-aitest-fixture-batching-design.md).
 
