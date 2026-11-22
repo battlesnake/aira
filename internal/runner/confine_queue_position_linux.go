@@ -97,6 +97,11 @@ type confineQueuePosition struct {
 	cpuCeiling     int64
 	cpuPressure    float64
 	cpuPressureSet bool
+	// sliceInUse is the slice's real use less its reclaimable part (0 is an
+	// absence: shim mode, an older daemon): the RAM fit charges the larger of
+	// it and the bookings, so a RAM wait with room in the bookings is told by
+	// this figure, not by the bookings.
+	sliceInUse int64
 }
 
 // confineQueueProbeTimeout bounds one probe. It is deliberately far shorter
@@ -282,12 +287,18 @@ func confineDiagnosisNote(position confineQueuePosition) (string, bool, bool) {
 	var parts []string
 	if known[ConfineBlockedRAM] {
 		ram := "RAM"
-		if position.heldEstablished {
-			ram += ": " + FormatConfineMegabytes(position.heldBytes)
-			if position.ceilingBytes > 0 {
-				ram += " of " + FormatConfineMegabytes(position.ceilingBytes)
-			}
-			ram += " booked"
+		of := ""
+		if position.ceilingBytes > 0 {
+			of = " of " + FormatConfineMegabytes(position.ceilingBytes)
+		}
+		switch {
+		case position.heldEstablished && position.sliceInUse > position.heldBytes:
+			// The fit charges the real use when it exceeds the bookings, so the
+			// bookings alone would show room that is not there.
+			ram += ": " + FormatConfineMegabytes(position.sliceInUse) + " in use" + of +
+				", above the " + FormatConfineMegabytes(position.heldBytes) + " booked"
+		case position.heldEstablished:
+			ram += ": " + FormatConfineMegabytes(position.heldBytes) + of + " booked"
 		}
 		if known[ConfineBlockedCeilingCut] {
 			ram += confineCeilingCutNote(position)
@@ -591,6 +602,9 @@ func confineQueuePositionFromDaemon(ctx context.Context, request ConfineRequest,
 	// box CPU pressure. A negative booked figure is a ledger defect and is not
 	// printed, like the granted pair above.
 	exclusive.blockedBy = reserve.BlockedBy
+	if reserve.SliceCurrentBytes > reserve.SliceReclaimableBytes && reserve.SliceReclaimableBytes >= 0 {
+		exclusive.sliceInUse = reserve.SliceCurrentBytes - reserve.SliceReclaimableBytes
+	}
 	if reserve.CPUCeilingCores > 0 && reserve.CPUOutstandingCores >= 0 {
 		exclusive.cpuBooked, exclusive.cpuCeiling = reserve.CPUOutstandingCores, reserve.CPUCeilingCores
 	}

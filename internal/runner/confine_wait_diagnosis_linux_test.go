@@ -176,3 +176,22 @@ func TestParseCPUPressureSome(t *testing.T) {
 		}
 	}
 }
+
+// verifies: AIRA-370 honesty — the RAM fit charges the larger of the bookings
+// and the slice's real use (less reclaimable), so when real use is the larger
+// the clause states it rather than bookings that show room. Below the bookings
+// (or unread) it is the booked form. Mutation: always print the booked form.
+func TestConfineWaitRAMDiagnosisNamesRealUseAboveTheBookings(t *testing.T) {
+	reserve := diagReserve(1, ConfineBlockedRAM)
+	reserve.GrantedBytes = 20000 << 20
+	reserve.SliceCurrentBytes, reserve.SliceReclaimableBytes = 46000<<20, 500<<20
+	reserve.CPUPressureSomeAvg10 = nil
+	want := ", 1 of 4 queued, waiting for RAM: 45500M in use of 46694M, above the 20000M booked"
+	if note := queueNoteFor(t, 0, reserve); note != want {
+		t.Fatalf("note\n got %q\nwant %q", note, want)
+	}
+	reserve.SliceCurrentBytes = 10000 << 20
+	if note := queueNoteFor(t, 0, reserve); note != ", 1 of 4 queued, waiting for RAM: 20000M of 46694M booked" {
+		t.Fatalf("note=%q", note)
+	}
+}
