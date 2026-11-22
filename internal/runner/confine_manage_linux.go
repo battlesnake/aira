@@ -154,16 +154,28 @@ func readConfineCPUFrame(slicePath string) ConfineCPUFrame {
 			frame.SliceUsageUsec, frame.SliceKnown = *value, true
 		}
 	}
+	// AIRA-370. The machine's CPU load beside the counters: PSI `some avg10`.
+	// Unreadable (no PSI, an old kernel) leaves it unknown, never 0.
+	if data, err := readBoundedFile(confineCPUPressurePath, confineCPUStatReadLimit); err == nil {
+		frame.PressureSomeAvg10, frame.PressureKnown = parseCPUPressureSome(data)
+	}
 	return frame
 }
 
-func readCgroupCPUUsageUsec(path string) *int64 {
+// confineCPUPressurePath is the host's CPU pressure file (AIRA-370).
+const confineCPUPressurePath = "/proc/pressure/cpu"
+
+func readBoundedFile(path string, limit int64) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, confineCPUStatReadLimit))
+	return io.ReadAll(io.LimitReader(file, limit))
+}
+
+func readCgroupCPUUsageUsec(path string) *int64 {
+	data, err := readBoundedFile(path, confineCPUStatReadLimit)
 	if err != nil {
 		return nil
 	}

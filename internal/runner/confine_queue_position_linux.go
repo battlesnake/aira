@@ -86,6 +86,17 @@ type confineQueuePosition struct {
 	// ConfineSliceReserve.ResolvedReserveBytes for why the client cannot know
 	// this figure by itself while it waits.
 	resolvedReserve int64
+
+	// AIRA-370. Which gate held this job in the daemon's last pass
+	// (ConfineBlocked* tokens; nil from an older daemon or an unevaluated
+	// waiter), the CPU SLOT ledger the `cpu` token refers to (cpuCeiling 0 is
+	// an absence; cpuBooked is established with heldEstablished, the same
+	// snapshot bit), and the box's CPU pressure, context only.
+	blockedBy      []string
+	cpuBooked      int64
+	cpuCeiling     int64
+	cpuPressure    float64
+	cpuPressureSet bool
 }
 
 // confineQueueProbeTimeout bounds one probe. It is deliberately far shorter
@@ -197,17 +208,7 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// memory nothing is using.
 	pressure := ""
 	if position.ceilingThrottled {
-		switch position.ceilingBasis {
-		case "system-pressure":
-			pressure = ", ceiling cut to keep system free memory"
-			if position.memAvailable > 0 {
-				pressure += " (MemAvailable " + FormatConfineMegabytes(position.memAvailable) + ")"
-			}
-		case "machine-reserve":
-			pressure = ", ceiling cut to keep the machine-share reserve"
-		default:
-			pressure = ", ceiling cut below the configured ceiling"
-		}
+		pressure = confineCeilingCutNote(position)
 	}
 	if position.position <= 0 || position.queued < position.position {
 		return pressure + exclusiveNote, false
@@ -220,14 +221,110 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// early it is evaluated, and it would hold every smaller job behind it), so the
 	// front command is withheld for it.
 	pushable := position.ceilingBytes <= 0 || position.resolvedReserve <= position.ceilingBytes
-	return fmt.Sprintf(", %d of %d queued", position.position, position.queued) + confineLaneNote(position) +
-		confineHeldNote(position) + pressure + confineOwnReserveNote(position, clientReserve) + exclusiveNote, pushable
+	where := fmt.Sprintf(", %d of %d queued", position.position, position.queued)
+	tail := confineOwnReserveNote(position, clientReserve) + exclusiveNote + confineBoxCPUNote(position)
+	// AIRA-370. The daemon's own diagnosis, when it sent one, is the ONE reason
+	// clause: it replaces the lane clause and the ceiling clause (which it
+	// carries itself when, and only when, the cut is part of why this job
+	// waits), and a RAM diagnosis carries the booked figures in place of the
+	// granted clause. An older daemon sends none and gets today's clauses.
+	if diagnosis, ram, ok := confineDiagnosisNote(position); ok {
+		held := confineHeldNote(position)
+		if ram {
+			held = ""
+		}
+		return where + diagnosis + held + tail, pushable
+	}
+	return where + confineLaneNote(position) + confineHeldNote(position) + pressure + tail, pushable
+}
+
+// confineCeilingCutNote names WHY the RAM ceiling is cut, from the basis
+// (AIRA-103/106), never assuming the cause: the static machine-reserve term can
+// bind on an idle box, so MemAvailable is printed only beside system-pressure.
+func confineCeilingCutNote(position confineQueuePosition) string {
+	switch position.ceilingBasis {
+	case "system-pressure":
+		note := ", ceiling cut to keep system free memory"
+		if position.memAvailable > 0 {
+			note += " (MemAvailable " + FormatConfineMegabytes(position.memAvailable) + ")"
+		}
+		return note
+	case "machine-reserve":
+		return ", ceiling cut to keep the machine-share reserve"
+	}
+	return ", ceiling cut below the configured ceiling"
+}
+
+// confineDiagnosisNote renders the daemon's AIRA-370 wait diagnosis as one
+// clause, and whether it is a RAM diagnosis (which then states the booked
+// figures itself). ok is false when the daemon sent no token this binary
+// knows: the caller then prints today's clauses rather than a guess.
+//
+// `cpu` is the admission SLOT ledger (declared cores against slots-per-core x
+// cores), never the machine's CPU load, and the clause says so; the load is the
+// separate box-CPU note.
+func confineDiagnosisNote(position confineQueuePosition) (string, bool, bool) {
+	known := map[string]bool{}
+	for _, token := range position.blockedBy {
+		known[token] = true
+	}
+	switch {
+	case known[ConfineBlockedRestartFreeze]:
+		return ", new admissions paused while the restarted daemon re-registers running jobs", false, true
+	case known[ConfineBlockedExclusive]:
+		if position.exclusiveState != "" {
+			return "", false, true // the exclusive clause names the job
+		}
+		return ", held for an exclusive job", false, true
+	case known[ConfineBlockedHead]:
+		return ", fits but held behind the head of the queue", false, true
+	}
+	var parts []string
+	if known[ConfineBlockedRAM] {
+		ram := "RAM"
+		if position.heldEstablished {
+			ram += ": " + FormatConfineMegabytes(position.heldBytes)
+			if position.ceilingBytes > 0 {
+				ram += " of " + FormatConfineMegabytes(position.ceilingBytes)
+			}
+			ram += " booked"
+		}
+		if known[ConfineBlockedCeilingCut] {
+			ram += confineCeilingCutNote(position)
+		}
+		parts = append(parts, ram)
+	}
+	if known[ConfineBlockedCPU] {
+		cpu := "CPU slots"
+		if position.heldEstablished && position.cpuCeiling > 0 {
+			cpu += fmt.Sprintf(": %d of %d booked", position.cpuBooked, position.cpuCeiling)
+		}
+		parts = append(parts, cpu+" (an admission count, not CPU load)")
+	}
+	if known[ConfineBlockedVRAM] {
+		parts = append(parts, "GPU memory (VRAM)")
+	}
+	if len(parts) == 0 {
+		return "", false, false
+	}
+	return ", waiting for " + strings.Join(parts, "; "), known[ConfineBlockedRAM], true
+}
+
+// confineBoxCPUNote is the machine's CPU load as context (AIRA-370): printed
+// only when the daemon read the pressure and it is at or above
+// ConfineBoxCPUBusyPercent. It never claims to be why the job waits.
+func confineBoxCPUNote(position confineQueuePosition) string {
+	if !position.cpuPressureSet || position.cpuPressure < ConfineBoxCPUBusyPercent {
+		return ""
+	}
+	return fmt.Sprintf(", box CPU busy: some task waited for a CPU %.0f%% of the last 10 s", position.cpuPressure)
 }
 
 // confineLaneNote is the ONE small-job lane clause (AIRA-350): held behind the
 // head first (a fit the head rule refused), else why the lane did not take the
 // job. Nothing when the lane is off, did not refuse it, or the daemon predates
-// it.
+// it. Since AIRA-370 it is printed only for a daemon that sends no diagnosis;
+// `no-room` comes only from such a daemon (a current one names the resource).
 func confineLaneNote(position confineQueuePosition) string {
 	if position.heldByHead {
 		return ", fits but held behind the head of the queue"
@@ -490,6 +587,16 @@ func confineQueuePositionFromDaemon(ctx context.Context, request ConfineRequest,
 	}
 	exclusive.position, exclusive.queued, exclusive.aheadBytes = reserve.QueuePosition, queued, ahead
 	exclusive.laneWait, exclusive.heldByHead = reserve.LaneWait, reserve.HeldByHead
+	// AIRA-370, from the same reply: the diagnosis, the slot ledger and the
+	// box CPU pressure. A negative booked figure is a ledger defect and is not
+	// printed, like the granted pair above.
+	exclusive.blockedBy = reserve.BlockedBy
+	if reserve.CPUCeilingCores > 0 && reserve.CPUOutstandingCores >= 0 {
+		exclusive.cpuBooked, exclusive.cpuCeiling = reserve.CPUOutstandingCores, reserve.CPUCeilingCores
+	}
+	if reserve.CPUPressureSomeAvg10 != nil {
+		exclusive.cpuPressure, exclusive.cpuPressureSet = *reserve.CPUPressureSomeAvg10, true
+	}
 	return exclusive, true
 }
 

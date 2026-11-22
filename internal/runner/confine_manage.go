@@ -333,11 +333,19 @@ type ConfineRecord struct {
 	// row the lane counts as a small lease (a job-level lease booking at most the
 	// lane's job maximum, however it was granted). LaneWait and HeldByHead are a
 	// QUEUED row's last-pass diagnoses: why the lane did not grant it ("full",
-	// "kept", "pushed", "no-room"; empty when the lane did not refuse it), and
-	// whether today's head rule held back a job that fits. Diagnosis only.
-	Small             bool     `json:"small,omitempty"`
-	LaneWait          string   `json:"lane_wait,omitempty"`
-	HeldByHead        bool     `json:"held_by_head,omitempty"`
+	// "kept", "pushed"; empty when the lane did not refuse it, and AIRA-370's
+	// BlockedBy then says why the main walk did not), and whether today's head
+	// rule held back a job that fits. Diagnosis only.
+	Small      bool   `json:"small,omitempty"`
+	LaneWait   string `json:"lane_wait,omitempty"`
+	HeldByHead bool   `json:"held_by_head,omitempty"`
+	// BlockedBy is a QUEUED row's AIRA-370 diagnosis: which gate held it in the
+	// daemon's last admission pass, as ConfineBlocked* tokens in precedence
+	// order (see ConfineBlockedRestartFreeze). Absent when that pass did not
+	// evaluate the job (it arrived since, or the pass could not read the slice)
+	// or the daemon predates the field: unevaluated, never "not blocked".
+	// Diagnosis only, lane on or off.
+	BlockedBy         []string `json:"blocked_by,omitempty"`
 	UnevaluatedFields []string `json:"unevaluated_fields,omitempty"`
 }
 
@@ -516,6 +524,10 @@ type ConfineCPUFrame struct {
 	SliceUsageUsec  int64
 	SliceKnown      bool
 	SampleUnixNano  int64
+	// AIRA-370. /proc/pressure/cpu `some avg10` (percent); PressureKnown is
+	// required to read it, since 0.00 is a real idle reading.
+	PressureSomeAvg10 float64
+	PressureKnown     bool
 }
 
 // ConfineCommandWireLimit bounds the bytes of /proc/<pid>/cmdline the scan reads
@@ -696,6 +708,17 @@ type ConfineSliceReserve struct {
 	LaneJobs          int    `json:"lane_jobs,omitempty"`
 	LaneWait          string `json:"lane_wait,omitempty"`
 	HeldByHead        bool   `json:"held_by_head,omitempty"`
+	// AIRA-370. BlockedBy is the AIRA-24 probe's own waiter's diagnosis (see
+	// ConfineRecord.BlockedBy), lane on or off; absent for every caller that
+	// named no queued scope id.
+	BlockedBy []string `json:"blocked_by,omitempty"`
+	// AIRA-370. The admission CPU SLOT ledger (AIRA-283), from the same locked
+	// pass: CPUOutstandingCores is the cores the granted leases declared (meaningful
+	// only when GrantedEstablished is), CPUCeilingCores the slots admission
+	// allows (slots per core x cores). A BOOKING count, not CPU load: a slice
+	// can be out of slots on an idle machine. Zero ceiling is an absence.
+	CPUOutstandingCores int64 `json:"cpu_outstanding_cores,omitempty"`
+	CPUCeilingCores     int64 `json:"cpu_ceiling_cores,omitempty"`
 
 	// AIRA-68. Jobs and GrantedBytes above are TOTALS over two structurally
 	// different populations, and only one of them can ever appear as a row in the
@@ -838,6 +861,11 @@ type ConfineSliceReserve struct {
 	SliceCPUKnown      bool  `json:"slice_cpu_known,omitempty"`
 	CPUSampleUnixNano  int64 `json:"cpu_sample_unix_nano,omitempty"`
 	CPUCores           int   `json:"cpu_cores,omitempty"`
+	// AIRA-370. The machine's CPU LOAD, as distinct from the slot ledger above:
+	// /proc/pressure/cpu `some avg10`, the percent of the last 10 s in which some
+	// task was runnable but waiting for a CPU. Context only, never an admission
+	// input. nil is unevaluated (unreadable, no PSI, or shim mode), never 0.
+	CPUPressureSomeAvg10 *float64 `json:"cpu_pressure_some_avg10,omitempty"`
 
 	// AIRA-269. The VRAM frame `aira top` draws its System VRAM bar in — the
 	// structural mirror of the RAM/CPU frames, published under the same rules

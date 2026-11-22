@@ -46,6 +46,10 @@ type ConfineQueuedEntry struct {
 	// (AIRA-350), set only while the lane is on.
 	LaneWait   string
 	HeldByHead bool
+	// BlockedBy is the evaluator's last-pass diagnosis of why this waiter was
+	// not granted (AIRA-370), ConfineBlocked* tokens in precedence order; nil
+	// when the last pass did not evaluate it.
+	BlockedBy []string
 }
 
 // queuedConfineRecord builds the facets of a queued row that need no live read,
@@ -75,7 +79,7 @@ func queuedConfineRecord(entry ConfineQueuedEntry, now time.Time) (ConfineRecord
 		Name: name, Owner: owner, ScopeID: entry.ScopeID, SupervisorPID: &pid,
 		Worker:       IsAitestWorkerScopeName(name), // classified exactly as a live row is
 		ReserveBytes: &reserve, VRAMBytes: &vram, Pushed: entry.Pushed,
-		LaneWait: entry.LaneWait, HeldByHead: entry.HeldByHead,
+		LaneWait: entry.LaneWait, HeldByHead: entry.HeldByHead, BlockedBy: entry.BlockedBy,
 		Priority:          ConfinePriorityNormal,
 		UnevaluatedFields: []string{"populated", "rss", "cap", "cpu", "supervisor_live"},
 	}

@@ -162,6 +162,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		sliceCPUUsec  = int64(2_500_000_000)
 		cpuSampleNano = int64(1_700_000_000_000_000_000)
 		cpuCores      = 12
+		cpuPressure   = 70.5
 	)
 	// withSystemFrame stamps the AIRA-127 system/slice frame onto an arm's
 	// expectation. One definition, so a new wire field cannot be added and then
@@ -182,6 +183,11 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		want.SystemCPUUsageUsec, want.SystemCPUKnown = systemCPUUsec, true
 		want.SliceCPUUsageUsec, want.SliceCPUKnown = sliceCPUUsec, true
 		want.CPUSampleUnixNano, want.CPUCores = cpuSampleNano, cpuCores
+		// AIRA-370. The box CPU pressure rides the same frame, and the slot
+		// ledger is the evaluator's own: R x cores (3 x 12), none booked here.
+		pressure := cpuPressure
+		want.CPUPressureSomeAvg10 = &pressure
+		want.CPUCeilingCores = 3 * cpuCores
 		// AIRA-220. Every arm here registers a queue (an established ledger,
 		// including the established-EMPTY arm), so the granted pair is established
 		// in all of them. The absent-ledger case is TestConfineListReserveUnevaluatedWhenLedgerAbsent.
@@ -215,7 +221,8 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 				return runner.ConfineCPUFrame{
 					SystemUsageUsec: systemCPUUsec, SystemKnown: true,
 					SliceUsageUsec: sliceCPUUsec, SliceKnown: true,
-					SampleUnixNano: cpuSampleNano,
+					SampleUnixNano:    cpuSampleNano,
+					PressureSomeAvg10: cpuPressure, PressureKnown: true,
 				}
 			},
 			func() int { return cpuCores })

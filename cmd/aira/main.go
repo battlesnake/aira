@@ -3735,18 +3735,24 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 				result.SliceReserve.Containment,
 				runner.DescribeShimBudgetSource(result.SliceReserve.BudgetSource))
 		}
+		// AIRA-370. The machine's CPU load rides the slice line, only when it
+		// was read: context, never an admission figure.
+		cpuPressure := ""
+		if pressure := result.SliceReserve.CPUPressureSomeAvg10; pressure != nil {
+			cpuPressure = fmt.Sprintf("; box CPU pressure %.0f%% (some task waited for a CPU, last 10 s)", *pressure)
+		}
 		if result.SliceReserve.GrantedEstablished {
-			_, _ = fmt.Fprintf(stdout, "slice reserve: %s granted / %s ceiling across %d admitted %s%s\n",
+			_, _ = fmt.Fprintf(stdout, "slice reserve: %s granted / %s ceiling across %d admitted %s%s%s\n",
 				formatReserveBytes(result.SliceReserve.GrantedBytes),
 				formatReserveBytes(result.SliceReserve.CeilingBytes),
-				result.SliceReserve.Jobs, jobLabel, containment)
+				result.SliceReserve.Jobs, jobLabel, containment, cpuPressure)
 		} else {
 			// AIRA-220. The daemon holds no ledger for this slice yet, so the
 			// granted total and job count are unestablished; report them as such
 			// rather than as a fabricated empty slice. The ceiling is an
 			// independent read and is still shown when it was established.
-			_, _ = fmt.Fprintf(stdout, "slice reserve: unevaluated (no admission ledger) / %s ceiling%s\n",
-				formatReserveBytes(result.SliceReserve.CeilingBytes), containment)
+			_, _ = fmt.Fprintf(stdout, "slice reserve: unevaluated (no admission ledger) / %s ceiling%s%s\n",
+				formatReserveBytes(result.SliceReserve.CeilingBytes), containment, cpuPressure)
 		}
 		// Why a job is WAITING, which the admitted-jobs table above cannot show.
 		// Printed unconditionally (including the zero) so "nothing is queued" is a

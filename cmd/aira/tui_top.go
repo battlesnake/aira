@@ -833,10 +833,10 @@ func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int) table
 // topQueuedState is a queued row's LIVE cell. "pushed" wins: a pushed job is
 // ahead of every high one, and its freeze is the stronger fact. "high"
 // (AIRA-340) marks a `--priority high` launch, so misuse of the flag is visible
-// to every session watching the queue. AIRA-361 adds the small-job lane's
-// last-pass diagnosis (topLaneReason) AFTER either, never instead of it: a high
-// job the lane refused shows both facts ("high, lane full"), and a row with
-// neither reads as plain "queued".
+// to every session watching the queue. The reason follows either, never
+// instead of it ("high, ram"): AIRA-370's wait diagnosis (topBlockedReason)
+// when the daemon sent one, else (an older daemon) AIRA-361's lane reason
+// (topLaneReason). A row with neither reads as plain "queued".
 func topQueuedState(record runner.ConfineRecord) string {
 	head := ""
 	switch {
@@ -845,7 +845,10 @@ func topQueuedState(record runner.ConfineRecord) string {
 	case record.Priority == runner.ConfinePriorityHigh:
 		head = "high"
 	}
-	reason := topLaneReason(record)
+	reason := topBlockedReason(record)
+	if reason == "" {
+		reason = topLaneReason(record)
+	}
 	switch {
 	case head != "" && reason != "":
 		return head + ", " + reason
@@ -855,6 +858,32 @@ func topQueuedState(record runner.ConfineRecord) string {
 		return reason
 	}
 	return "queued"
+}
+
+// topBlockedWords is the LIVE cell's word for each AIRA-370 diagnosis token.
+// "cpu slots", never "cpu": the token is the admission slot ledger, not load.
+var topBlockedWords = map[string]string{
+	runner.ConfineBlockedRestartFreeze: "freeze",
+	runner.ConfineBlockedExclusive:     "exclusive",
+	runner.ConfineBlockedHead:          "behind head",
+	runner.ConfineBlockedRAM:           "ram",
+	runner.ConfineBlockedCeilingCut:    "ceiling cut",
+	runner.ConfineBlockedCPU:           "cpu slots",
+	runner.ConfineBlockedVRAM:          "vram",
+}
+
+// topBlockedReason is which gate held a queued job in the daemon's last pass,
+// in the daemon's own token order ("ram, ceiling cut, cpu slots"). A token
+// this binary does not know names nothing rather than a guess; "" when the
+// daemon sent none.
+func topBlockedReason(record runner.ConfineRecord) string {
+	var words []string
+	for _, token := range record.BlockedBy {
+		if word, ok := topBlockedWords[token]; ok {
+			words = append(words, word)
+		}
+	}
+	return strings.Join(words, ", ")
 }
 
 // topLaneReason is why the small-job lane did not take a queued job, in plain
@@ -1672,6 +1701,11 @@ func topFooter(result runner.ConfineListResult) string {
 	if len(result.Queued) < reserve.Queued {
 		parts = append(parts, fmt.Sprintf("showing %d of %d queued (some queued jobs have no row, e.g. per-test reservations; at most %d are listed)",
 			len(result.Queued), reserve.Queued, runner.ConfineQueuedRowLimit))
+	}
+	// AIRA-370. The machine's CPU load, said once and only when it is high:
+	// context for long waits, never an admission reason (the rows name those).
+	if pressure, busy := runner.ConfineBoxCPUBusy(reserve); busy {
+		parts = append(parts, fmt.Sprintf("box CPU busy %.0f%%", pressure))
 	}
 	if reserve.Exclusive != nil {
 		exclusive := "EXCLUSIVE " + reserve.Exclusive.State

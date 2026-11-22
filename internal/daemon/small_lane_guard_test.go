@@ -10,13 +10,15 @@ import (
 	"testing"
 )
 
-// verifies: AIRA-350 T27 — laneWait and heldByHead are diagnosis only: written
+// verifies: AIRA-350 T27 and AIRA-370 — laneWait, heldByHead and blocked are
+// diagnosis only: written
 // only by an evaluator pass (evaluateAdmitQueue and the lane pre-pass it calls,
 // smallLanePassLocked) and read only by the snapshot (admitSliceSnapshotFor).
 // A decision that read either would make a diagnosis a second, unreviewed
 // admission input. Syntactic, on the admit_pin_charge_guard_test.go pattern: a
 // new site fails until someone decides it here. Mutation: read laneWait in the
-// pre-pass (or write it in the snapshot) -> red.
+// pre-pass (or write it in the snapshot) -> red; read blocked in
+// admitFitLocked -> red.
 func TestSmallLaneDiagnosesAreWrittenByTheEvaluatorAndReadByTheSnapshot(t *testing.T) {
 	writers := map[string]bool{"evaluateAdmitQueue": true, "smallLanePassLocked": true}
 	readers := map[string]bool{"admitSliceSnapshotFor": true}
@@ -53,7 +55,7 @@ func TestSmallLaneDiagnosesAreWrittenByTheEvaluatorAndReadByTheSnapshot(t *testi
 			})
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				selector, ok := node.(*ast.SelectorExpr)
-				if !ok || (selector.Sel.Name != "laneWait" && selector.Sel.Name != "heldByHead") {
+				if !ok || (selector.Sel.Name != "laneWait" && selector.Sel.Name != "heldByHead" && selector.Sel.Name != "blocked") {
 					return true
 				}
 				site := function.Name.Name + " ." + selector.Sel.Name
