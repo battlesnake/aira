@@ -367,6 +367,25 @@ section 8 recorder does). **Build slice 1
 only if the best cap <= 50 predicts at least 5% of engine test-seconds** (about 1,370 s of 27,468
 R); otherwise stop and write a collapse memo.
 
+**Slice 0 result (speed session, 2026-11-22, fastest-ee engine run B after #3234, 69,699 traced
+records, 27,468 test-seconds).** A first-order prediction, not the tuple-aware walk above: it cuts
+consecutive batches in file order and takes one module-fixture setup per (file, batch) holding a
+user, with no parameter identity or marker tuples. Fixture self-time by scope: module 4,556 s
+(16.6%, 8,010 setups), function 186 s (0.7%), session 11 s (0.0%), class 4 s (0.0%): session scope is
+negligible, which supports the section 11 answer that session fixtures are not kept across chunks.
+Predicted saving by cap: 5 -> 2,435 s (8.9%); 10 -> 3,312 s (12.1%); 20 -> 3,760 s (13.7%);
+50 -> 3,934 s (14.3%); 100 -> 3,973 s (14.5%); it flattens by cap 20 to 50. It over-predicts for
+parametrised module fixtures (the trace key has no parameter index): the worst case is
+`module:result` in tools/ohw/test_score_ohw.py, 5 setups at a mean of 193 s over 19 tests, and
+discounting its 964 s leaves about 2,800 s (10%) at cap 10 and 3,000 s (11%) at cap 20. Pairs with a
+mean setup of at least 0.1 s, by tests that ran the fixture: 1 -> 19 pairs; 2-4 -> 37; 5-19 -> 93;
+20-99 -> 49; 100+ -> 15; the long tail is a ~0.25 s `index` fixture in about 30 `libs/engine`
+test files of 100 to 900 tests each. This clears the decision rule's 5% bar by a wide margin even
+after the discount, so the premise gate is provisionally met; the tuple-aware walk is still to be
+run before the build is declared worthwhile, but it cannot reverse a 2x margin unless markers cut
+chunks to near singletons. Candidate default caps for the A/B: 20 and 50. Data and script:
+`~/tmp/egt-scripts/batch_predict.py` (speed's host).
+
 **A/B (after the build, same commit, default still off).**
 1. aira's own suite, cap 1 against caps 10, 25, 50: a no-regression check (little gain expected;
    assumption, not measured).
