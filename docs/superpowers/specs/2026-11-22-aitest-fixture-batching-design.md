@@ -1,6 +1,6 @@
 # aitest consecutive-chunk batching (AIRA-372): design
 
-Status: proposed, 2026-11-22, revised after plan review round 1 (section 14). Not built. Ticket `.aira/tickets/AIRA-372.md`; deferrals in
+Status: proposed, 2026-11-22, revised after plan review rounds 1 and 2 (section 14). Not built. Ticket `.aira/tickets/AIRA-372.md`; deferrals in
 `.aira/tickets/AIRA-373.md` (held). Source: the fastest-ee "speed" session's proposal (RANT-156,
 `~/tmp/aitest-batching/2026-11-22-aitest-fixture-batching-design.md`, cited as "speed §N") and two
 independent challenge reviews of it (`~/tmp/aitest-batching/challengers.json`: "minimum" and
@@ -187,7 +187,7 @@ A single nodeid line (n == 1) runs only today's post-item check, so cap 1 is tod
   today's path (`chunk_pos = 1`, `rest` empty).
 - Accepted result (the `in_flight = None` site, `:3240`): if not recycling and `rest` is non-empty,
   `in_flight = rest.popleft()`, charge its attempt, `chunk_pos += 1`, `pending_events = []`; else
-  `in_flight = None`.
+  `in_flight = None` and `chunk_pos = 0`.
 - `_largest_fitting(pop=True)` and `next_nodeid()` charge attempts only when the popped entry is a
   nodeid, never a chunk id.
 
@@ -241,12 +241,13 @@ without batching (derived, not measured).
 - The death reason string is NOT extended. It reaches a user only when `requeue_once` refuses
   (`supervisor.py:3462-3466`, attempts >= 2), and a chunk member in flight always has attempts 1
   (charged at promotion; requeues are singles or an uncharged rest), so a chunk-position clause
-  there would never print. Instead, `_handle_worker_exit` writes one stderr line at the moment of
-  every crash with `chunk_pos > 1`, before retirement, whatever the retry does: "aira aitest: worker
-  <pid> died on item k of a chunk (<nodeid>): <death>; k-1 earlier items had run with shared
-  fixtures alive; retrying it alone" (`<death>` is the string already computed at `:3462`). Without
-  it a worker killed by memory accumulated across the chunk is retried alone, usually passes, and
-  the cause stays invisible. The pool summary counts crashes with `chunk_pos > 1`.
+  there would never print. Instead, when `in_flight is not None` and `chunk_pos > 1`,
+  `_handle_worker_exit` writes one stderr line before retirement, whatever the retry does:
+  "aira aitest: worker <pid> died while running item k of a chunk (<nodeid>); k-1 earlier items had
+  run with shared fixtures alive; retrying it alone". It does not embed `_describe_worker_death`'s
+  text, which asserts the retry already failed; the `:3462` unevaluated reason stays byte-identical
+  to today. Without the line, a worker killed by memory accumulated across the chunk is retried
+  alone, usually passes, and the cause stays invisible. The pool summary counts the same crashes.
 - A shared fixture's teardown error is reported on the item whose teardown phase ran it: the last
   user before a scope change, or the chunk's last member. That is serial pytest's attribution for
   the same order. After a crash or recycle cut, the item that ends the run can differ between runs;
@@ -256,8 +257,8 @@ without batching (derived, not measured).
 
 In a worker, its copy-on-write session sets `shouldfail` or `shouldstop` after its own failures;
 `runtestprotocol` then forces `nextitem=None` (`runner.py:140-141`). The rest of that worker's life
-runs unbatched: sound (each member sets up fresh), a performance cost only. No aitest code;
-documented in the README and pinned by test W6.
+runs unbatched: sound (each member sets up fresh), a performance cost only. No aitest code and
+no aitest test; documented in the README.
 
 ### 5.6 Ordering plugins
 
@@ -298,19 +299,18 @@ for that range.
   against cap c, each worker's private memory (`/proc/self/smaps_rollup` `Private_Clean +
   Private_Dirty`, sampled after every test under the measure dir, section 8) and the container's
   peak (`/sys/fs/cgroup/memory.peak` read by the A/B harness after the run; reported unevaluated
-  if absent). Not `ru_maxrss`: it misses copy-on-write growth. M (`~/tmp/aira-372-fix/
-  cow_probe.py`, `cow.log`): a forked child touching about 80 MiB of inherited pages went from 712
-  to 82,036 KiB private while `ru_maxrss` stayed at 90,228 KiB before and after. Retained fixtures
-  touch inherited objects (refcounts alone write the pages). Deferred option (AIRA-373): a ledger-only watermark
-  from the same `Private_*` sum against the worker's lease. Trigger: a CI private-memory peak near
-  the lease or a container OOM.
+  if absent). `memory.peak` is cumulative over the cgroup's life, so each measured arm runs in a
+  fresh container or cgroup, or the harness resets the peak first. Not `ru_maxrss`: it misses
+  copy-on-write growth. M (`~/tmp/aira-372-fix/cow_probe.py`, `cow.log`): a forked child touching
+  about 80 MiB of inherited pages went from 712 to 82,036 KiB private while `ru_maxrss` stayed at
+  90,228 KiB. Retained fixtures touch inherited objects (refcounts alone write the pages).
+  Deferred (AIRA-373): a ledger-only watermark from the same `Private_*` sum against the worker's
+  lease. Trigger: a CI private-memory peak near the lease or a container OOM.
 - **Never `/proc/self/statm`.** A forked child's statm resident counts the supervisor's
-  copy-on-write image and does not see copy-on-write growth. M (`~/tmp/aitest-batching-review/
-  statm_fork.py`, `statm2.log`, 6.18 WSL kernel): parent 328 MiB resident; child at fork statm 326
-  MiB with `Private_Dirty` 0; after writing about 100 MiB, statm still 326 MiB while `Private_Dirty`
-  is 106 MiB. With a multi-GB fastest-ee supervisor every worker would read above its 512 MiB lease
-  before its first test. (`ru_maxrss` has the same copy-on-write floor and is blind to the same
-  growth, so it is not used for the CI comparison.)
+  copy-on-write image and misses copy-on-write growth. M (`~/tmp/aitest-batching-review/
+  statm_fork.py`, `statm2.log`): child at fork statm 326 MiB with `Private_Dirty` 0; after writing
+  about 100 MiB, statm still 326 MiB, `Private_Dirty` 106 MiB. With a multi-GB fastest-ee
+  supervisor every worker would read above its 512 MiB lease before its first test.
 
 ## 7. Configuration
 
@@ -328,63 +328,46 @@ cap c (AIRA_AITEST_BATCH_MAX_TESTS)". No flag, no ini key.
 
 - **Setup runs per scope node**: the worker registers a `pytest_fixture_setup` hookwrapper (public on
   pytest 7, 8, 9; it fires only on a cache miss, `fixtures.py:1077-1110`) that appends
-  `scope, argname, fixturedef.baseid, getattr(request, "param_index", 0), request.node.nodeid,
-  seconds` to `fixture-setup-<pid>.tsv` (`argname` plus `baseid` identify the definition, since
-  an overriding fixture shares the argname; `param_index` identifies the parametrised instance).
-  Only when the measure dir is set; a normal run registers nothing.
-- **Private memory per worker**: `_record_memory_sample` also writes `Private_Clean +
-  Private_Dirty` from `/proc/self/smaps_rollup` (unevaluated if unreadable), so ledger-only
-  workers get a copy-on-write-aware figure (section 6).
+  `scope, argname, request.node.nodeid, seconds` to `fixture-setup-<pid>.tsv`. Each row is a real
+  cache miss, so pytest's own cache key and invalidation decide what is counted. Only when the
+  measure dir is set; a normal run registers nothing.
+- **Private memory per worker**: `_record_memory_sample` appends a fourth column to the existing
+  `worker-<pid>.tsv` row, `Private_Clean + Private_Dirty` from `/proc/self/smaps_rollup`
+  (`unevaluated` if unreadable); the first three columns are unchanged.
 - **Chunk lengths**: the cut histogram (from `collect()`) and the run lengths actually executed
   (members run before a crash, recycle or end), in `pool-report-<pid>.json`.
 - **Drain length**: wall time from the queue first becoming empty to the last worker's retirement.
-- **Peak per worker**: existing `memory.peak` (desktop) and the maximum private-memory sample
-  (everywhere); `ru_maxrss` stays in the Gantt but is not used to judge memory (section 6).
-- **Crashes and OOMs**: count of worker crashes, of crashes with `chunk_pos > 1`, of OOM group kills,
+- **Peak per worker**: existing `memory.peak` (desktop) and the per-pid maximum of the fourth
+  column, taken by the A/B harness from the TSVs (no supervisor change); `ru_maxrss` stays in the
+  Gantt but is not used to judge memory (section 6).
+- **Crashes and OOMs**: count of worker crashes, of mid-chunk crashes (5.4), of OOM group kills,
   and of unstarted members requeued.
 
 ## 9. Rollout and A/B
 
-**Slice 0 (premise, no aira code; the speed session, from its fastest-ee fixture tracer).** Report
-fixture self-time by scope (session, package, module, class) after the 42% fix, the tests-per-module
-distribution for modules using the costly module fixtures, and the number of module switches in the
-final order. Decision rule, fixed before the query: predicted saving at cap c =
-sum over fixture instances of (setups today - setups at cap c) x that instance's mean setup
-seconds, where "setups at cap c" is simulated, not inferred from module sizes:
-1. Take the final item order and, per item, its cut tuple `k` (from the item's `aira_mem`,
-   `aira_cpu`, `aira_time`, `aira_failfast` markers through aitest's own readers, as `collect()`
-   resolves them) and `item.path`; cut chunks at cap c with the section 4.2 rules.
-2. Per item, list the session, package, module and class fixture instances it requests, each
-   identified by (scope, argname, definition `baseid`, `param_index`, scope node).
-3. Walk each chunk keeping pytest's alive set: an item's request is a setup if no instance with
-   the same (scope, argname, baseid, scope node) is alive or the alive one has a different
-   `param_index` (pytest's `cache_key` rebuild); leaving a class, module or package node drops
-   that node's instances; a chunk end drops all. "Setups today" is the same walk with every item
-   a chunk of one.
+**Slice 0 (speed session's fastest-ee tracer, R; engine run B after #3234, 27,468
+test-seconds).** Fixture self-time: module 4,556 s (16.6%, 8,010 setups), function 186 s, session
+11 s, class 4 s (session negligible, as section 11 assumes). First-order prediction (consecutive
+batches in file order, one module setup per (file, batch) with a user; no parameter identity or
+marker cuts): cap 5 -> 8.9%, 10 -> 12.1%, 20 -> 13.7%, 50 -> 14.3%, 100 -> 14.5%
+(`~/tmp/egt-scripts/batch_predict.py`, speed's host).
 
-The tracer must therefore record definition and parameter identity, not only argname (the
-section 8 recorder does). **Build slice 1
-only if the best cap <= 50 predicts at least 5% of engine test-seconds** (about 1,370 s of 27,468
-R); otherwise stop and write a collapse memo.
+**Pessimistic marker bound (plan review round 2, R: `~/tmp/aira-372-r2/pess.log`).** fastest-ee's
+one chunk-cutting marker source is the learned `aira_time` weights (above 10 s only; 5,996 tests
+in 108 files). Excluding the parametrised `module:result` in tools/ohw/test_score_ohw.py, the
+first-order saving is 2,734 s (10.0%) at cap 10, 2,989 s (10.9%) at 20, 3,162 s (11.5%) at 50;
+charging every weighted test two extra chunk boundaries leaves 1,997 s (7.3%), 2,187 s (8.0%),
+2,311 s (8.4%), and cap 5 gives 6.0%. All clear the 5% bar (about 1,370 s). Not bounded:
+`aira_mem`, `aira_cpu`, `aira_failfast` cuts, and final order against file order. The weights cut
+chunks in exactly the slow-test modules, and shift once batching lowers per-test seconds.
 
-**Slice 0 result (speed session, 2026-11-22, fastest-ee engine run B after #3234, 69,699 traced
-records, 27,468 test-seconds).** A first-order prediction, not the tuple-aware walk above: it cuts
-consecutive batches in file order and takes one module-fixture setup per (file, batch) holding a
-user, with no parameter identity or marker tuples. Fixture self-time by scope: module 4,556 s
-(16.6%, 8,010 setups), function 186 s (0.7%), session 11 s (0.0%), class 4 s (0.0%): session scope is
-negligible, which supports the section 11 answer that session fixtures are not kept across chunks.
-Predicted saving by cap: 5 -> 2,435 s (8.9%); 10 -> 3,312 s (12.1%); 20 -> 3,760 s (13.7%);
-50 -> 3,934 s (14.3%); 100 -> 3,973 s (14.5%); it flattens by cap 20 to 50. It over-predicts for
-parametrised module fixtures (the trace key has no parameter index): the worst case is
-`module:result` in tools/ohw/test_score_ohw.py, 5 setups at a mean of 193 s over 19 tests, and
-discounting its 964 s leaves about 2,800 s (10%) at cap 10 and 3,000 s (11%) at cap 20. Pairs with a
-mean setup of at least 0.1 s, by tests that ran the fixture: 1 -> 19 pairs; 2-4 -> 37; 5-19 -> 93;
-20-99 -> 49; 100+ -> 15; the long tail is a ~0.25 s `index` fixture in about 30 `libs/engine`
-test files of 100 to 900 tests each. This clears the decision rule's 5% bar by a wide margin even
-after the discount, so the premise gate is provisionally met; the tuple-aware walk is still to be
-run before the build is declared worthwhile, but it cannot reverse a 2x margin unless markers cut
-chunks to near singletons. Candidate default caps for the A/B: 20 and 50. Data and script:
-`~/tmp/egt-scripts/batch_predict.py` (speed's host).
+**Recorded deviation from the round-1 rule**, which required a simulated walk of pytest's fixture
+cache before building. The walk is deleted: it re-implements that cache and kept getting it wrong
+(the key is `request.param`, not `param_index`, `fixtures.py:1119-1120`; dependency invalidation,
+`:1058-1065`). The build proceeds on the first-order result plus the pessimistic bound; the A/B's
+instrumented run measures real cache misses (section 8) instead of modelling them. **Stop rule,
+after measurement:** if the measured saving at the best cap is under 5% of engine test-seconds,
+the default is not flipped and a collapse memo is written. Candidate caps: 20 and 50.
 
 **A/B (after the build, same commit, default still off).**
 1. aira's own suite, cap 1 against caps 10, 25, 50: a no-regression check (little gain expected;
@@ -432,10 +415,6 @@ Worker (`test_worker.py`, pytester):
   instead of running it (0 lines).
 - **W5** a teardown error in a module fixture lands on the last sharer only, not on earlier
   members. Mutant: per-member `nextitem=None`.
-- **W6** `session.shouldfail` set before a chunk: every member rebuilds, all pass, no SetupState
-  assertion. This pins pytest's contract (`runner.py:140-141`) against an upgrade, not aitest
-  code: the de-batching is pytest's own, and a redundant out-of-protocol teardown would pass it
-  (W3 is the test that catches that).
 - **W7** the `pytest_fixture_setup` recorder writes one row per cache miss only under
   `AIRA_AITEST_MEASURE_DIR` and nothing otherwise.
 
@@ -454,9 +433,11 @@ Supervisor (`test_supervisor.py`, fake workers as in `_fake_worker_state`):
   mapping to `[c, d]`, with c and d at 0 attempts; worker retired, replacement requested. A recycle
   on c of `[a,b,c,d]` requeues the bare nodeid d. Mutant: rest requeued as singles.
 - **S6** crash while b (item 2) is in flight, with b's retry then passing: exactly one stderr line
-  naming worker, "item 2 of a chunk", b's nodeid and the death text, written before the retry;
-  the pool summary's mid-chunk crash count is 1; no such line for a crash on item 1. Mutant: the
-  clause attached to the death reason only (no line, since the retry passes).
+  naming worker, "item 2 of a chunk" and b's nodeid, written before the retry, not containing
+  "the one retry"; the pool summary's mid-chunk crash count is 1. No line and no count for a crash
+  on item 1, nor for an idle worker dying after its chunk completed. Mutants: the clause attached
+  to the death reason only (no line, since the retry passes); `_describe_worker_death` text
+  embedded; condition on `chunk_pos` alone (the idle death prints).
 - **S7** exceeds-ceiling on a chunk id: every member unevaluated with the ceiling reason; no chunk id
   appears in `results` or in any synthesized report. Same for `_fail_queue_terminal` (**S8**).
 - **S9** fail-fast trip while another worker is mid-chunk: its `rest` members carry the abort reason.
@@ -474,14 +455,18 @@ End to end (real fork):
 - **E3** a trylast `modifyitems` hook interleaving two modules: results correct, setup count equal
   to serial pytest's for that order, dispatch order within each chunk equal to `session.items`.
   Mutant: chunker groups by module (reorders).
-- **E4** (crash mid-chunk, one worker) a chunk of 5 where member 3 calls `os._exit` on its first run
-  only (marker file): every nodeid has exactly one result and all pass; per-nodeid run-count file
-  shows m1, m2, m4, m5 ran once and m3 twice; attempts `{m1:1, m2:1, m3:2, m4:1, m5:1}`; m1 and m2's
-  replayed reports appear once each and m3's first-attempt partial events are discarded (JUnit
-  has one testcase per nodeid); the S6 stderr line appears. Fake-worker tests skip event
-  validation (`config is None` returns `[]`, `supervisor.py:3266`), so this is the test that
-  covers replay across a crash. Mutants: promotion off by one (m3's attempts 1, or m4 run twice);
-  rest dropped; m1/m2 events replayed twice.
+- **E4** (crash mid-chunk, one worker) a chunk of 5 whose member 3 dies on its first run only
+  (marker file) at a test-only seam: `worker._fault_after_events`, a module attribute that is
+  `None` in production (the payload stays one write). When set, the loop writes and flushes the
+  member's event lines, calls it, and only then writes the result line; the test project's
+  conftest sets it before fork to `os._exit` for m3's first run. So m3's event bytes reach the
+  supervisor's `pending_events` and no result confirms them. Asserts: every nodeid has exactly one
+  result and all pass; per-nodeid run counts m1, m2, m4, m5 once and m3 twice; attempts
+  `{m1:1, m2:1, m3:2, m4:1, m5:1}`; JUnit has one testcase per nodeid with m3's reports from its
+  retry only; the S6 line appears. Fake-worker tests skip event validation (`supervisor.py:3266`),
+  so this is the test of replay across a crash. Mutants: staged events replayed on arrival or on
+  crash rather than on result (m3 reported twice); promotion off by one (m3's attempts 1, or m4
+  run twice); rest dropped; m1/m2 events replayed twice.
 - **E5** (recycle mid-chunk, one worker) `AIRA_AITEST_WORKER_MAX_TESTS=4`, cap 3, six tests in one
   module, so chunks `[1,2,3]` and `[4,5,6]`: 6 passes, each run once, no worker runs more than 4
   tests (per-pid run counts), module setup count 3 (chunk A, test 4 alone as the tripping member,
@@ -516,7 +501,7 @@ Docs: README `Look-ahead dispatch` limitation replaced by the batching note (cap
 | Drain grows up to cap x slowest test | Cap is the knob; drain measured; tail split deferred (AIRA-373). |
 | Chunks are ranked by the shared `aira_time` rank, not their total | Same as a single test of that rank, so long chunks may land late; measured by the drain; summed rank deferred. |
 | A third-party plugin reads `nextitem` | Real items only, never a sentinel; pytest's own contract. |
-| Saving smaller than predicted (many 1-3-test modules) | Slice 0 decides before any build. |
+| Saving smaller than predicted (marker cuts, parametrised fixtures) | Pessimistic bound still 6-8% (9); the A/B measures real cache misses and the stop rule keeps the default off below 5%. |
 | Crash mid-chunk loses batching for the rest | Bounded at cap-1 single reruns per crash; counted. A recycle (routine, about every 200 tests) keeps it: the rest is requeued as one chunk (5.3). |
 
 ## 13. Deferrals (all in AIRA-373, held; the owner clears the hold)
@@ -550,3 +535,15 @@ at `798af794` before editing.
 | No real-fork crash or recycle test | **Applied** (E4, E5). |
 | Drain tail from static chunks without tail split | **No change** (approve with nits): already accepted in 3 and deferred to AIRA-373 with a trigger. |
 | CI ledger-only has no memory backstop | **No change** beyond the measurement fix above: the trade is stated in 6 and the watermark deferred. |
+
+Plan review round 2 (REVISE; blocker: the crash-line text). Checked against `798af794` and pytest 9.0.3.
+
+| Finding | Disposition |
+|---|---|
+| Premise "provisionally met" without the walk; the walk mis-modelled pytest's cache (`param_index` for `request.param`, no dependency invalidation) | **Closed by deleting** the walk and the recorder's `baseid` / `param_index` (8, 9). Confirmed `fixtures.py:1119-1120`, `:1058-1065`. Build on first-order plus the reviewer's pessimistic bound (`pess.log` re-read), a recorded deviation; the A/B measures cache misses; 5% stop rule after measurement. |
+| Crash line embeds `_describe_worker_death`, which says the retry already failed | **Closed by deleting** the embedding (5.4; S6). Confirmed `supervisor.py:3505-3507`, `:3530-3533`; the `:3462` reason is unchanged. |
+| Idle death after a chunk prints with nodeid `None` | **Applied** (4.4, 5.4; S6). Confirmed `:3240` leaves `chunk_pos`. Gate on `in_flight`; reset `chunk_pos`. |
+| E4 cannot reach partial-event discard | **Applied** (E4). Confirmed one payload write (`worker.py:600-625`); test-only seam after the event bytes. |
+| Container `memory.peak` boundary | **Applied** (6). |
+| W6 pins only pytest | **Closed by deleting** W6. |
+| Private-memory output under-specified | **Applied** (8): fourth TSV column (`worker.py:332-337`), harness takes the per-pid maximum. |
