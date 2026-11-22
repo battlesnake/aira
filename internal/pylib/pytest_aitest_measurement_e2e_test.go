@@ -219,20 +219,33 @@ func TestRealPytestAitestMeasurementReport(t *testing.T) {
 	if len(tsvs) == 0 {
 		t.Fatalf("no per-worker memory.current sidecar was written under %s", measureDir)
 	}
+	// AIRA-372: four columns, nodeid / memory.current / completed count / private
+	// memory (smaps_rollup Private_Clean+Private_Dirty bytes).
 	sawRealCurrent := false
+	sawRealPrivate := false
 	for _, tsv := range tsvs {
 		body, _ := os.ReadFile(tsv)
 		t.Logf("%s:\n%s", filepath.Base(tsv), body)
 		for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
 			fields := strings.Split(line, "\t")
-			if len(fields) == 3 && fields[1] != "unevaluated" {
+			if len(fields) != 4 {
+				t.Fatalf("worker TSV row has %d fields, want 4: %q", len(fields), line)
+			}
+			if fields[1] != "unevaluated" {
 				sawRealCurrent = true
+			}
+			if fields[3] != "unevaluated" {
+				sawRealPrivate = true
 			}
 		}
 	}
 	if !sawRealCurrent {
 		t.Fatalf("every per-test memory.current was 'unevaluated' on a confined run -- "+
 			"the read or the scope path is wrong (sidecars: %v)", tsvs)
+	}
+	if !sawRealPrivate {
+		t.Fatalf("every per-test private-memory reading was 'unevaluated' -- "+
+			"the /proc/self/smaps_rollup read is wrong (sidecars: %v)", tsvs)
 	}
 
 	// AIRA-259: the per-worker Gantt trace must be written (pid-namespaced), and on

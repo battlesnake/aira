@@ -20,6 +20,7 @@ import os
 import pytest
 
 from aitest.supervisor import Supervisor
+import aitest.worker as worker_module
 from aitest.worker import _record_memory_sample
 
 
@@ -149,9 +150,39 @@ def test_worker_memory_sample_real_and_unevaluated(tmp_path, monkeypatch):
     tsv_files = list(measure.glob("worker-*.tsv"))
     assert len(tsv_files) == 1, tsv_files  # same pid -> one appended file
     lines = tsv_files[0].read_text().splitlines()
-    assert any(line == "t.py::test_real\t99999\t1" for line in lines), lines
-    assert any(line == "t.py::test_none\tunevaluated\t2" for line in lines), lines
+    # AIRA-372: a fourth column, this process's private memory in bytes
+    # (/proc/self/smaps_rollup Private_Clean + Private_Dirty).
+    rows = [line.split("\t") for line in lines]
+    assert all(len(row) == 4 for row in rows), lines
+    assert any(row[:3] == ["t.py::test_real", "99999", "1"] for row in rows), lines
+    assert any(row[:3] == ["t.py::test_none", "unevaluated", "2"] for row in rows), lines
+    assert all(row[3].isdigit() and int(row[3]) > 0 for row in rows), lines
     assert not any("\t0\t" in line for line in lines), "a missing memory.current is 'unevaluated', not 0"
+
+
+def test_worker_private_memory_is_unevaluated_when_smaps_rollup_is_unreadable(tmp_path, monkeypatch):
+    measure = tmp_path / "measure"
+    measure.mkdir()
+    monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure))
+    monkeypatch.setattr(worker_module, "_private_memory_bytes", lambda: None)
+
+    _record_memory_sample(None, "t.py::test_x", 1)
+
+    (tsv,) = list(measure.glob("worker-*.tsv"))
+    assert tsv.read_text() == "t.py::test_x\tunevaluated\t1\tunevaluated\n"
+
+
+def test_private_memory_bytes_sums_private_clean_and_dirty(tmp_path, monkeypatch):
+    fake = tmp_path / "smaps_rollup"
+    fake.write_text(
+        "00400000-7fff [rollup]\nRss:  900 kB\nPrivate_Clean:  3 kB\nPrivate_Dirty:  5 kB\nShared_Clean: 7 kB\n"
+    )
+    real_open = open
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda path, *a, **k: real_open(str(fake) if path == "/proc/self/smaps_rollup" else path, *a, **k),
+    )
+    assert worker_module._private_memory_bytes() == 8 * 1024
 
 
 def test_worker_records_nothing_when_measure_dir_is_unset(tmp_path, monkeypatch):

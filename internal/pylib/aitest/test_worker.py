@@ -846,3 +846,355 @@ def test_should_recycle_fails_open_for_nonpositive_memory_max(tmp_path, monkeypa
     (scope_dir / "memory.max").write_text("0")
 
     assert _should_recycle(str(scope_dir), time.monotonic(), 0) is False
+
+
+# ---------------------------------------------------------------------------
+# AIRA-372: consecutive-chunk batching, the worker side (spec section 10, W1-W7).
+# ---------------------------------------------------------------------------
+
+_SHARED_MODULE = """
+import os
+import pytest
+
+_counter = {"setups": 0, "teardowns": 0}
+
+@pytest.fixture(scope="module")
+def shared():
+    _counter["setups"] += 1
+    yield
+    _counter["teardowns"] += 1
+    if os.environ.get("AITEST_W_TEARDOWN_RAISES"):
+        raise RuntimeError("MODULE-TEARDOWN-BOOM")
+
+def test_m1(shared):
+    pass
+
+def test_m2(shared):
+    pass
+
+def test_m3(shared):
+    pass
+
+def test_m4(shared):
+    pass
+"""
+
+
+def _chunk_line(nodeids):
+    return worker_module._CHUNK_LINE_PREFIX + json.dumps(list(nodeids)) + "\n"
+
+
+def _member_results(pipe_out):
+    """[(nodeid, outcome, waited_us or None, recycling, [events for that member])]
+    from a worker's written output. Members 2..n of a chunk carry no wait token, so
+    unlike _split_worker_lines this does not require one."""
+    pipe_out.seek(0)
+    results = []
+    pending = []
+    for line in pipe_out.read().splitlines():
+        if line.startswith(_EVENT_LINE_PREFIX):
+            pending.append(_untag_tuples(json.loads(line[len(_EVENT_LINE_PREFIX):])))
+            continue
+        recycling = line.endswith(worker_module._RECYCLE_SUFFIX)
+        if recycling:
+            line = line[: -len(worker_module._RECYCLE_SUFFIX)]
+        body, waited = _split_dispatch_wait(line)
+        nodeid, _, outcome = body.rpartition(" ")
+        results.append((nodeid, outcome, waited, recycling, pending))
+        pending = []
+    return results
+
+
+def _teardown_reports(events):
+    return [
+        event for event in events
+        if event["kind"] == "report" and event["data"].get("when") == "teardown"
+    ]
+
+
+def test_run_one_with_a_real_nextitem_keeps_a_module_fixture_alive(pytester):
+    """W1. With nextitem=items[1] the module fixture survives items[0]'s teardown and
+    is torn down in items[1]'s (nextitem=None) teardown: one setup, not two. The
+    nextitem=None case (two setups) is test_run_one_tears_down_and_rebuilds_session_
+    scoped_fixtures_per_test above."""
+    items = pytester.getitems(_SHARED_MODULE)
+    counter = items[0].module._counter
+    assert run_one(items[0], nextitem=items[1])[0] == "passed"
+    assert counter == {"setups": 1, "teardowns": 0}, "the fixture must survive into items[1]"
+    assert run_one(items[1])[0] == "passed"
+    assert counter == {"setups": 1, "teardowns": 1}
+
+
+def test_run_worker_loop_runs_a_chunk_with_shared_fixtures_and_tears_down_before_the_next_read(pytester):
+    """W2. One chunk line of 3 members in one module: one module setup, three result
+    lines in order, a dispatch-wait token on the first only, and the finalizer has run
+    by the time the loop reads its next line (the last member ran with nextitem=None)."""
+    items = pytester.getitems(_SHARED_MODULE)[:3]
+    by_id = {item.nodeid: item for item in items}
+    counter = items[0].module._counter
+    torn_down_at_next_read = []
+
+    def pipe_in():
+        yield _chunk_line(by_id)
+        torn_down_at_next_read.append(counter["teardowns"])
+        yield "__stop__\n"
+
+    pipe_out = io.StringIO()
+    run_worker_loop(None, by_id, pipe_in(), pipe_out)
+    results = _member_results(pipe_out)
+    assert [(n, o) for n, o, _w, _r, _e in results] == [(n, "passed") for n in by_id]
+    assert results[0][2] is not None, "member 1 carries the wait token"
+    assert [w for _n, _o, w, _r, _e in results[1:]] == [None, None], "members 2..n carry none"
+    assert not any(r for _n, _o, _w, r, _e in results)
+    assert counter["setups"] == 1, "module fixture set up once for the whole chunk"
+    assert torn_down_at_next_read == [1], "the chunk's last member must tear the fixture down"
+
+
+def test_count_recycle_mid_chunk_runs_the_tripping_member_with_nextitem_none(pytester, monkeypatch, clear_invalid_recycle_env_warnings):
+    """W3. AIRA_AITEST_WORKER_MAX_TESTS=2 and a chunk of 4 whose module fixture's
+    finalizer raises: exactly 2 results, the second carrying the recycle suffix,
+    outcome error with the fixture's teardown failure among ITS events (the teardown
+    ran inside member 2's protocol); member 1 passed; members 3-4 never ran."""
+    _clear_recycle_env(monkeypatch)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "2")
+    monkeypatch.setenv("AITEST_W_TEARDOWN_RAISES", "1")
+    items = pytester.getitems(_SHARED_MODULE)
+    by_id = {item.nodeid: item for item in items}
+    counter = items[0].module._counter
+    pipe_out = io.StringIO()
+    run_worker_loop(None, by_id, io.StringIO(_chunk_line(by_id) + "__stop__\n"), pipe_out)
+    results = _member_results(pipe_out)
+    names = list(by_id)
+    assert [(n, o, r) for n, o, _w, r, _e in results] == [
+        (names[0], "passed", False), (names[1], "error", True),
+    ]
+    teardown = _teardown_reports(results[1][4])
+    assert len(teardown) == 1 and teardown[0]["data"]["outcome"] == "failed"
+    assert "MODULE-TEARDOWN-BOOM" in json.dumps(teardown[0]["data"])
+    assert _teardown_reports(results[0][4])[0]["data"]["outcome"] == "passed"
+    assert counter == {"setups": 1, "teardowns": 1}
+
+
+def test_a_reused_worker_pre_checks_member_one_of_a_chunk(pytester, monkeypatch, clear_invalid_recycle_env_warnings):
+    """W3b. A reused worker under AIRA_AITEST_WORKER_MAX_TESTS=2: one single line,
+    then a chunk of 3 -- exactly 2 results in total, the second (chunk member 1) with
+    the recycle suffix. The count bound holds whatever count a chunk starts at."""
+    _clear_recycle_env(monkeypatch)
+    monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "2")
+    items = pytester.getitems(_SHARED_MODULE)
+    by_id = {item.nodeid: item for item in items}
+    names = list(by_id)
+    pipe_in = io.StringIO(names[0] + "\n" + _chunk_line(names[1:]) + "__stop__\n")
+    pipe_out = io.StringIO()
+    run_worker_loop(None, by_id, pipe_in, pipe_out)
+    results = _member_results(pipe_out)
+    assert [(n, r) for n, _o, _w, r, _e in results] == [(names[0], False), (names[1], True)]
+    assert results[1][2] is not None, "chunk member 1 still carries its wait token"
+
+
+_WATERMARK_MODULE = """
+import os
+import pytest
+
+_counter = {"setups": 0}
+
+@pytest.fixture(scope="module")
+def shared():
+    _counter["setups"] += 1
+    yield
+
+def test_w1(shared):
+    path = os.environ.get("AITEST_W_RAISE_CURRENT")
+    if path:
+        with open(path, "w") as handle:
+            handle.write("90")
+
+def test_w2(shared):
+    pass
+
+def test_w3(shared):
+    pass
+"""
+
+
+def test_memory_watermark_crossing_after_member_one_retires_after_member_two(pytester, tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    """W4, case 1. Member 1 pushes memory.current above the 64% watermark; member 2's
+    pre-check trips, so member 2 runs (with nextitem=None) and the worker recycles:
+    2 results, member 3 not run."""
+    _clear_recycle_env(monkeypatch)
+    scope = tmp_path / "scope"
+    scope.mkdir()
+    (scope / "memory.current").write_text("10")
+    (scope / "memory.max").write_text("100")
+    monkeypatch.setenv("AITEST_W_RAISE_CURRENT", str(scope / "memory.current"))
+    items = pytester.getitems(_WATERMARK_MODULE)
+    by_id = {item.nodeid: item for item in items}
+    names = list(by_id)
+    pipe_out = io.StringIO()
+    run_worker_loop(str(scope), by_id, io.StringIO(_chunk_line(names) + "__stop__\n"), pipe_out)
+    results = _member_results(pipe_out)
+    assert [(n, o, r) for n, o, _w, r, _e in results] == [
+        (names[0], "passed", False), (names[1], "passed", True),
+    ]
+
+
+def test_memory_watermark_already_above_at_chunk_start_runs_member_one_alone(pytester, tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    """W4, case 2. Already above the watermark when the chunk starts: member 1's
+    pre-check trips, member 1 still RUNS (a trip never skips a member) with
+    nextitem=None, and the worker recycles after it: exactly 1 result."""
+    _clear_recycle_env(monkeypatch)
+    scope = tmp_path / "scope"
+    scope.mkdir()
+    (scope / "memory.current").write_text("90")
+    (scope / "memory.max").write_text("100")
+    monkeypatch.delenv("AITEST_W_RAISE_CURRENT", raising=False)
+    items = pytester.getitems(_WATERMARK_MODULE)
+    by_id = {item.nodeid: item for item in items}
+    names = list(by_id)
+    pipe_out = io.StringIO()
+    run_worker_loop(str(scope), by_id, io.StringIO(_chunk_line(names) + "__stop__\n"), pipe_out)
+    results = _member_results(pipe_out)
+    assert [(n, o, r) for n, o, _w, r, _e in results] == [(names[0], "passed", True)]
+    assert items[0].module._counter["setups"] == 1
+
+
+_WATERMARK_LAST_MODULE = """
+import os
+
+def test_v1():
+    pass
+
+def test_v2():
+    with open(os.environ["AITEST_W_RAISE_CURRENT"], "w") as handle:
+        handle.write("90")
+"""
+
+
+def test_memory_watermark_crossed_by_the_last_member_recycles_after_it(pytester, tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    """W4, case 3. A chunk of 2 whose LAST member pushes memory.current above the
+    watermark: no later member's pre-check exists to see it, so the post-check after
+    the last member must, and member 2 carries the recycle suffix. Mutant: the
+    post-check only for single-item units (`n == 1` for `i == n - 1`)."""
+    _clear_recycle_env(monkeypatch)
+    scope = tmp_path / "scope"
+    scope.mkdir()
+    (scope / "memory.current").write_text("10")
+    (scope / "memory.max").write_text("100")
+    monkeypatch.setenv("AITEST_W_RAISE_CURRENT", str(scope / "memory.current"))
+    items = pytester.getitems(_WATERMARK_LAST_MODULE)
+    by_id = {item.nodeid: item for item in items}
+    names = list(by_id)
+    pipe_out = io.StringIO()
+    run_worker_loop(str(scope), by_id, io.StringIO(_chunk_line(names) + "__stop__\n"), pipe_out)
+    results = _member_results(pipe_out)
+    assert [(n, o, r) for n, o, _w, r, _e in results] == [
+        (names[0], "passed", False), (names[1], "passed", True),
+    ]
+
+
+def test_a_shared_fixture_teardown_error_lands_on_the_last_sharer_only(pytester, monkeypatch, clear_invalid_recycle_env_warnings):
+    """W5. In a chunk of 3 sharers, a module fixture whose finalizer raises is
+    reported on the last member's teardown only (serial pytest's attribution);
+    the earlier members pass."""
+    _clear_recycle_env(monkeypatch)
+    monkeypatch.setenv("AITEST_W_TEARDOWN_RAISES", "1")
+    items = pytester.getitems(_SHARED_MODULE)[:3]
+    by_id = {item.nodeid: item for item in items}
+    pipe_out = io.StringIO()
+    run_worker_loop(None, by_id, io.StringIO(_chunk_line(by_id) + "__stop__\n"), pipe_out)
+    results = _member_results(pipe_out)
+    assert [o for _n, o, _w, _r, _e in results] == ["passed", "passed", "error"]
+    assert [
+        [t["data"]["outcome"] for t in _teardown_reports(events)]
+        for _n, _o, _w, _r, events in results
+    ] == [["passed"], ["passed"], ["failed"]]
+
+
+_RECORDER_MODULE = """
+import pytest
+
+@pytest.fixture(scope="module")
+def shared():
+    yield
+
+@pytest.fixture
+def per_test():
+    yield
+
+def test_r1(shared, per_test):
+    pass
+
+def test_r2(shared, per_test):
+    pass
+
+def test_r3(shared, per_test):
+    pass
+"""
+
+
+def test_fixture_setup_recorder_writes_one_row_per_cache_miss_only_under_the_measure_dir(pytester, tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    """W7. Under AIRA_AITEST_MEASURE_DIR a chunk of 3 sharing a module fixture and
+    each using a function fixture records 1 module row and 3 function rows (one per
+    real cache miss); with the dir unset nothing is registered or written. The
+    directory is created by the supervisor's own pre-fork step, not by hand (a hand
+    mkdir here once hid that nothing created it)."""
+    _clear_recycle_env(monkeypatch)
+    measure = tmp_path / "fresh" / "measure"
+    monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure))
+    worker_module._ensure_measure_dir()
+    items = pytester.getitems(_RECORDER_MODULE)
+    by_id = {item.nodeid: item for item in items}
+    run_worker_loop(None, by_id, io.StringIO(_chunk_line(by_id) + "__stop__\n"), io.StringIO())
+    (tsv,) = list(measure.glob("fixture-setup-%d.tsv" % os.getpid()))
+    rows = [line.split("\t") for line in tsv.read_text().splitlines()]
+    assert all(len(row) == 4 for row in rows), rows
+    user_rows = sorted((scope, name) for scope, name, _node, _s in rows if name in ("shared", "per_test"))
+    assert user_rows == [("function", "per_test")] * 3 + [("module", "shared")], rows
+    module_row = [row for row in rows if row[1] == "shared"][0]
+    assert module_row[2].endswith(".py"), "the module scope node's nodeid: %r" % (module_row,)
+    float(module_row[3])
+
+    monkeypatch.delenv("AIRA_AITEST_MEASURE_DIR")
+    tsv.unlink()
+    other = pytester.getitems(_RECORDER_MODULE)
+    other_by_id = {item.nodeid: item for item in other}
+    run_worker_loop(None, other_by_id, io.StringIO(_chunk_line(other_by_id) + "__stop__\n"), io.StringIO())
+    assert list(measure.glob("fixture-setup-*.tsv")) == []
+    assert other[0].config.pluginmanager.get_plugin(worker_module._FIXTURE_RECORDER_NAME) is None
+
+
+def test_single_line_wire_is_unchanged_and_the_fault_seam_is_inert_by_default(pytester, monkeypatch, clear_invalid_recycle_env_warnings):
+    """Default byte-identity, worker side: a bare nodeid line produces exactly
+    today's bytes (events, then "<nodeid> <outcome> __dispatch_wait_us__=<N>"), in
+    ONE write, and the E4 seam is None in production."""
+    _clear_recycle_env(monkeypatch)
+    assert worker_module._fault_after_events is None
+    items = pytester.getitems("def test_ok(): pass")
+    by_id = {item.nodeid: item for item in items}
+    nodeid = items[0].nodeid
+
+    class _CountingPipe(io.StringIO):
+        writes = 0
+
+        def write(self, data):
+            type(self).writes += 1
+            return super().write(data)
+
+    pipe_out = _CountingPipe()
+    run_worker_loop(None, by_id, io.StringIO(nodeid + "\n__stop__\n"), pipe_out)
+    assert _CountingPipe.writes == 1, "one write per result when the seam is unset"
+    lines = pipe_out.getvalue().splitlines()
+    assert all(line.startswith(_EVENT_LINE_PREFIX) for line in lines[:-1])
+    head, waited = _split_dispatch_wait(lines[-1])
+    assert head == "%s passed" % nodeid and waited is not None
+    assert lines[-1] == "%s passed%s%d" % (nodeid, worker_module._DISPATCH_WAIT_TOKEN, waited)
+
+
+def test_a_malformed_chunk_line_raises_into_the_crash_path(pytester):
+    items = pytester.getitems(_SHARED_MODULE)
+    by_id = {item.nodeid: item for item in items}
+    for bad in ("not json", json.dumps("a string"), json.dumps([items[0].nodeid]), json.dumps([items[0].nodeid, "nope::x"])):
+        with pytest.raises((ValueError, KeyError)):
+            run_worker_loop(
+                None, by_id, io.StringIO(worker_module._CHUNK_LINE_PREFIX + bad + "\n"), io.StringIO()
+            )
