@@ -323,10 +323,15 @@ type admitWaiter struct {
 	// queue.mu (cleared at its start, rewritten by the lane pre-pass and the head
 	// rule), and the snapshot is their only reader (T27,
 	// small_lane_guard_test.go). laneWait is why the lane did not grant this
-	// waiter in the last pass ("", full, kept, pushed, no-room); heldByHead is
-	// whether today's head rule turned a fit into a refusal in that pass.
+	// waiter in the last pass ("", full, kept, pushed; a lane waiter that did not
+	// fit is diagnosed by blocked instead); heldByHead is whether today's head
+	// rule turned a fit into a refusal in that pass.
 	laneWait   string
 	heldByHead bool
+	// AIRA-370. blocked is the last pass's wait diagnosis (admit_diagnosis.go),
+	// on the same terms: diagnosis only, written by the evaluator, read by the
+	// snapshot.
+	blocked admitBlocked
 
 	// S8 (restart/anchor state — design §3 compare-and-release, §4 restart).
 	//
@@ -1240,6 +1245,11 @@ type admitSnapshot struct {
 	scopeSmall       map[string]bool
 	queuedLaneWait   string
 	queuedHeldByHead bool
+	// AIRA-370. The matched queued waiter's last-pass wait diagnosis (lane on or
+	// off), taken at the same match; and the CPU slot ledger's booked total
+	// (queue.cpuOutstanding) from the same locked walk as outstanding.
+	queuedBlockedBy []string
+	cpuOutstanding  int64
 }
 
 // boundedAdmitSignature bounds the DIAGNOSTIC copy of a client-supplied
@@ -1367,7 +1377,7 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 	}
 	queue.mu.Lock()
 	snapshot := admitSnapshot{
-		outstanding: queue.outstanding, outstandingJobs: queue.outstandingJobs,
+		outstanding: queue.outstanding, outstandingJobs: queue.outstandingJobs, cpuOutstanding: queue.cpuOutstanding,
 		phase: phase, present: true,
 		scopeReserves:   make(map[string]int64, len(queue.waiters)),
 		scopePins:       map[string]int64{},
@@ -1416,6 +1426,7 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 			if snapshot.laneOn {
 				snapshot.queuedLaneWait, snapshot.queuedHeldByHead = waiter.laneWait, waiter.heldByHead
 			}
+			snapshot.queuedBlockedBy = admitBlockedTokens(waiter.blocked, waiter.heldByHead)
 		}
 		// AIRA-324: what is AHEAD is counted in booking bytes, the quantity that
 		// will occupy the ledger when those waiters are granted.
@@ -1429,6 +1440,7 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 			if snapshot.laneOn {
 				entry.LaneWait, entry.HeldByHead = waiter.laneWait, waiter.heldByHead
 			}
+			entry.BlockedBy = admitBlockedTokens(waiter.blocked, waiter.heldByHead)
 			snapshot.queuedEntries = append(snapshot.queuedEntries, entry)
 		}
 	}
@@ -2565,6 +2577,16 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		}
 		return
 	}
+	// AIRA-350/370. The wait diagnoses describe THIS pass: cleared on every queued
+	// waiter, then rewritten by the lane pre-pass (laneWait), the head rule
+	// (heldByHead) and the walk's refusals (blocked). Cleared BEFORE the slice
+	// read, so a pass that cannot read the slice leaves every waiter unevaluated
+	// rather than showing the previous pass's reason as current. Diagnosis only.
+	for _, waiter := range queue.waiters {
+		if waiter != nil && waiter.state == admitQueued {
+			waiter.laneWait, waiter.heldByHead, waiter.blocked = "", false, 0
+		}
+	}
 	readMemory := s.memoryReader()
 	current, maximum, reclaimable, ok, _ := readMemory(queue.path)
 	if !ok {
@@ -2637,14 +2659,10 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// do NOT come through here: they SET/establish directly under queue.mu in
 	// enqueueAdmitInternal, so they are never frozen (Invariant 6).
 	restartFrozen := s.restartFrozenAt(now)
-	// AIRA-350. The lane diagnoses describe THIS pass: cleared on every queued
-	// waiter, then rewritten by the pre-pass (laneWait) and the head rule below
-	// (heldByHead). Diagnosis only.
-	for _, waiter := range queue.waiters {
-		if waiter != nil && waiter.state == admitQueued {
-			waiter.laneWait, waiter.heldByHead = "", false
-		}
-	}
+	// AIRA-370, diagnosis only: whether this pass's RAM ceiling is cut below the
+	// slice's memory.max (always false in ci-shim mode, where effectiveMaximum is
+	// maximum).
+	ceilingCut := effectiveMaximum < maximum
 	// AIRA-350. The small-job lane's grant-only pre-pass (small_lane.go), before
 	// today's walk and after every per-pass fact it reads is derived. Skipped
 	// during the restart freeze, as every new admission is; a no-op while the
@@ -2668,6 +2686,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// at freeze-end, woken by the restart timer's signal or the next poll tick.
 		if restartFrozen {
 			waiter.waited = true
+			waiter.blocked = admitBlockedRestartFreeze // AIRA-370 diagnosis
 			continue
 		}
 		// AIRA-101, the exclusivity gate. Placed before the RAM fit check because
@@ -2680,6 +2699,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// head, and during a drain there is no backfill to stop.
 		if gate.blocks(queue, waiter) {
 			waiter.waited = true
+			waiter.blocked = admitBlockedExclusive // AIRA-370 diagnosis
 			// AIRA-149. A waiter that is not the drain head is blocked because
 			// another waiter is exclusively holding or draining the slice --
 			// something else is in the way BY CONSTRUCTION, so it latches observed
@@ -2701,6 +2721,7 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		fit := s.admitFitLocked(queue, waiter, current, effectiveMaximum, reclaimable)
 		available, physicalFree, ramFits := fit.available, fit.physicalFree, fit.ramFits
 		fits := fit.all()
+		waiter.blocked = fit.refused(ceilingCut) // AIRA-370 diagnosis; zero when it fits
 		// AIRA-307/309. The head's protection, applied to every LATER job-level
 		// waiter. A sub-reservation is exempt from every form of it and judged on
 		// fit alone, on exclusiveGate.blocks' drain argument: it is an admitted
@@ -2740,12 +2761,13 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 		// Refused on capacity (RAM, CPU or VRAM short), or held behind the head.
 		//
 		// ACCEPTED GAP (S5, out of scope): noteGrantableLocked records the RAM
-		// `available` figure even for a CPU-only refusal, and there is no CPU
-		// diagnostic field — so a job blocked purely on CPU is rejected with
-		// E_ADMIT_SATURATED rendering the RAM-flavoured "no memory admission within
-		// the wait". Diagnosis only (no admission decision reads it); a dedicated CPU
-		// diagnostic is deferred. The contention latch below still tells the honest
-		// truth (observed, never a fabricated solitude).
+		// `available` figure even for a CPU-only refusal, so a non-blocking job
+		// refused purely on CPU is rejected with E_ADMIT_SATURATED rendering the
+		// RAM-flavoured "no memory admission within the wait". Diagnosis only. A
+		// WAITING job's CPU refusal is named by waiter.blocked (AIRA-370) on the
+		// wait line, `aira top` and `confine --list --json`; the rejection payload
+		// is unchanged. The contention latch below still tells the honest truth
+		// (observed, never a fabricated solitude).
 		waiter.waited = true
 		// AIRA-149 contention latch, S5-aware. A RAM refusal (ramFits == false) is a
 		// fact about THIS slice's ledger, so it takes the honest solo reading — which

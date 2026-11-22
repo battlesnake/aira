@@ -116,6 +116,17 @@ func requireLaneWait(t *testing.T, waiter *admitWaiter, want string) {
 	}
 }
 
+// requireBlocked asserts a waiter's AIRA-370 wait diagnosis, as the wire
+// tokens. A lane waiter that does not fit carries no lane token: the main walk
+// names the resource instead.
+func requireBlocked(t *testing.T, waiter *admitWaiter, want ...string) {
+	t.Helper()
+	got := admitBlockedTokens(waiter.blocked, waiter.heldByHead)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		diagnosisMismatch(t, "waiter %d blocked_by=%v, want %v", waiter.seq, got, want)
+	}
+}
+
 func requireHeldByHead(t *testing.T, waiter *admitWaiter, want bool) {
 	t.Helper()
 	if waiter.heldByHead != want {
@@ -181,10 +192,11 @@ func TestSmallLaneT1Incident(t *testing.T) {
 	grantedIdx := map[int]bool{0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 7: true, 10: true}
 	for i, small := range smalls {
 		requireLaneGranted(t, small, grantedIdx[i])
+		requireLaneWait(t, small, "")
 		if grantedIdx[i] {
-			requireLaneWait(t, small, "")
+			requireBlocked(t, small)
 		} else {
-			requireLaneWait(t, small, laneWaitNoRoom)
+			requireBlocked(t, small, "ram")
 		}
 		requireHeldByHead(t, small, false)
 	}
@@ -223,7 +235,8 @@ func TestSmallLaneT1bNoCPUSlot(t *testing.T) {
 
 	for _, small := range smalls {
 		requireLaneGranted(t, small, false)
-		requireLaneWait(t, small, laneWaitNoRoom)
+		requireLaneWait(t, small, "")
+		requireBlocked(t, small, "cpu") // AIRA-370: the slot ledger, not RAM
 	}
 }
 
@@ -255,7 +268,8 @@ func TestSmallLaneT2LedgerFull(t *testing.T) {
 
 			for _, small := range smalls {
 				requireLaneGranted(t, small, false)
-				requireLaneWait(t, small, laneWaitNoRoom)
+				requireLaneWait(t, small, "")
+				requireBlocked(t, small, "ram")
 			}
 		})
 	}
@@ -280,7 +294,8 @@ func TestSmallLaneT2LedgerFull(t *testing.T) {
 		server.evaluateAdmitQueue(queue)
 		for _, small := range smalls {
 			requireLaneGranted(t, small, false)
-			requireLaneWait(t, small, laneWaitNoRoom)
+			requireLaneWait(t, small, "")
+			requireBlocked(t, small, "ram", "ceiling-cut") // AIRA-370: the cut is in force
 		}
 
 		server.publishSliceCeilingSnapshot(sliceCeilingSnapshot{
@@ -1452,7 +1467,8 @@ func TestSmallLaneT22FirstFit(t *testing.T) {
 	requireLaneGranted(t, small, true)
 	requireLaneWait(t, small, "")
 	requireLaneGranted(t, big, false)
-	requireLaneWait(t, big, laneWaitNoRoom)
+	requireLaneWait(t, big, "")
+	requireBlocked(t, big, "ram")
 }
 
 // verifies: AIRA-350 T23 — one room: a lane grant faces the main walk's whole
@@ -1483,7 +1499,8 @@ func TestSmallLaneT23OneRoom(t *testing.T) {
 		server, queue, small := build(t, &current, true, nil)
 		server.evaluateAdmitQueue(queue)
 		requireLaneGranted(t, small, false)
-		requireLaneWait(t, small, laneWaitNoRoom)
+		requireLaneWait(t, small, "")
+		requireBlocked(t, small, "ram") // the full pin's physical room
 	})
 	t.Run("pin fits at equality", func(t *testing.T) {
 		current := int64(41743) * mib
@@ -1530,8 +1547,16 @@ func TestSmallLaneT23OneRoom(t *testing.T) {
 				})
 				queue.outstanding, queue.cpuOutstanding, queue.vramOutstanding, queue.outstandingJobs = rederiveLedgerLocked(queue)
 				server.evaluateAdmitQueue(queue)
-				if lane && small.state != admitGranted && small.laneWait != laneWaitNoRoom {
-					t.Fatalf("row %+v: refused with laneWait %q, want no-room", r, small.laneWait)
+				// AIRA-370: a refused lone small waiter carries no lane token, and
+				// the main walk names exactly the resources that did not fit.
+				if lane && small.state != admitGranted && (small.laneWait != "" || small.heldByHead) {
+					t.Fatalf("row %+v: refused with laneWait %q heldByHead %v, want no lane token", r, small.laneWait, small.heldByHead)
+				}
+				if lane && small.state != admitGranted && small.blocked == 0 {
+					diagnosisMismatch(t, "row %+v: refused with no resource named", r)
+				}
+				if lane && r.cpuFull != (small.state != admitGranted && small.blocked&admitBlockedCPU != 0) {
+					diagnosisMismatch(t, "row %+v: cpu named=%v, want %v", r, small.blocked&admitBlockedCPU != 0, r.cpuFull)
 				}
 				if lane && small.state == admitGranted && small.laneWait != "" {
 					t.Fatalf("row %+v: granted with laneWait %q", r, small.laneWait)

@@ -834,10 +834,13 @@ func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int) table
 // topQueuedState is a queued row's LIVE cell. "pushed" wins: a pushed job is
 // ahead of every high one, and its freeze is the stronger fact. "high"
 // (AIRA-340) marks a `--priority high` launch, so misuse of the flag is visible
-// to every session watching the queue. AIRA-361 adds the small-job lane's
-// last-pass diagnosis (topLaneReason) AFTER either, never instead of it: a high
-// job the lane refused shows both facts ("high, lane full"), and a row with
-// neither reads as plain "queued".
+// to every session watching the queue. The reason follows either, never
+// instead of it ("high, ram"): AIRA-361's small-job lane verdict, then
+// AIRA-370's wait diagnosis (topBlockedReason), the gate that finally held the
+// job ("lane full, ram": the lane did not take it, then the walk found no
+// RAM). An older daemon sends no diagnosis and gets AIRA-361's lane reason
+// alone (topLaneReason, which also says "behind head"). A row with neither
+// reads as plain "queued".
 func topQueuedState(record runner.ConfineRecord) string {
 	head := ""
 	switch {
@@ -846,7 +849,13 @@ func topQueuedState(record runner.ConfineRecord) string {
 	case record.Priority == runner.ConfinePriorityHigh:
 		head = "high"
 	}
-	reason := topLaneReason(record)
+	reason := topBlockedReason(record)
+	switch lane := topLaneWord(record.LaneWait); {
+	case reason == "":
+		reason = topLaneReason(record)
+	case lane != "":
+		reason = lane + ", " + reason
+	}
 	switch {
 	case head != "" && reason != "":
 		return head + ", " + reason
@@ -858,6 +867,32 @@ func topQueuedState(record runner.ConfineRecord) string {
 	return "queued"
 }
 
+// topBlockedWords is the LIVE cell's word for each AIRA-370 diagnosis token.
+// "cpu slots", never "cpu": the token is the admission slot ledger, not load.
+var topBlockedWords = map[string]string{
+	runner.ConfineBlockedRestartFreeze: "freeze",
+	runner.ConfineBlockedExclusive:     "exclusive",
+	runner.ConfineBlockedHead:          "behind head",
+	runner.ConfineBlockedRAM:           "ram",
+	runner.ConfineBlockedCeilingCut:    "ceiling cut",
+	runner.ConfineBlockedCPU:           "cpu slots",
+	runner.ConfineBlockedVRAM:          "vram",
+}
+
+// topBlockedReason is which gate held a queued job in the daemon's last pass,
+// in the daemon's own token order ("ram, ceiling cut, cpu slots"). A token
+// this binary does not know names nothing rather than a guess; "" when the
+// daemon sent none.
+func topBlockedReason(record runner.ConfineRecord) string {
+	var words []string
+	for _, token := range record.BlockedBy {
+		if word, ok := topBlockedWords[token]; ok {
+			words = append(words, word)
+		}
+	}
+	return strings.Join(words, ", ")
+}
+
 // topLaneReason is why the small-job lane did not take a queued job, in plain
 // words, only when the daemon gave one: held behind the head first (a fit the
 // head rule refused), as the confine wait line orders them (confineLaneNote),
@@ -867,7 +902,13 @@ func topLaneReason(record runner.ConfineRecord) string {
 	if record.HeldByHead {
 		return "behind head"
 	}
-	switch record.LaneWait {
+	return topLaneWord(record.LaneWait)
+}
+
+// topLaneWord is the lane's own verdict in plain words ("" for none or an
+// unknown token). "no-room" comes only from a daemon older than AIRA-370.
+func topLaneWord(laneWait string) string {
+	switch laneWait {
 	case "full":
 		return "lane full"
 	case "kept":
@@ -1688,10 +1729,15 @@ func topFooter(result runner.ConfineListResult) string {
 		// split is the same fabricated zeros; report it unevaluated in lockstep.
 		populationClause = "populations unevaluated"
 	}
-	parts := []string{
-		grantedClause,
-		populationClause,
+	var parts []string
+	// AIRA-370. The machine's CPU load, said once and only when it is high:
+	// context for long waits, never an admission reason (the rows name those).
+	// First: the footer is one unwrapped line and the granted clause alone can
+	// fill 80 columns, so anywhere later is clipped off a real terminal.
+	if pressure, busy := runner.ConfineBoxCPUBusy(reserve); busy {
+		parts = append(parts, fmt.Sprintf("box CPU busy %.0f%%", pressure))
 	}
+	parts = append(parts, grantedClause, populationClause)
 	if reserve.FreezePhase != "" {
 		parts = append(parts, fmt.Sprintf("%d queued, freeze %s", reserve.Queued, reserve.FreezePhase))
 	}

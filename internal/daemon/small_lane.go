@@ -31,12 +31,15 @@ import (
 // nothing, so every admission decision is today's (spec I8).
 
 // laneWait tokens: why the lane did not grant a queued waiter in the last pass.
-// Diagnosis only (AIRA-149 terms); "" means the lane did not refuse it.
+// Diagnosis only (AIRA-149 terms); "" means the lane did not refuse it. A lane
+// waiter that does not fit carries no lane token: the main walk faces it with
+// the same fit against a ledger at least as full (lane grants only add), so it
+// is refused there too and admitWaiter.blocked names the resource (AIRA-370
+// retired the conflated "no-room").
 const (
 	laneWaitFull   = "full"
 	laneWaitKept   = "kept"
 	laneWaitPushed = "pushed"
-	laneWaitNoRoom = "no-room"
 )
 
 // smallLaneConfigFromEnv reads AIRA_DAEMON_SMALL_LANE (x) and, only when the lane
@@ -197,8 +200,7 @@ func (s *Server) smallLanePassLocked(queue *sliceQueue, gate exclusiveGate, curr
 		}
 		fit := s.admitFitLocked(queue, waiter, current, effectiveMaximum, reclaimable)
 		if !fit.all() {
-			waiter.laneWait = laneWaitNoRoom
-			continue
+			continue // the main walk's blocked names the resource (AIRA-370)
 		}
 		occ = occ.plus(waiter)
 		if ref != nil && ref != waiter && !s.admitCouldFitBesideLocked(ref, effectiveMaximum, occ) {

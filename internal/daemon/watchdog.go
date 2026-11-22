@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -116,28 +115,10 @@ func readHostPressureFull() (float64, uint64, bool, string) {
 	return parseHostPressureFull(data)
 }
 
+// parseHostPressureFull is the `full` line of /proc/pressure/memory, through the
+// one PSI parser the CPU frame (AIRA-370) also uses.
 func parseHostPressureFull(data []byte) (float64, uint64, bool, string) {
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 || fields[0] != "full" {
-			continue
-		}
-		values := make(map[string]string, len(fields)-1)
-		for _, field := range fields[1:] {
-			key, value, found := strings.Cut(field, "=")
-			if !found || key == "" || value == "" {
-				return 0, 0, false, "parse-error"
-			}
-			values[key] = value
-		}
-		avg, avgErr := strconv.ParseFloat(values["avg10"], 64)
-		total, totalErr := strconv.ParseUint(values["total"], 10, 64)
-		if avgErr != nil || totalErr != nil || avg < 0 || math.IsNaN(avg) || math.IsInf(avg, 0) {
-			return 0, 0, false, "parse-error"
-		}
-		return avg, total, true, ""
-	}
-	return 0, 0, false, "full-line-absent"
+	return runner.ParsePressureAvg10(data, "full")
 }
 
 func readMemAvailable() (int64, bool, string) {

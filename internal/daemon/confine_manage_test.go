@@ -162,6 +162,7 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		sliceCPUUsec  = int64(2_500_000_000)
 		cpuSampleNano = int64(1_700_000_000_000_000_000)
 		cpuCores      = 12
+		cpuPressure   = 70.5
 	)
 	// withSystemFrame stamps the AIRA-127 system/slice frame onto an arm's
 	// expectation. One definition, so a new wire field cannot be added and then
@@ -182,6 +183,11 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		want.SystemCPUUsageUsec, want.SystemCPUKnown = systemCPUUsec, true
 		want.SliceCPUUsageUsec, want.SliceCPUKnown = sliceCPUUsec, true
 		want.CPUSampleUnixNano, want.CPUCores = cpuSampleNano, cpuCores
+		// AIRA-370. The box CPU pressure rides the same frame, and the slot
+		// ledger is the evaluator's own: R x cores (3 x 12), none booked here.
+		pressure := cpuPressure
+		want.CPUPressureSomeAvg10 = &pressure
+		want.CPUCeilingCores = 3 * cpuCores
 		// AIRA-220. Every arm here registers a queue (an established ledger,
 		// including the established-EMPTY arm), so the granted pair is established
 		// in all of them. The absent-ledger case is TestConfineListReserveUnevaluatedWhenLedgerAbsent.
@@ -215,7 +221,8 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 				return runner.ConfineCPUFrame{
 					SystemUsageUsec: systemCPUUsec, SystemKnown: true,
 					SliceUsageUsec: sliceCPUUsec, SliceKnown: true,
-					SampleUnixNano: cpuSampleNano,
+					SampleUnixNano:    cpuSampleNano,
+					PressureSomeAvg10: cpuPressure, PressureKnown: true,
 				}
 			},
 			func() int { return cpuCores })
@@ -284,6 +291,37 @@ func TestConfineListSliceReserveSummary(t *testing.T) {
 		})
 		if got := *result.SliceReserve; !reflect.DeepEqual(got, want) {
 			t.Fatalf("slice reserve=%+v, want %+v", got, want)
+		}
+	})
+
+	// AIRA-370. A pressure the frame did not establish is unevaluated: off the
+	// wire, never a 0 (nor the number beside a false bit). Mutation: publish it
+	// whatever PressureKnown says (this arm goes red).
+	t.Run("pressure-unread", func(t *testing.T) {
+		server, _ := setup(t)
+		server.admitReadMemory = func(string) (int64, int64, int64, bool, string) {
+			return sliceCurrent, maximum, sliceReclaimable, true, ""
+		}
+		server.SetCPUFrameForTest(
+			func(string) runner.ConfineCPUFrame {
+				return runner.ConfineCPUFrame{
+					SystemUsageUsec: systemCPUUsec, SystemKnown: true,
+					SliceUsageUsec: sliceCPUUsec, SliceKnown: true,
+					SampleUnixNano:    cpuSampleNano,
+					PressureSomeAvg10: 42, PressureKnown: false,
+				}
+			},
+			func() int { return cpuCores })
+		response := server.confineManagement(context.Background(), request)
+		result, ok := response.Data.(runner.ConfineListResult)
+		if !response.OK || !ok || result.SliceReserve == nil {
+			t.Fatalf("response=%+v result=%+v", response, result)
+		}
+		if !result.SliceReserve.SystemCPUKnown {
+			t.Fatalf("fixture: the CPU frame was not published at all: %+v", result.SliceReserve)
+		}
+		if got := result.SliceReserve.CPUPressureSomeAvg10; got != nil {
+			t.Fatalf("an unread pressure is on the wire as %v", *got)
 		}
 	})
 

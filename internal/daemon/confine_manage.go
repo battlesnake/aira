@@ -291,6 +291,13 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				LaneJobs:          snapshot.laneJobs,
 				LaneWait:          snapshot.queuedLaneWait,
 				HeldByHead:        snapshot.queuedHeldByHead,
+				// AIRA-370. The probe's own waiter's wait diagnosis, and the CPU
+				// SLOT ledger it may name, from the same snapshot. The ceiling is
+				// the evaluator's own cpuCeiling(), so the figures the wait line
+				// prints are the ones the fit was judged against.
+				BlockedBy:           snapshot.queuedBlockedBy,
+				CPUOutstandingCores: snapshot.cpuOutstanding,
+				CPUCeilingCores:     s.cpuCeiling(),
 				// AIRA-68: the same snapshot's population split, so the summary can
 				// never again be read against the Scopes table above it as though
 				// they counted the same thing.
@@ -362,6 +369,12 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 				result.SliceReserve.SliceCPUKnown = cpu.SliceKnown
 				result.SliceReserve.CPUSampleUnixNano = cpu.SampleUnixNano
 				result.SliceReserve.CPUCores = s.cpuCoreCounter()()
+				// AIRA-370. The machine's CPU load (PSI), context beside the slot
+				// ledger, published only when it was read.
+				if cpu.PressureKnown {
+					pressure := cpu.PressureSomeAvg10
+					result.SliceReserve.CPUPressureSomeAvg10 = &pressure
+				}
 				// AIRA-269. The VRAM frame — same terms as RAM/CPU: a LOCK-FREE read
 				// of the sampler's atomic snapshot (NEVER a fork here; nvidia-smi on
 				// every `aira top` tick is exactly what the off-lock sampler exists to
