@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"aira/internal/runner"
 
@@ -1083,7 +1084,8 @@ func topPeakWithin(peak *int64, used int64, reserved int64) (int64, bool) {
 // colour-tag syntax is neutralised so an argument like `[red]` is displayed
 // rather than swallowed as markup. Truncation for WIDTH is not done here — the
 // table already clamps a cell that does not fit, and a second scheme layered on
-// top of it would only disagree with it.
+// top of it would only disagree with it. The one bound applied here,
+// topCellMaxRunes, is for cost, not width.
 func topCommandCell(command *string) string {
 	return topUntrustedCell(command)
 }
@@ -1096,8 +1098,22 @@ func topUntrustedCell(text *string) string {
 	if text == nil {
 		return "unevaluated"
 	}
-	return tview.Escape(topPrintable(*text))
+	// Cut BEFORE escaping, so the cut can never split an escape sequence.
+	value, cut := *text, ""
+	if utf8.RuneCountInString(value) > topCellMaxRunes {
+		value, cut = string([]rune(value)[:topCellMaxRunes]), "…"
+	}
+	return tview.Escape(topPrintable(value)) + cut
 }
+
+// topCellMaxRunes bounds the last column's text (AIRA-374). The value is wider
+// than any terminal row, so the bound removes nothing the table could show: the
+// table still clamps the cell to the terminal and marks that cut itself. What it
+// removes is cost. tview measures the full grapheme width of every visible cell
+// on every draw (three passes: column sizing, printing, the ellipsis check), and
+// it draws after every keypress, so on the owner's box nine 4 KB supervisor argvs
+// made one arrow key cost ~17 ms of CPU, most of it in uniseg.
+const topCellMaxRunes = 512
 
 // topPrintable escapes text's non-printing runes, so another process's bytes
 // cannot rewrite the line they are shown on. Colour tags are left alone: a
