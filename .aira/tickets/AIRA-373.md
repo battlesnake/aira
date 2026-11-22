@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-373","project":"aira","title":"aitest batching phase 2 (DEFERRED until the slice 1 A/B says it is needed): measured cost model + history, predicted-duration batches/LPT/tail split, retained-fixture reservation, CI smaps_rollup watermark, aira_affinity/xdist_group/aira_isolated, pytest_aitest_prefork, session fixtures kept across chunks","status":"planned","kind":"feature","severity":"P3","assignee":null,"milestone":"v0.47","labels":["backlog"],"hold":true,"relations":[]}
+---
+Everything in speed's RANT-156 design that the challenge pass cut from slice 1, each with the trigger that would justify building it (see the spec's cut/defer table). Do not build until the slice 1 A/B (same commit, cap=1 vs cap=c, aira's own suite and fastest-ee engine on GCP) shows which part is needed; the owner clears the hold.
