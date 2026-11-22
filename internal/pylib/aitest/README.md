@@ -53,9 +53,10 @@ aitest: pool: live workers peak 64, mean 60.00 over 2020.1 s; supervisor CPU 150
   unread while the supervisor is busy. A worker's wait before `__stop__` is not
   counted, because no test follows it. The worker sends the figure on the
   result line, so the denominator in "measured on N of M tests" is the number
-  of completed results, and N is less than M only when a test double sends a
-  result line without the figure (a test whose worker died before reporting is
-  in neither count). If no test was measured, the figure reads `unevaluated`,
+  of completed results. N is less than M when batching is on (members 2..n of a
+  chunk were not dispatched separately, so they carry no figure) and when a test
+  double sends a result line without it (a test whose worker died before
+  reporting is in neither count). If no test was measured, the figure reads `unevaluated`,
   never 0. One case counts time that is not a dispatch delay: a worker that went
   idle because the queue was empty, and later receives a test requeued after
   another worker crashed, counts its whole idle period as waiting for dispatch.
@@ -166,8 +167,9 @@ the start: `aitest: batching: N tests in K chunks, cap c (AIRA_AITEST_BATCH_MAX_
   `unevaluated`); `pool-report-<pid>.json` adds `batch_cap`,
   `chunk_lengths_cut`, `chunk_lengths_run`, `drain_s`, `worker_crashes`,
   `mid_chunk_crashes`, `oom_group_kills` and `unstarted_requeued`.
-  `chunk_lengths_run` counts every dispatched unit, single tests included (a
-  unit lost before its first result counts as 0). `oom_group_kills` reads
+  `chunk_lengths_run` counts every dispatched unit, single tests included, by
+  the number of its members that returned a result (a unit lost or killed by a
+  fail-fast abort before its first result counts as 0). `oom_group_kills` reads
   `unevaluated` when any worker's `memory.events` could not settle it (no
   cgroup scope on ci-shim or the daemon-down fallback, or an unreadable file).
 
@@ -192,7 +194,7 @@ Design and the A/B plan before the default changes:
   `AIRA_AITEST_BATCH_MAX_TESTS` unset or `1` (the default) every test is
   dispatched alone and `run_one` passes `nextitem=None`, so
   session/module/class-scoped fixtures are torn down and rebuilt per test. See
-  "Consecutive-chunk batching" below.
+  "Consecutive-chunk batching" above.
 - **`record_xml_attribute`/`record_testsuite_property`** write into the
   child's own COW-forked `LogXML` plugin instance and are lost — same
   limitation as xdist workers, not a regression against the design target.

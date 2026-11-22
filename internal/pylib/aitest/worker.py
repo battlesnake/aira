@@ -381,6 +381,21 @@ def _private_memory_bytes():
     return total if seen == 2 else None
 
 
+def _ensure_measure_dir():
+    """AIRA-372: create AIRA_AITEST_MEASURE_DIR, once, before any worker forks. The
+    worker-side recorders (_record_memory_sample, the fixture-setup recorder) append
+    to files in it and swallow every OSError, so on a fresh path they would silently
+    record nothing. No-op when the variable is unset; fail-silent like the
+    recorders."""
+    measure_dir = os.environ.get("AIRA_AITEST_MEASURE_DIR", "")
+    if not measure_dir.strip():
+        return
+    try:
+        os.makedirs(measure_dir, exist_ok=True)
+    except OSError:
+        pass
+
+
 _FIXTURE_RECORDER_NAME = "aitest-fixture-setup-recorder"
 
 

@@ -43,6 +43,10 @@ func builtAiraBinary(t *testing.T) string {
 }
 
 func TestMain(m *testing.M) {
+	// AIRA-372: the e2e tests pass os.Environ() to their pytest children, so an
+	// AIRA_AITEST_BATCH_MAX_TESTS exported for an A/B run would batch every one of
+	// them. A test that wants batching sets it on its own command.
+	_ = os.Unsetenv("AIRA_AITEST_BATCH_MAX_TESTS")
 	code := m.Run()
 	if airaBuild.dir != "" {
 		_ = os.RemoveAll(airaBuild.dir)

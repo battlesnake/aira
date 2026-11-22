@@ -68,8 +68,8 @@ def build_suite():
 
 
 def run(suite, cap):
+    # Not created here: aitest must create a fresh measurement directory itself.
     measure = os.path.join(SCRATCH, "measure-cap%s" % cap)
-    os.makedirs(measure)
     env = dict(os.environ)
     for name in ("AIRA_AITEST_OUTER_SCOPE", "AIRA_AITEST_ADMISSION", "AIRA_AITEST_WORKER_ADMIT_CMD"):
         env.pop(name, None)  # no daemon: the fallback pool

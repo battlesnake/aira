@@ -1058,6 +1058,40 @@ def test_memory_watermark_already_above_at_chunk_start_runs_member_one_alone(pyt
     assert items[0].module._counter["setups"] == 1
 
 
+_WATERMARK_LAST_MODULE = """
+import os
+
+def test_v1():
+    pass
+
+def test_v2():
+    with open(os.environ["AITEST_W_RAISE_CURRENT"], "w") as handle:
+        handle.write("90")
+"""
+
+
+def test_memory_watermark_crossed_by_the_last_member_recycles_after_it(pytester, tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    """W4, case 3. A chunk of 2 whose LAST member pushes memory.current above the
+    watermark: no later member's pre-check exists to see it, so the post-check after
+    the last member must, and member 2 carries the recycle suffix. Mutant: the
+    post-check only for single-item units (`n == 1` for `i == n - 1`)."""
+    _clear_recycle_env(monkeypatch)
+    scope = tmp_path / "scope"
+    scope.mkdir()
+    (scope / "memory.current").write_text("10")
+    (scope / "memory.max").write_text("100")
+    monkeypatch.setenv("AITEST_W_RAISE_CURRENT", str(scope / "memory.current"))
+    items = pytester.getitems(_WATERMARK_LAST_MODULE)
+    by_id = {item.nodeid: item for item in items}
+    names = list(by_id)
+    pipe_out = io.StringIO()
+    run_worker_loop(str(scope), by_id, io.StringIO(_chunk_line(names) + "__stop__\n"), pipe_out)
+    results = _member_results(pipe_out)
+    assert [(n, o, r) for n, o, _w, r, _e in results] == [
+        (names[0], "passed", False), (names[1], "passed", True),
+    ]
+
+
 def test_a_shared_fixture_teardown_error_lands_on_the_last_sharer_only(pytester, monkeypatch, clear_invalid_recycle_env_warnings):
     """W5. In a chunk of 3 sharers, a module fixture whose finalizer raises is
     reported on the last member's teardown only (serial pytest's attribution);
@@ -1101,11 +1135,13 @@ def test_r3(shared, per_test):
 def test_fixture_setup_recorder_writes_one_row_per_cache_miss_only_under_the_measure_dir(pytester, tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
     """W7. Under AIRA_AITEST_MEASURE_DIR a chunk of 3 sharing a module fixture and
     each using a function fixture records 1 module row and 3 function rows (one per
-    real cache miss); with the dir unset nothing is registered or written."""
+    real cache miss); with the dir unset nothing is registered or written. The
+    directory is created by the supervisor's own pre-fork step, not by hand (a hand
+    mkdir here once hid that nothing created it)."""
     _clear_recycle_env(monkeypatch)
-    measure = tmp_path / "measure"
-    measure.mkdir()
+    measure = tmp_path / "fresh" / "measure"
     monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure))
+    worker_module._ensure_measure_dir()
     items = pytester.getitems(_RECORDER_MODULE)
     by_id = {item.nodeid: item for item in items}
     run_worker_loop(None, by_id, io.StringIO(_chunk_line(by_id) + "__stop__\n"), io.StringIO())

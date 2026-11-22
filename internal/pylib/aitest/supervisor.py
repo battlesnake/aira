@@ -17,6 +17,7 @@ from aitest.worker import (
     _DISPATCH_WAIT_TOKEN,
     _EVENT_LINE_PREFIX,
     _RECYCLE_SUFFIX,
+    _ensure_measure_dir,
     _env_int,
     _exit_child,
     _untag_tuples,
@@ -1567,33 +1568,40 @@ class Supervisor:
                 failfast.add(item.nodeid)
         self.aira_mem_bytes = mem_map
         self._annotated = annotated
-        # AIRA-372: cut the final order into chunks of consecutive items. At cap 1
-        # every unit is a single nodeid and the queue is exactly the nodeid list.
+        # AIRA-372: cut the final order into chunks of consecutive items.
         cap = _resolve_batch_cap()
-        units = _cut_chunks(
-            items,
-            lambda item: (
-                reservation_need[item.nodeid], cpu_need[item.nodeid],
-                time_cost[item.nodeid], item.nodeid in failfast,
-            ),
-            cap,
-        )
         self._batch_cap = cap
         self._chunks = {}
-        queue = []
-        for members in units:
-            self._chunk_lengths_cut[len(members)] += 1
-            if len(members) == 1:
-                queue.append(members[0])
-                continue
-            chunk_id = "\x01chunk:%d" % len(self._chunks)
-            self._chunks[chunk_id] = members
-            # Uniform (need, cpu, time) within a chunk, so the pick, the fit filter,
-            # the cover check and growth sizing read a chunk exactly as one test.
-            reservation_need[chunk_id] = reservation_need[members[0]]
-            cpu_need[chunk_id] = cpu_need[members[0]]
-            time_cost[chunk_id] = time_cost[members[0]]
-            queue.append(chunk_id)
+        self._chunk_lengths_cut = collections.Counter()
+        if cap == 1:
+            # Batching off: the queue is exactly the nodeid list, built without the
+            # cutter, so the default path is unchanged by construction.
+            queue = [item.nodeid for item in items]
+            if queue:
+                self._chunk_lengths_cut[1] = len(queue)
+        else:
+            queue = []
+            for members in _cut_chunks(
+                items,
+                lambda item: (
+                    reservation_need[item.nodeid], cpu_need[item.nodeid],
+                    time_cost[item.nodeid], item.nodeid in failfast,
+                ),
+                cap,
+            ):
+                self._chunk_lengths_cut[len(members)] += 1
+                if len(members) == 1:
+                    queue.append(members[0])
+                    continue
+                chunk_id = "\x01chunk:%d" % len(self._chunks)
+                self._chunks[chunk_id] = members
+                # Uniform (need, cpu, time) within a chunk, so the pick, the fit
+                # filter, the cover check and growth sizing read a chunk exactly as
+                # one test.
+                reservation_need[chunk_id] = reservation_need[members[0]]
+                cpu_need[chunk_id] = cpu_need[members[0]]
+                time_cost[chunk_id] = time_cost[members[0]]
+                queue.append(chunk_id)
         self.queue = queue
         self.reservation_need = reservation_need
         self.cpu_need = cpu_need
@@ -3624,11 +3632,16 @@ class Supervisor:
                     inflight,
                     "killed by the fail-fast abort (tripped by %s)" % self.failfast_triggered,
                 )
-            # AIRA-372: the unstarted rest of a chunk this worker held.
+                # AIRA-372: the killed unit still counts in the run-length histogram,
+                # as the members that completed before the kill (as on a crash).
+                self._chunk_lengths_run[max(state.get("chunk_pos", 0) - 1, 0)] += 1
+            # AIRA-372: the rest of a chunk this worker held. "No result", not "not
+            # started": the worker begins the next member as soon as it sends a
+            # result, before the supervisor has read it.
             for member in state.get("rest") or ():
                 self._unevaluated_reasons.setdefault(
                     member,
-                    "not started: the fail-fast abort (tripped by %s) stopped the pool"
+                    "no result before the fail-fast abort (tripped by %s) stopped the pool"
                     % self.failfast_triggered,
                 )
             try:
@@ -3681,6 +3694,17 @@ class Supervisor:
         # (_forget_worker_scope's os.rmdir): once it is gone the evidence for
         # WHY this worker died is gone with it.
         death = self._describe_worker_death(pid, state)
+        # AIRA-372: kill before retiring, as _abort_pool does. A worker lost while
+        # still alive (an invalid report batch, a mid-chunk loss) would otherwise run
+        # on into its next member while _reap_child waits out the reap timeout.
+        # Through the pidfd only: it names this exact unreaped child, so the signal
+        # can never reach a reused pid. A worker with no pidfd keeps the bounded reap.
+        pidfd = state.get("pidfd")
+        if pidfd is not None:
+            try:
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            except OSError:
+                pass
         self._retire_worker(pid, state)
         # AIRA-372 (spec 5.2): the unstarted rest of a chunk goes back to the queue
         # head as single items, uncharged, in collection order behind the in-flight
@@ -3911,6 +3935,8 @@ class Supervisor:
         # (collection ran before this call and is not included).
         self._run_start_wall_us = _now_wall_us()
         cpu_start = time.process_time()
+        # AIRA-372: before the first fork, so every worker's recorders find the directory.
+        _ensure_measure_dir()
         self.bootstrap()
         import gc
         gc.freeze()

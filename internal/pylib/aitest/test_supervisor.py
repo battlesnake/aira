@@ -4656,21 +4656,45 @@ def _batched_sup(pytester, monkeypatch, cap, source=_FOUR_SHARERS, config=False)
     return sup, [item.nodeid for item in items], replaced
 
 
+def test_an_exported_batch_cap_never_reaches_a_test(pytester, monkeypatch):
+    """conftest.py's autouse scrub: a pytest run with AIRA_AITEST_BATCH_MAX_TESTS
+    exported sees it unset inside every test, so aira's own suite is hermetic to an
+    A/B shell. Mutant: the scrub removed (the inner test sees "10")."""
+    import pathlib
+
+    monkeypatch.setenv(_BATCH, "10")
+    pytester.makeconftest(pathlib.Path(__file__).with_name("conftest.py").read_text())
+    pytester.makepyfile("""
+        import os
+
+        def test_sees_no_cap():
+            assert os.environ.get("AIRA_AITEST_BATCH_MAX_TESTS") is None
+    """)
+    pytester.runpytest().assert_outcomes(passed=1)
+
+
 @pytest.mark.parametrize("raw", [None, "1"])
 def test_batching_off_keeps_the_queue_and_the_wire_byte_identical(pytester, monkeypatch, capsys, raw):
     """S2, default byte-identity. Unset or 1: the queue is exactly the nodeid list,
     no chunk exists, no batching line prints, and every dispatch line is a bare
-    nodeid. Mutant: a JSON chunk line always (even for one item)."""
+    nodeid. The queue is built without the cutter at all. Mutants: a JSON chunk line
+    always (even for one item); cap 1 routed through _cut_chunks."""
     if raw is None:
         monkeypatch.delenv(_BATCH, raising=False)
     else:
         monkeypatch.setenv(_BATCH, raw)
     items = pytester.getitems(_FOUR_SHARERS)
     ids = [item.nodeid for item in items]
+
+    def no_cutter(*_args):
+        raise AssertionError("batching off must not cut")
+
+    monkeypatch.setattr(supervisor_module, "_cut_chunks", no_cutter)
     sup = Supervisor()
     sup.collect(items)
     assert list(sup.queue) == ids
     assert sup._chunks == {}
+    assert sup._chunk_lengths_cut == collections.Counter({1: 4})
     assert set(sup.reservation_need) == set(ids) == set(sup.cpu_need) == set(sup.time_cost)
     assert "aitest: batching" not in capsys.readouterr().out
     monkeypatch.setattr(sup, "_replace_worker", lambda: None)
@@ -4870,8 +4894,11 @@ def test_a_fail_fast_abort_names_the_unstarted_rest_of_another_workers_chunk(pyt
     assert sup._unevaluated_reasons[a] == "killed by the fail-fast abort (tripped by %s)" % leg
     for member in (b, c):
         assert sup._unevaluated_reasons[member] == (
-            "not started: the fail-fast abort (tripped by %s) stopped the pool" % leg
+            "no result before the fail-fast abort (tripped by %s) stopped the pool" % leg
         )
+    # The leg's unit ran 1; the killed chunk returned no result, so it counts as 0.
+    # Mutant: the abort leaves the killed unit out of the run-length histogram.
+    assert sup._chunk_lengths_run == collections.Counter({1: 1, 0: 1})
 
 
 def test_a_chunk_with_a_space_in_a_parametrised_nodeid_round_trips(pytester, monkeypatch):
@@ -5069,9 +5096,21 @@ def test_a_real_worker_lost_mid_chunk_reruns_only_the_lost_member_and_replays_ea
             os._exit(137)
 
     monkeypatch.setattr(worker_module, "_fault_after_events", fault)
+    measure = tmp_path / "e4-measure"
+    monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure))
     config = items[0].config
     sup = Supervisor(config=config)
     sup.collect(items)
+    # The precondition, asserted rather than assumed: when m3's loss is handled, its
+    # event lines are already staged with no result to confirm them.
+    staged_at_loss = []
+    real_handle_worker_exit = sup._handle_worker_exit
+
+    def handle_worker_exit(pid, state):
+        staged_at_loss.append((state["in_flight"], len(state["pending_events"])))
+        return real_handle_worker_exit(pid, state)
+
+    monkeypatch.setattr(sup, "_handle_worker_exit", handle_worker_exit)
     # A real junitxml plugin on the same hooks, so the XML itself is checked too.
     junit_path = tmp_path / "junit.xml"
     junit = LogXML(str(junit_path), None)
@@ -5107,6 +5146,26 @@ def test_a_real_worker_lost_mid_chunk_reruns_only_the_lost_member_and_replays_ea
     assert m3_props == [("ran_pid", str(retry_pid))], (first_pid, m3_props)
     err = capsys.readouterr().err
     assert "was lost while running item 3 of a chunk (%s)" % m3 in err, err
+    assert [(nodeid, staged > 0) for nodeid, staged in staged_at_loss] == [(m3, True)], staged_at_loss
+    report = _pool_report(measure)
+    assert report["batch_cap"] == 5
+    assert report["chunk_lengths_cut"] == {"5": 1}
+    # The chunk ran 2 before the loss; m3's retry and the requeued m4, m5 ran alone.
+    assert report["chunk_lengths_run"] == {"1": 3, "2": 1}
+    _assert_batching_report_honest(report)
+
+
+def _pool_report(measure):
+    (path,) = list(measure.glob("pool-report-*.json"))
+    with open(str(path), encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _assert_batching_report_honest(report):
+    """drain_s is a real reading; the stub's worker scopes are plain directories with no
+    memory.events, so the OOM count cannot be established and must not read 0."""
+    assert isinstance(report["drain_s"], (int, float)) and report["drain_s"] >= 0, report["drain_s"]
+    assert report.get("oom_group_kills", "unevaluated") == "unevaluated", report.get("oom_group_kills")
 
 
 def test_a_real_count_recycle_mid_chunk_requeues_the_rest_as_one_chunk(tmp_path, monkeypatch, pytester):
@@ -5119,6 +5178,8 @@ def test_a_real_count_recycle_mid_chunk_requeues_the_rest_as_one_chunk(tmp_path,
     monkeypatch.setenv(_BATCH, "3")
     monkeypatch.setenv("AIRA_AITEST_WORKER_MAX_TESTS", "4")
     log, body = _counting_module(tmp_path, 6)
+    measure = tmp_path / "e5-measure"
+    monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure))
     items = pytester.getitems(body)
     sup = Supervisor()
     sup.collect(items)
@@ -5131,3 +5192,79 @@ def test_a_real_count_recycle_mid_chunk_requeues_the_rest_as_one_chunk(tmp_path,
     per_pid = collections.Counter(pid for kind, _name, pid in events if kind == "ran")
     assert max(per_pid.values()) <= 4, per_pid
     assert sum(1 for kind, *_ in events if kind == "setup") == 3
+    report = _pool_report(measure)
+    assert report["batch_cap"] == 3
+    assert report["chunk_lengths_cut"] == {"3": 2}
+    # Chunk A whole; test 4 alone as the tripping member; [5, 6] requeued as one.
+    assert report["chunk_lengths_run"] == {"1": 1, "2": 1, "3": 1}
+    _assert_batching_report_honest(report)
+
+
+def test_a_fresh_measurement_directory_keeps_every_workers_fixture_and_memory_samples(tmp_path, monkeypatch, pytester):
+    """AIRA_AITEST_MEASURE_DIR naming a directory that does not exist yet: the
+    supervisor creates it before forking, so the workers' fixture-setup and memory
+    TSVs are written (their recorders swallow a missing directory silently). Daemon-
+    less fallback pool, real forked workers, batching off: three module setups and
+    three memory rows. Mutant: the pre-fork creation removed (no TSV at all)."""
+    monkeypatch.delenv("AIRA_AITEST_OUTER_SCOPE", raising=False)
+    monkeypatch.setenv("AIRA_AITEST_MAX_WORKERS_FALLBACK", "2")
+    measure = tmp_path / "not" / "yet" / "there"
+    monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure))
+    _log, body = _counting_module(tmp_path, 3)
+    items = pytester.getitems(body)
+    sup = Supervisor()
+    sup.collect(items)
+    results = sup.run(estimated_bytes=1 << 20, worker_count=2)
+    assert results == {item.nodeid: "passed" for item in items}
+    fixture_rows = [
+        line.split("\t")
+        for path in measure.glob("fixture-setup-*.tsv")
+        for line in path.read_text().splitlines()
+    ]
+    assert sum(1 for row in fixture_rows if row[1] == "shared") == 3, fixture_rows
+    memory_rows = [
+        line for path in measure.glob("worker-*.tsv") for line in path.read_text().splitlines()
+    ]
+    assert len(memory_rows) == 3, memory_rows
+
+
+def test_a_worker_lost_while_alive_is_killed_before_the_reap_wait(tmp_path, monkeypatch):
+    """A worker can be lost while still running (an invalid report batch, a mid-chunk
+    loss): _handle_worker_exit SIGKILLs it through its pidfd before retiring it, so
+    the single-threaded supervisor does not wait out the reap timeout while the
+    worker runs on. Mutant: no kill (the handler takes the full 30 s timeout)."""
+    monkeypatch.setenv("AIRA_AITEST_REAP_TIMEOUT", "30")
+    pid = os.fork()
+    if pid == 0:  # a live worker busy in a long test
+        try:
+            time.sleep(60)
+        finally:
+            os._exit(0)
+    sup = Supervisor()
+    monkeypatch.setattr(sup, "_replace_worker", lambda: None)
+    dispatch_read, state = _retirable_state(tmp_path)
+    state["grant"] = None
+    state["in_flight"] = "test_x.py::test_lost"
+    state["pidfd"] = os.pidfd_open(pid)
+    sup.workers[pid] = state
+    # Cleanup through a pidfd of our own: never a bare kill of a pid that may have
+    # been reaped (and reused) already.
+    guard = os.pidfd_open(pid)
+    started = time.monotonic()
+    try:
+        sup._handle_worker_exit(pid, state)
+        elapsed = time.monotonic() - started
+    finally:
+        os.close(dispatch_read)
+        try:
+            signal.pidfd_send_signal(guard, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        os.close(guard)
+    assert pid not in sup.workers
+    assert elapsed < 10, "the lost worker was not killed: %.1f s in the reap wait" % elapsed
+    assert sup.queue == ["test_x.py::test_lost"], "requeued once for its retry"

@@ -200,8 +200,9 @@ use (`grep -n "self\.queue"`):
 - `_fail_queue_terminal` (`:1402-1405`): mark every member unevaluated with the reason.
 - `_bootstrap_from_empty_pool` exceeds-ceiling (`:2996-3016`): remove the chunk, mark every member;
   the annotated/unannotated wording uses `members[0]` (uniform need implies uniform annotation).
-- `_abort_pool` (`:3422-3438`): besides the in-flight member, each `rest` member gets "not started:
-  the fail-fast abort (tripped by X) stopped the pool".
+- `_abort_pool` (`:3422-3438`): besides the in-flight member, each `rest` member gets "no result
+  before the fail-fast abort (tripped by X) stopped the pool" (not "not started": the worker begins
+  the next member as soon as it sends a result, before the supervisor reads it).
 - Nothing else reads entries as nodeids: `requeue_once` only inserts nodeids, and
   `_synthesize_unevaluated_reports` iterates `items_by_nodeid`.
 
@@ -567,6 +568,6 @@ folded into the build commit:
 | E4 seam signature unstated | **Applied** (E4): `worker._fault_after_events(nodeid)`, once per member after the event flush, both paths. |
 | "died" is wrong for a live worker whose report batch failed validation | **Applied** (5.4, S6): "was lost while running item k of a chunk". |
 
-Build note: E4 runs in-process with real forked workers and asserts on the reports replayed into the
-supervisor's own `pytest_runtest_logreport` hook (the hook junitxml listens on), not on a JUnit file,
-because it also asserts the supervisor's `attempts` map.
+Build note: E4 runs in-process with real forked workers, so it can assert the supervisor's
+`attempts` map, and checks both the reports replayed into the supervisor's own
+`pytest_runtest_logreport` hook and a JUnit file written by a real `LogXML` on the same hooks.
