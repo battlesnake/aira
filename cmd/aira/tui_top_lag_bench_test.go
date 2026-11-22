@@ -104,11 +104,13 @@ func newTopBenchRuntime(tb testing.TB) (*tuiRuntime, tcell.SimulationScreen, con
 	tb.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	screen := tcell.NewSimulationScreen("UTF-8")
-	if err := screen.Init(); err != nil {
-		tb.Fatal(err)
-	}
-	screen.SetSize(topBenchWidth, topBenchHeight)
 	runtime := newTopRuntime(ctx, &tuiSmokeDispatcher{started: make(chan struct{})}, nil, nil, nil, screen)
+	// AFTER the runtime: tview's SetScreen runs screen.Init(), which resets a
+	// simulation screen to 80x25, so a size set before it is silently lost.
+	screen.SetSize(topBenchWidth, topBenchHeight)
+	if width, height := screen.Size(); width != topBenchWidth || height != topBenchHeight {
+		tb.Fatalf("simulation screen is %dx%d, want %dx%d", width, height, topBenchWidth, topBenchHeight)
+	}
 	runtime.outerPages.SetRect(0, 0, topBenchWidth, topBenchHeight)
 	return runtime, screen, cancel
 }

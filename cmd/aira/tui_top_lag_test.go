@@ -10,10 +10,10 @@ import (
 
 // AIRA-374. A supervisor's argv can be 4 KB (a test runner handed every path),
 // and tview re-measures the full grapheme width of every visible cell on every
-// draw, which it does after EVERY keypress: nine such commands made one arrow key
-// cost ~17 ms of CPU. The cell is bounded to a width no terminal row reaches, the
-// cut is marked, and everything before it is kept, in both the live and the
-// queued rows and in both the COMMAND and DIRECTORY forms of the last column.
+// draw, which it does after EVERY keypress. The last column's text is bounded to
+// topCellMaxRunes input runes, the cut is marked, and everything before it is
+// kept, in both the live and the queued rows and in both the COMMAND and
+// DIRECTORY forms of the column.
 //
 // verifies: AIRA-374
 func TestTopLastColumnIsBoundedForADrawPerKeypress(t *testing.T) {
@@ -39,11 +39,23 @@ func TestTopLastColumnIsBoundedForADrawPerKeypress(t *testing.T) {
 	if got := topCommandCell(&exact); got != exact {
 		t.Fatalf("a command of exactly %d runes was changed", topCellMaxRunes)
 	}
-	// The bound applies BEFORE escaping, so a cut can never split an escape: a
-	// long argv of control characters still renders as visible escapes only.
+	// The bound applies to the INPUT runes, BEFORE either escaping step, so a cut
+	// can never split an escape: a long argv of control characters renders as
+	// exactly the first topCellMaxRunes of them, each as its whole visible escape.
+	// A cut taken after topPrintable, or after tview.Escape, lands inside a
+	// six-character '\x1b' and fails this.
 	hostile := strings.Repeat("\x1b", 2*topCellMaxRunes)
-	if got := topCommandCell(&hostile); strings.ContainsRune(got, '\x1b') || !strings.HasSuffix(got, "…") {
-		t.Fatalf("a long hostile argv lost its escaping or its cut mark")
+	if got, want := topCommandCell(&hostile), strings.Repeat(`'\x1b'`, topCellMaxRunes)+"…"; got != want {
+		t.Fatalf("hostile argv rendered as %d runes ending %q, want %d whole escapes plus the cut mark",
+			utf8.RuneCountInString(got), got[max(0, len(got)-20):], topCellMaxRunes)
+	}
+	// The bound counts runes, not bytes: a multibyte argv keeps exactly
+	// topCellMaxRunes whole characters. A byte cut splits a three-byte rune and
+	// shows a replacement escape instead.
+	wide := strings.Repeat("日本", topCellMaxRunes)
+	if got, want := topCommandCell(&wide), strings.Repeat("日本", topCellMaxRunes/2)+"…"; got != want {
+		t.Fatalf("multibyte argv rendered as %d runes ending %q, want %d whole runes plus the cut mark",
+			utf8.RuneCountInString(got), got[max(0, len(got)-20):], topCellMaxRunes)
 	}
 
 	live := topTestRecord("CONFINE-live-1-a@s", "live", 1<<30, 1<<29)
