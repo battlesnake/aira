@@ -341,13 +341,15 @@ cap c (AIRA_AITEST_BATCH_MAX_TESTS)". No flag, no ini key.
   assumed three columns change in the same commit: `pytest_aitest_measurement_e2e_test.go` (now
   requires four fields and a real private-memory reading) and `test_measurement_report.py`.
 - **Chunk lengths**: the cut histogram (from `collect()`) and the run lengths actually executed
-  (members run before a crash, recycle or end), in `pool-report-<pid>.json`.
+  (members run before a crash, recycle or end) of every dispatched unit, single tests included,
+  in `pool-report-<pid>.json`.
 - **Drain length**: wall time from the queue first becoming empty to the last worker's retirement.
 - **Peak per worker**: existing `memory.peak` (desktop) and the per-pid maximum of the fourth
   column, taken by the A/B harness from the TSVs (no supervisor change); `ru_maxrss` stays in the
   Gantt but is not used to judge memory (section 6).
 - **Crashes and OOMs**: count of worker crashes, of mid-chunk crashes (5.4), of OOM group kills,
-  and of unstarted members requeued.
+  and of unstarted members requeued. The OOM count is `unevaluated` when any retired worker's
+  `memory.events` could not settle it (no scope: ci-shim ledger-only, daemon-down fallback).
 
 ## 9. Rollout and A/B
 

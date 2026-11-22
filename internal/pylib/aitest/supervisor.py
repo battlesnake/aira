@@ -1259,6 +1259,8 @@ class Supervisor:
         self._worker_crashes = 0
         self._mid_chunk_crashes = 0
         self._unstarted_requeued = 0
+        # None (reported "unevaluated") from the first retired worker whose
+        # memory.events could not settle it: no scope, no grant, or no reading.
         self._oom_group_kills = 0
         self._queue_empty_wall_us = None
         self.workers = {}
@@ -2616,6 +2618,9 @@ class Supervisor:
             # and loses memory.peak (measured: pool-peak sample_count 1 -> 0). The
             # worker is reaped above, so memory.peak is already final here.
             self._observe_worker_usage(grant)
+        else:
+            # A daemon-down fallback worker has no scope: its OOM count is unknowable.
+            self._oom_group_kills = None
         # AIRA-259: record this worker's Gantt span BEFORE the scope is torn down
         # below (the cgroup peak cross-check needs the still-live scope), and
         # regardless of grant (a fallback/ledger-only worker still gets a span,
@@ -2661,6 +2666,7 @@ class Supervisor:
         """
         scope = grant.get("scope")
         if not scope:
+            self._oom_group_kills = None  # no memory.events to read: unsettled
             return
         self._pool_scoped_workers += 1
         # A REAL enforced grant carries the cap as a STRING (the worker-admit outcome
@@ -2685,6 +2691,9 @@ class Supervisor:
         scope_oom = _scope_oom_group_killed(scope)
         if scope_oom:
             self._pool_peak_oom = True
+        if scope_oom is None:
+            self._oom_group_kills = None
+        elif scope_oom and self._oom_group_kills is not None:
             self._oom_group_kills += 1
         # AIRA-230 v7-4: retain this worker's (peak, cap, oom, scope_path) for the
         # measurement report, ONLY when enabled. The cap is the converted memory_max
@@ -2956,7 +2965,7 @@ class Supervisor:
             "drain_s": honest(drain_s),
             "worker_crashes": self._worker_crashes,
             "mid_chunk_crashes": self._mid_chunk_crashes,
-            "oom_group_kills": self._oom_group_kills,
+            "oom_group_kills": honest(self._oom_group_kills),
             "unstarted_requeued": self._unstarted_requeued,
         }
 
@@ -3405,8 +3414,8 @@ class Supervisor:
                 self.attempts[promoted] = self.attempts.get(promoted, 0) + 1
                 state["chunk_pos"] = state.get("chunk_pos", 1) + 1
             else:
-                if state.get("chunk_id") is not None:
-                    self._chunk_lengths_run[state["chunk_pos"]] += 1
+                # Every dispatched unit, chunk or single (spec 8: what actually ran).
+                self._chunk_lengths_run[state.get("chunk_pos", 1)] += 1
                 state["in_flight"] = None
                 # The one reset that keeps an idle worker's death from reading as a
                 # mid-chunk crash (_handle_worker_exit keys on chunk_pos > 1).
@@ -3664,8 +3673,9 @@ class Supervisor:
                 "%d earlier items had run with shared fixtures alive; retrying it alone\n"
                 % (pid, chunk_pos, nodeid, chunk_pos - 1)
             )
-        if nodeid is not None and state.get("chunk_id") is not None:
-            self._chunk_lengths_run[chunk_pos - 1] += 1  # members that completed
+        if nodeid is not None:
+            # Members of this unit (chunk or single) that completed before the loss.
+            self._chunk_lengths_run[max(chunk_pos - 1, 0)] += 1
         rest = state.get("rest") or ()
         # BEFORE _retire_worker, which removes the scope directory
         # (_forget_worker_scope's os.rmdir): once it is gone the evidence for

@@ -166,6 +166,10 @@ the start: `aitest: batching: N tests in K chunks, cap c (AIRA_AITEST_BATCH_MAX_
   `unevaluated`); `pool-report-<pid>.json` adds `batch_cap`,
   `chunk_lengths_cut`, `chunk_lengths_run`, `drain_s`, `worker_crashes`,
   `mid_chunk_crashes`, `oom_group_kills` and `unstarted_requeued`.
+  `chunk_lengths_run` counts every dispatched unit, single tests included (a
+  unit lost before its first result counts as 0). `oom_group_kills` reads
+  `unevaluated` when any worker's `memory.events` could not settle it (no
+  cgroup scope on ci-shim or the daemon-down fallback, or an unreadable file).
 
 Design and the A/B plan before the default changes:
 [`docs/superpowers/specs/2026-11-22-aitest-fixture-batching-design.md`](../../../docs/superpowers/specs/2026-11-22-aitest-fixture-batching-design.md).

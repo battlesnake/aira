@@ -4438,7 +4438,10 @@ sys.stdin.buffer.read()
 
 import collections
 import io
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
+
+from _pytest.junitxml import LogXML
 
 import aitest.worker as worker_module
 from aitest.supervisor import _cut_chunks, _resolve_batch_cap
@@ -4575,6 +4578,37 @@ def test_collect_cuts_on_markers_and_registers_chunk_ids_with_shared_needs(pytes
     assert sup._time_for(chunk_id) == sup._time_for(ids[0])
     assert chunk_id not in sup.items_by_nodeid and chunk_id.startswith("\x01")
     assert "aitest: batching: 5 tests in 4 chunks, cap 10 (AIRA_AITEST_BATCH_MAX_TESTS)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("marker, need_reader, value", [
+    ("aira_cpu(2)", "_cpu_need_for", 2),
+    ("aira_time(5)", "_time_for", 5),
+])
+def test_collect_cuts_where_only_the_cpu_or_time_mark_changes(pytester, monkeypatch, marker, need_reader, value):
+    """S1 at collect(): two pairs in one module that differ ONLY in aira_cpu (or only in
+    aira_time) are two chunks, and the second chunk carries its members' mark. A chunk
+    is sized by its head, so a merged chunk would run a 2-core member under a 1-core
+    reservation. Mutant: cpu (or time) replaced by a constant in collect()'s cut key."""
+    monkeypatch.setenv(_BATCH, "10")
+    items = pytester.getitems("""
+        import pytest
+
+        def test_a(): pass
+        def test_b(): pass
+
+        @pytest.mark.%s
+        def test_c(): pass
+
+        @pytest.mark.%s
+        def test_d(): pass
+    """ % (marker, marker))
+    sup = Supervisor()
+    sup.collect(items)
+    ids = [item.nodeid for item in items]
+    assert list(sup._chunks.values()) == [ids[:2], ids[2:]]
+    first, second = list(sup.queue)
+    assert getattr(sup, need_reader)(first) == 1
+    assert getattr(sup, need_reader)(second) == value
 
 
 def _idle_worker(sup):
@@ -4872,6 +4906,73 @@ def test_only_a_chunk_head_carries_a_dispatch_wait_measurement(pytester, monkeyp
     assert sup._chunk_lengths_run == collections.Counter({3: 1})
 
 
+def test_the_run_length_histogram_counts_singles_and_crashed_units(pytester, monkeypatch):
+    """Spec 8: the run lengths actually executed, one entry per dispatched unit, chunk or
+    single: [a,b,c] runs whole (3), the single d is lost before its result (0 ran),
+    and d's retry runs alone (1). At cap 1 every test is a unit of 1. Mutant: count
+    only units that carry a chunk id (singles and single retries vanish)."""
+    sup, ids, _replaced = _batched_sup(pytester, monkeypatch, 3)
+    a, b, c, d = ids
+    assert list(sup._chunks.values()) == [[a, b, c]]
+    worker = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    _send(sup, worker, "%s passed" % a, "%s passed" % b, "%s passed" % c)
+    sup._dispatch_to_idle_workers()
+    assert worker.state["in_flight"] == d
+    _send(sup, worker, eof=True)
+    retry = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    _send(sup, retry, "%s passed" % d)
+    assert sup.results == {n: "passed" for n in ids}
+    assert sup._chunk_lengths_run == collections.Counter({3: 1, 0: 1, 1: 1})
+
+    off, ids, _replaced = _batched_sup(pytester, monkeypatch, 1)
+    worker = _idle_worker(off)
+    for nodeid in ids:
+        off._dispatch_to_idle_workers()
+        _send(off, worker, "%s passed" % nodeid)
+    os.close(worker.dispatch_read)
+    assert off._chunk_lengths_run == collections.Counter({1: 4})
+
+
+def _oom_group_kills_reported(tmp_path, monkeypatch, grants):
+    """Retire one worker per grant through the real _retire_worker, emit the
+    measurement report, and return its oom_group_kills field."""
+    measure = tmp_path / ("measure-%d" % len(list(tmp_path.glob("measure-*"))))
+    monkeypatch.setenv("AIRA_AITEST_MEASURE_DIR", str(measure))
+    sup = Supervisor()
+    for index, grant in enumerate(grants):
+        pid = 999930 + index
+        dispatch_read, state = _retirable_state(tmp_path)
+        state["grant"] = grant
+        sup.workers[pid] = state
+        sup._retire_worker(pid, state)
+        os.close(dispatch_read)
+    sup._emit_measurement_report()
+    with open(str(measure / ("pool-report-%d.json" % os.getpid())), encoding="utf-8") as handle:
+        return json.load(handle)["oom_group_kills"]
+
+
+def test_the_oom_group_kill_count_is_unevaluated_unless_every_worker_settled_it(tmp_path, monkeypatch):
+    """Spec 8's OOM count feeds the default-flip rule (spec 9), so a worker whose
+    memory.events could not settle it -- no scope (ledger-only ci-shim grant), no grant
+    (daemon-down fallback), or an unreadable file -- makes the count "unevaluated",
+    never a fabricated 0. Mutants: the increment deleted (the counted kill reads 0);
+    the unsettled flag never set (the scope-less pools read 0)."""
+    def scoped(name, kill):
+        return {"scope": str(_worker_scope(tmp_path, name, peak=1024, oom_group_kill=kill)),
+                "memory_max": "104857600", "worker_id": "1"}
+
+    assert _oom_group_kills_reported(tmp_path, monkeypatch, [scoped("k1", 1), scoped("k0", 0)]) == 1
+    assert _oom_group_kills_reported(tmp_path, monkeypatch, [scoped("z0", 0)]) == 0
+    assert _oom_group_kills_reported(
+        tmp_path, monkeypatch, [scoped("s0", 0), {"scope": "", "memory_max": "104857600", "worker_id": "2"}]
+    ) == "unevaluated"
+    assert _oom_group_kills_reported(tmp_path, monkeypatch, [scoped("f0", 0), None]) == "unevaluated"
+    unreadable = {"scope": str(_worker_scope(tmp_path, "no-events", peak=1024)), "memory_max": "104857600"}
+    assert _oom_group_kills_reported(tmp_path, monkeypatch, [scoped("u1", 1), unreadable]) == "unevaluated"
+
+
 # --- end to end, real forked workers ------------------------------------------------
 
 def _stub_admission(tmp_path, monkeypatch):
@@ -4911,6 +5012,8 @@ def _counting_module(tmp_path, count):
         body += f"""
         def test_m{index}(shared, request):
             _note("ran", request.node.name)
+            # The attempt's own mark, carried in its reports (and JUnit properties).
+            request.node.user_properties.append(("ran_pid", os.getpid()))
     """
     return log, body
 
@@ -4942,8 +5045,11 @@ def test_a_real_worker_lost_mid_chunk_reruns_only_the_lost_member_and_replays_ea
     passing result; m1, m2, m4, m5 ran once and m3 twice; attempts are
     {m1:1, m2:1, m3:2, m4:1, m5:1}; the replayed reports (what junitxml receives)
     hold exactly one testcase's worth per nodeid, m3's from its retry only; the S6
-    line appears. Mutants: staged events replayed on arrival or on crash (m3 twice);
-    promotion off by one; rest dropped; m1/m2 replayed twice."""
+    line appears. Each attempt marks its reports with its pid, so m3's replayed reports
+    and its JUnit testcase must carry the retry's mark. Mutants: staged events replayed
+    on arrival or on crash (m3 twice); promotion off by one; rest dropped; m1/m2
+    replayed twice; m3's staged first-attempt reports replayed in place of its retry's
+    (right count, wrong attempt)."""
     _stub_admission(tmp_path, monkeypatch)
     monkeypatch.setenv(_BATCH, "5")
     monkeypatch.delenv("AIRA_AITEST_WORKER_MAX_TESTS", raising=False)
@@ -4963,10 +5069,20 @@ def test_a_real_worker_lost_mid_chunk_reruns_only_the_lost_member_and_replays_ea
             os._exit(137)
 
     monkeypatch.setattr(worker_module, "_fault_after_events", fault)
-    sup = Supervisor(config=items[0].config)
+    config = items[0].config
+    sup = Supervisor(config=config)
     sup.collect(items)
-    with _replay_spy(items[0].config) as spy:
-        results = sup.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+    # A real junitxml plugin on the same hooks, so the XML itself is checked too.
+    junit_path = tmp_path / "junit.xml"
+    junit = LogXML(str(junit_path), None)
+    config.pluginmanager.register(junit, name="aitest-e4-junit")
+    junit.pytest_sessionstart()
+    try:
+        with _replay_spy(config) as spy:
+            results = sup.run(estimated_bytes=100 * (1 << 20), worker_count=1)
+        junit.pytest_sessionfinish()
+    finally:
+        config.pluginmanager.unregister(junit)
     assert results == {nodeid: "passed" for nodeid in ids}
     ran = collections.Counter(name for kind, name, _pid in _events(log) if kind == "ran")
     assert ran == {"test_m1": 1, "test_m2": 1, "test_m3": 2, "test_m4": 1, "test_m5": 1}
@@ -4976,6 +5092,19 @@ def test_a_real_worker_lost_mid_chunk_reruns_only_the_lost_member_and_replays_ea
     assert collections.Counter(n for n, _loc in spy.logstarts) == {n: 1 for n in ids}
     m3_pids = [pid for kind, name, pid in _events(log) if kind == "ran" and name == "test_m3"]
     assert len(set(m3_pids)) == 2, "m3's retry ran in a fresh worker"
+    # Provenance, not just cardinality: each attempt marks its reports with its own
+    # pid, so m3's replayed reports and its JUnit testcase must carry the RETRY's pid
+    # (the log's second m3 line) and never the lost first attempt's.
+    first_pid, retry_pid = int(m3_pids[0]), int(m3_pids[1])
+    m3_marks = {
+        r.when: [value for name, value in r.user_properties if name == "ran_pid"]
+        for r in spy.reports if r.nodeid == m3
+    }
+    assert m3_marks == {"setup": [], "call": [retry_pid], "teardown": [retry_pid]}, (first_pid, m3_marks)
+    cases = {case.get("name"): case for case in ET.parse(str(junit_path)).getroot().iter("testcase")}
+    assert sorted(cases) == ["test_m%d" % i for i in range(1, 6)]
+    m3_props = [(p.get("name"), p.get("value")) for p in cases["test_m3"].iter("property")]
+    assert m3_props == [("ran_pid", str(retry_pid))], (first_pid, m3_props)
     err = capsys.readouterr().err
     assert "was lost while running item 3 of a chunk (%s)" % m3 in err, err
 
