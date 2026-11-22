@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-374","project":"aira","title":"aira top is laggy under load: profile the per-tick path (list decode, view model, render) and fix the hot spot","status":"planned","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-374","project":"aira","title":"aira top is laggy under load: profile the per-tick path (list decode, view model, render) and fix the hot spot","status":"done","kind":"bug","severity":"P2","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
 ---
 Owner 2026-11-22: 'aira top is incredibly laggy now.' Evidence at the time: load average 75-87 on 16 cores, CPU PSI some avg10 74%; confine --list --json takes 56 ms wall (daemon is fast); the aira top process used about 8% CPU, all user time (40 ticks in 5 s), sys near 0, on a 72 KB list reply of 27 running + 4 queued rows whose command strings run up to 4096 bytes. Needs: a committed benchmark of the per-tick path on a recorded reply, a bisect against earlier commits (88193837 AIRA-361 lane display, 798af794 AIRA-368 supervisor argv) to see whether it regressed, and the fix (candidates: wide-string width/truncation work on 4 KB commands each frame, per-tick allocation/GC, re-render on every tick when nothing changed, input handling blocked behind render).
 

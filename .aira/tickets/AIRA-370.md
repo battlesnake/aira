@@ -1,5 +1,5 @@
 ---
-{"schema":1,"id":"AIRA-370","project":"aira","title":"admission wait diagnosis: say WHICH gate holds a queued job (RAM ledger, ceiling cut, CPU slots, VRAM, behind head, exclusive, restart freeze) in the confine wait line, 'aira top' queued rows and confine --list, plus the box CPU load as context","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-370","project":"aira","title":"admission wait diagnosis: say WHICH gate holds a queued job (RAM ledger, ceiling cut, CPU slots, VRAM, behind head, exclusive, restart freeze) in the confine wait line, 'aira top' queued rows and confine --list, plus the box CPU load as context","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
 ---
 Owner 2026-11-22: 'aira top's wait message: yes, be detailed.'
 

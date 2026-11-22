@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-376","project":"aira","title":"AIRA-372 review nits: strict pool-report key assertion, README concurrency sentence, singles-pre-check mutant, 'in 1 chunks' wording","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
+---
+Nits left after AIRA-372 final verification (all P3): test_supervisor.py ~5168 uses report.get('oom_group_kills','unevaluated'): index directly so a missing key fails; add a test that fails if single-item units are pre-checked (remove the n>=2 guard in worker.py and nothing fails today); 'retrying it alone' wording after a fail-fast abort; 'in 1 chunks' plural; README sentence on concurrency at caps near the worker count; a lost worker on a host without pidfds is still not killed up front (documented gap, supervisor.py ~3702). Also open: RANT-161 (confine-log --follow reported outcome-unknown for a job that finished with exit 0).
