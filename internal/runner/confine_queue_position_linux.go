@@ -227,20 +227,24 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	// front command is withheld for it.
 	pushable := position.ceilingBytes <= 0 || position.resolvedReserve <= position.ceilingBytes
 	where := fmt.Sprintf(", %d of %d queued", position.position, position.queued)
-	tail := confineOwnReserveNote(position, clientReserve) + exclusiveNote + confineBoxCPUNote(position)
+	own, boxCPU := confineOwnReserveNote(position, clientReserve), confineBoxCPUNote(position)
 	// AIRA-370. The daemon's own diagnosis, when it sent one, is the ONE reason
-	// clause: it replaces the lane clause and the ceiling clause (which it
-	// carries itself when, and only when, the cut is part of why this job
-	// waits), and a RAM diagnosis carries the booked figures in place of the
+	// clause: it replaces the lane clause, the ceiling clause (which it carries
+	// itself when, and only when, the cut is part of why this job waits) and the
+	// exclusive clause (said only when exclusivity is the gate, where it names
+	// the job), and a RAM diagnosis carries the booked figures in place of the
 	// granted clause. An older daemon sends none and gets today's clauses.
-	if diagnosis, ram, ok := confineDiagnosisNote(position); ok {
-		held := confineHeldNote(position)
-		if ram {
+	if diagnosis, gate, ok := confineDiagnosisNote(position); ok {
+		held, exclusive := confineHeldNote(position), ""
+		switch gate {
+		case ConfineBlockedRAM:
 			held = ""
+		case ConfineBlockedExclusive:
+			exclusive = exclusiveNote
 		}
-		return where + diagnosis + held + tail, pushable
+		return where + diagnosis + held + own + exclusive + boxCPU, pushable
 	}
-	return where + confineLaneNote(position) + confineHeldNote(position) + pressure + tail, pushable
+	return where + confineLaneNote(position) + confineHeldNote(position) + pressure + own + exclusiveNote + boxCPU, pushable
 }
 
 // confineCeilingCutNote names WHY the RAM ceiling is cut, from the basis
@@ -261,28 +265,29 @@ func confineCeilingCutNote(position confineQueuePosition) string {
 }
 
 // confineDiagnosisNote renders the daemon's AIRA-370 wait diagnosis as one
-// clause, and whether it is a RAM diagnosis (which then states the booked
-// figures itself). ok is false when the daemon sent no token this binary
-// knows: the caller then prints today's clauses rather than a guess.
+// clause, and the gate it names: the winning token in precedence order
+// (ConfineBlockedRAM when RAM is among the resources, which then states the
+// booked figures itself). ok is false when the daemon sent no token this
+// binary knows: the caller then prints today's clauses rather than a guess.
 //
 // `cpu` is the admission SLOT ledger (declared cores against slots-per-core x
 // cores), never the machine's CPU load, and the clause says so; the load is the
 // separate box-CPU note.
-func confineDiagnosisNote(position confineQueuePosition) (string, bool, bool) {
+func confineDiagnosisNote(position confineQueuePosition) (string, string, bool) {
 	known := map[string]bool{}
 	for _, token := range position.blockedBy {
 		known[token] = true
 	}
 	switch {
 	case known[ConfineBlockedRestartFreeze]:
-		return ", new admissions paused while the restarted daemon re-registers running jobs", false, true
+		return ", new admissions paused while the restarted daemon re-registers running jobs", ConfineBlockedRestartFreeze, true
 	case known[ConfineBlockedExclusive]:
 		if position.exclusiveState != "" {
-			return "", false, true // the exclusive clause names the job
+			return "", ConfineBlockedExclusive, true // the exclusive clause names the job
 		}
-		return ", held for an exclusive job", false, true
+		return ", held for an exclusive job", ConfineBlockedExclusive, true
 	case known[ConfineBlockedHead]:
-		return ", fits but held behind the head of the queue", false, true
+		return ", fits but held behind the head of the queue", ConfineBlockedHead, true
 	}
 	var parts []string
 	if known[ConfineBlockedRAM] {
@@ -316,9 +321,16 @@ func confineDiagnosisNote(position confineQueuePosition) (string, bool, bool) {
 		parts = append(parts, "GPU memory (VRAM)")
 	}
 	if len(parts) == 0 {
-		return "", false, false
+		return "", "", false
 	}
-	return ", waiting for " + strings.Join(parts, "; "), known[ConfineBlockedRAM], true
+	gate := ConfineBlockedCPU
+	switch {
+	case known[ConfineBlockedRAM]:
+		gate = ConfineBlockedRAM
+	case !known[ConfineBlockedCPU]:
+		gate = ConfineBlockedVRAM
+	}
+	return ", waiting for " + strings.Join(parts, "; "), gate, true
 }
 
 // confineBoxCPUNote is the machine's CPU load as context (AIRA-370): printed

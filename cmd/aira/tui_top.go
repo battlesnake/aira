@@ -834,9 +834,12 @@ func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int) table
 // ahead of every high one, and its freeze is the stronger fact. "high"
 // (AIRA-340) marks a `--priority high` launch, so misuse of the flag is visible
 // to every session watching the queue. The reason follows either, never
-// instead of it ("high, ram"): AIRA-370's wait diagnosis (topBlockedReason)
-// when the daemon sent one, else (an older daemon) AIRA-361's lane reason
-// (topLaneReason). A row with neither reads as plain "queued".
+// instead of it ("high, ram"): AIRA-361's small-job lane verdict, then
+// AIRA-370's wait diagnosis (topBlockedReason), the gate that finally held the
+// job ("lane full, ram": the lane did not take it, then the walk found no
+// RAM). An older daemon sends no diagnosis and gets AIRA-361's lane reason
+// alone (topLaneReason, which also says "behind head"). A row with neither
+// reads as plain "queued".
 func topQueuedState(record runner.ConfineRecord) string {
 	head := ""
 	switch {
@@ -846,8 +849,11 @@ func topQueuedState(record runner.ConfineRecord) string {
 		head = "high"
 	}
 	reason := topBlockedReason(record)
-	if reason == "" {
+	switch lane := topLaneWord(record.LaneWait); {
+	case reason == "":
 		reason = topLaneReason(record)
+	case lane != "":
+		reason = lane + ", " + reason
 	}
 	switch {
 	case head != "" && reason != "":
@@ -895,7 +901,13 @@ func topLaneReason(record runner.ConfineRecord) string {
 	if record.HeldByHead {
 		return "behind head"
 	}
-	switch record.LaneWait {
+	return topLaneWord(record.LaneWait)
+}
+
+// topLaneWord is the lane's own verdict in plain words ("" for none or an
+// unknown token). "no-room" comes only from a daemon older than AIRA-370.
+func topLaneWord(laneWait string) string {
+	switch laneWait {
 	case "full":
 		return "lane full"
 	case "kept":

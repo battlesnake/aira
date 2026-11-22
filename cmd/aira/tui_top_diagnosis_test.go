@@ -10,12 +10,15 @@ import (
 	"aira/internal/runner"
 )
 
-// verifies: AIRA-370 — a queued row's LIVE cell names the daemon's wait
-// diagnosis in place of the lane reason, after pushed/high, in the daemon's
-// token order; "cpu slots", never a bare "cpu" that reads as load. A row with
-// no diagnosis (an older daemon) keeps the lane reason, and an unknown token
-// names nothing. Mutations: append the lane reason beside the diagnosis (the
-// "lane full ignored" row goes red); map cpu to "cpu"; drop the fallback.
+// verifies: AIRA-370 — a queued row's LIVE cell names the lane's verdict and
+// then the daemon's wait diagnosis, after pushed/high, in the daemon's token
+// order; "cpu slots", never a bare "cpu" that reads as load; "behind head" once
+// (the diagnosis carries it, the lane reason's copy is not repeated). A row
+// with no diagnosis (an older daemon) keeps the lane reason alone, and an
+// unknown token names nothing. Mutations: drop the lane word beside a
+// diagnosis (the "lane full, ram" rows go red); prefix topLaneReason instead
+// of the lane word ("behind head, behind head"); map cpu to "cpu"; drop the
+// fallback.
 func TestTopQueuedRowNamesTheWaitDiagnosis(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -30,10 +33,13 @@ func TestTopQueuedRowNamesTheWaitDiagnosis(t *testing.T) {
 		{"cpu slots", []string{"cpu"}, "", false, "", "cpu slots"},
 		{"all resources", []string{"ram", "ceiling-cut", "cpu", "vram"}, "", false, "", "ram, ceiling cut, cpu slots, vram"},
 		{"behind head", []string{"head"}, "", true, "", "behind head"},
+		{"kept back, behind head", []string{"head"}, "kept", true, "", "kept back, behind head"},
 		{"exclusive", []string{"exclusive"}, "", false, "", "exclusive"},
 		{"freeze", []string{"restart-freeze"}, "", false, "", "freeze"},
-		{"lane full ignored", []string{"ram"}, "full", false, "", "ram"},
+		{"lane full, ram", []string{"ram"}, "full", false, "", "lane full, ram"},
+		{"behind push, cpu slots", []string{"cpu"}, "pushed", false, "", "behind push, cpu slots"},
 		{"high first", []string{"cpu"}, "", false, runner.ConfinePriorityHigh, "high, cpu slots"},
+		{"high, lane full, ram", []string{"ram", "ceiling-cut"}, "full", false, runner.ConfinePriorityHigh, "high, lane full, ram, ceiling cut"},
 		{"older daemon: lane reason", nil, "full", false, "", "lane full"},
 		{"unknown token: lane reason", []string{"someday"}, "kept", false, "", "kept back"},
 		{"unknown token alone", []string{"someday"}, "", false, "", "queued"},

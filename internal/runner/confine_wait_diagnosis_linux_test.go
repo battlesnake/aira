@@ -90,6 +90,39 @@ func TestConfineWaitDiagnosisExclusiveIsSaidOnce(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-370 — the exclusive clause is the exclusive DIAGNOSIS's
+// wording, not an extra clause: when another gate wins the precedence (the
+// restart freeze over a drain, a resource for the drain head on a provably
+// empty slice) the line names that gate alone. An older daemon (no diagnosis)
+// keeps today's exclusive clause. Mutation: append the exclusive clause
+// whatever the diagnosis (the freeze and ram rows go red); drop it from the
+// fallback (the older-daemon row goes red).
+func TestConfineWaitDiagnosisNamesExclusivityOnlyWhenItIsTheGate(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		blocked []string
+		want    string
+	}{
+		{"restart freeze over a drain", []string{ConfineBlockedRestartFreeze},
+			", 2 of 4 queued, new admissions paused while the restarted daemon re-registers running jobs, 46592M of 46694M granted"},
+		{"ram for the drain head", []string{ConfineBlockedRAM},
+			", 2 of 4 queued, waiting for RAM: 46592M of 46694M booked"},
+		{"exclusive", []string{ConfineBlockedExclusive},
+			`, 2 of 4 queued, 46592M of 46694M granted, slice draining for exclusive job "bench" (s1)`},
+		{"older daemon", nil,
+			`, 2 of 4 queued, small-job lane full, 46592M of 46694M granted, ceiling cut to keep system free memory (MemAvailable 44544M), slice draining for exclusive job "bench" (s1)`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reserve := diagReserve(2, test.blocked...)
+			reserve.Exclusive = &ConfineExclusiveState{State: "draining", Name: "bench", Owner: "s1"}
+			reserve.CPUPressureSomeAvg10 = nil
+			if note := queueNoteFor(t, 0, reserve); note != test.want {
+				t.Fatalf("note\n got %q\nwant %q", note, test.want)
+			}
+		})
+	}
+}
+
 // verifies: AIRA-370 — figures the daemon did not establish are never
 // fabricated: an unestablished ledger or an absent slot ceiling names the
 // resource without numbers (no "0M", no "0 of 0").

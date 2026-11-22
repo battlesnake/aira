@@ -230,9 +230,10 @@ func TestAdmitDiagnosisIsClearedEveryPassAndAbsentWhenUnevaluated(t *testing.T) 
 
 // verifies: AIRA-370 — the snapshot publishes the diagnosis lane on or off: on
 // each queued entry and on the AIRA-24 probe's own waiter, from the same locked
-// walk, beside the CPU slot ledger's booked total. Mutations: gate the copy on
-// laneOn (the lane-off run reads nil); take the probe's tokens from another
-// waiter.
+// walk, beside the CPU slot ledger's booked total. Two waiters with different
+// diagnoses, each probed by its own scope id, so a copy taken from the wrong
+// waiter is seen. Mutations: gate the copy on laneOn (the lane-off run reads
+// nil); take the probe's or an entry's tokens from the first queued waiter.
 func TestAdmitDiagnosisSnapshot(t *testing.T) {
 	for _, lane := range []bool{false, true} {
 		now := time.Unix(370500, 0)
@@ -244,16 +245,27 @@ func TestAdmitDiagnosisSnapshot(t *testing.T) {
 		lease := laneLease(1, 1000*mib)
 		lease.cpu = 64
 		cpuWaiter := laneJob(2, 2000*mib, now)
-		queue := queueOf(server, lease, cpuWaiter)
+		// room 45056 − H(3) − 1000 = 41864: too small for 44000, and no slot.
+		bothWaiter := laneJob(3, 44000*mib, now)
+		queue := queueOf(server, lease, cpuWaiter, bothWaiter)
 		server.admitQueue = queue
 		server.evaluateAdmitQueue(queue)
 
-		snapshot := server.admitSliceSnapshotFor("/slice", cpuWaiter.scopeID)
-		if !reflect.DeepEqual(snapshot.queuedBlockedBy, []string{"cpu"}) {
-			t.Fatalf("lane=%v probe blocked_by=%v, want [cpu]", lane, snapshot.queuedBlockedBy)
+		want := map[string][]string{cpuWaiter.scopeID: {"cpu"}, bothWaiter.scopeID: {"ram", "cpu"}}
+		var snapshot admitSnapshot
+		for scopeID, tokens := range want {
+			snapshot = server.admitSliceSnapshotFor("/slice", scopeID)
+			if !reflect.DeepEqual(snapshot.queuedBlockedBy, tokens) {
+				t.Fatalf("lane=%v probe %s blocked_by=%v, want %v", lane, scopeID, snapshot.queuedBlockedBy, tokens)
+			}
 		}
-		if len(snapshot.queuedEntries) != 1 || !reflect.DeepEqual(snapshot.queuedEntries[0].BlockedBy, []string{"cpu"}) {
+		if len(snapshot.queuedEntries) != 2 {
 			t.Fatalf("lane=%v entries=%+v", lane, snapshot.queuedEntries)
+		}
+		for _, entry := range snapshot.queuedEntries {
+			if !reflect.DeepEqual(entry.BlockedBy, want[entry.ScopeID]) {
+				t.Fatalf("lane=%v entry %s blocked_by=%v, want %v", lane, entry.ScopeID, entry.BlockedBy, want[entry.ScopeID])
+			}
 		}
 		if snapshot.cpuOutstanding != 64 {
 			t.Fatalf("cpuOutstanding=%d, want 64", snapshot.cpuOutstanding)

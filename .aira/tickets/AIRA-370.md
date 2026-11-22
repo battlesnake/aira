@@ -22,3 +22,8 @@ No admission decision changes (display and diagnosis only). Shortest-job-first o
 
 ## Simplify
 Reuse admitFit, ceilingBasis, the AIRA-24 probe reply; no new verb, no extra round trip. Delete the conflated `no-room` wording if the new token subsumes it.
+
+## Build decisions (review round 1)
+- Lane reason and diagnosis together in `aira top` (item 4 as written): the LIVE cell reads the lane's verdict, then the gate that finally held the job (`lane full, ram`, `kept back, behind head`). The wait line keeps ONE diagnosis clause. laneWait is kept rather than retired: it is the only fact saying why a small job did not skip the queue, which the diagnosis (always the main walk's final gate) cannot say.
+- The exclusive clause on the wait line is said only when exclusivity is the diagnosed gate; an older daemon keeps today's clauses.
+- Display-only evidence: `docs/dev/aira-370-mutation-check.py` removes or alters the diagnosis and runs the whole daemon package; only the named diagnosis tests may go red.
