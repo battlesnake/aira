@@ -967,6 +967,11 @@ def _resolve_batch_cap():
     return min(cap, max(1, _env_int("AIRA_AITEST_WORKER_MAX_TESTS", _DEFAULT_MAX_TESTS)))
 
 
+def _count_of(count, noun):
+    """'1 chunk', '2 chunks': a count with its noun in the right number."""
+    return "%d %s%s" % (count, noun, "" if count == 1 else "s")
+
+
 def _cut_chunks(items, key_of, cap):
     """AIRA-372 (spec 4.2): cut `items`, in their final order, into lists of
     consecutive nodeids. A segment is a maximal run with equal key_of(item) =
@@ -1609,8 +1614,8 @@ class Supervisor:
         self._failfast = failfast
         if cap > 1:
             print(
-                "aitest: batching: %d tests in %d chunks, cap %d (%s)"
-                % (len(items), len(queue), cap, _BATCH_ENV)
+                "aitest: batching: %s in %s, cap %d (%s)"
+                % (_count_of(len(items), "test"), _count_of(len(queue), "chunk"), cap, _BATCH_ENV)
             )
 
     def next_nodeid(self):
@@ -3681,10 +3686,20 @@ class Supervisor:
             # too. chunk_pos > 1 implies in_flight is set, because chunk_pos is
             # reset to 0 wherever in_flight is cleared.
             self._mid_chunk_crashes += 1
+            # AIRA-376: after a fail-fast trip (an earlier result in this same drain
+            # pass) the pool is about to be aborted, so the member is not retried.
+            if self.failfast_triggered is not None:
+                then = "not retrying it: the fail-fast abort (tripped by %s) stops the pool" % (
+                    self.failfast_triggered,
+                )
+            else:
+                then = "retrying it alone"
+            earlier = chunk_pos - 1
             sys.stderr.write(
                 "aira aitest: worker %d was lost while running item %d of a chunk (%s); "
-                "%d earlier items had run with shared fixtures alive; retrying it alone\n"
-                % (pid, chunk_pos, nodeid, chunk_pos - 1)
+                "%s had run with shared fixtures alive; %s\n"
+                % (pid, chunk_pos, nodeid,
+                   _count_of(earlier, "earlier item"), then)
             )
         if nodeid is not None:
             # Members of this unit (chunk or single) that completed before the loss.
