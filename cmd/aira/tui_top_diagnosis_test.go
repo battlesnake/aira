@@ -41,7 +41,7 @@ func TestTopQueuedRowNamesTheWaitDiagnosis(t *testing.T) {
 		{"behind head", []string{"head"}, "", true, "", "behind head"},
 		{"kept back, behind head", []string{"head"}, "kept", true, "", "kept back, behind head"},
 		{"exclusive", []string{"exclusive"}, "", false, "", "exclusive"},
-		{"freeze", []string{"restart-freeze"}, "", false, "", "freeze"},
+		{"daemon restart", []string{"restart-freeze"}, "", false, "", "daemon restart"},
 		{"lane full, ram", []string{"ram"}, "full", false, "", "lane full, ram"},
 		{"behind push, cpu slots", []string{"cpu"}, "pushed", false, "", "behind push, cpu slots"},
 		{"high first", []string{"cpu"}, "", false, runner.ConfinePriorityHigh, "high, cpu slots"},

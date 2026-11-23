@@ -255,8 +255,11 @@ func TestAdmitDiagnosisIsClearedEveryPassAndAbsentWhenUnevaluated(t *testing.T) 
 // each queued entry and on the AIRA-24 probe's own waiter, from the same locked
 // walk, beside the CPU slot ledger's booked total. Two waiters with different
 // diagnoses, each probed by its own scope id, so a copy taken from the wrong
-// waiter is seen. Mutations: gate the copy on laneOn (the lane-off run reads
-// nil); take the probe's or an entry's tokens from the first queued waiter.
+// waiter is seen. A third, small enough for the lane, finds the lane full
+// (lane on) AND no CPU slot, and carries both the lane token and the resource
+// token (AIRA-375). Mutations: gate the copy on laneOn (the lane-off run reads
+// nil); take the probe's or an entry's tokens from the first queued waiter;
+// copy BlockedBy only for a waiter with no lane token (the small row goes red).
 func TestAdmitDiagnosisSnapshot(t *testing.T) {
 	for _, lane := range []bool{false, true} {
 		now := time.Unix(370500, 0)
@@ -270,24 +273,33 @@ func TestAdmitDiagnosisSnapshot(t *testing.T) {
 		cpuWaiter := laneJob(2, 2000*mib, now)
 		// room 45056 − H(3) − 1000 = 41864: too small for 44000, and no slot.
 		bothWaiter := laneJob(3, 44000*mib, now)
-		queue := queueOf(server, lease, cpuWaiter, bothWaiter)
+		// Lane on: the 1000 small lease plus this 512 exceed a 1024 lane cap.
+		smallWaiter := laneJob(4, 512*mib, now)
+		if lane {
+			server.smallLaneCap = 1024 * mib
+		}
+		queue := queueOf(server, lease, cpuWaiter, bothWaiter, smallWaiter)
 		server.admitQueue = queue
 		server.evaluateAdmitQueue(queue)
 
-		want := map[string][]string{cpuWaiter.scopeID: {"cpu"}, bothWaiter.scopeID: {"ram", "cpu"}}
+		want := map[string][]string{cpuWaiter.scopeID: {"cpu"}, bothWaiter.scopeID: {"ram", "cpu"}, smallWaiter.scopeID: {"cpu"}}
+		wantLane := map[string]string{}
+		if lane {
+			wantLane[smallWaiter.scopeID] = laneWaitFull
+		}
 		var snapshot admitSnapshot
 		for scopeID, tokens := range want {
 			snapshot = server.admitSliceSnapshotFor("/slice", scopeID)
-			if !reflect.DeepEqual(snapshot.queuedBlockedBy, tokens) {
-				diagnosisMismatch(t, "lane=%v probe %s blocked_by=%v, want %v", lane, scopeID, snapshot.queuedBlockedBy, tokens)
+			if !reflect.DeepEqual(snapshot.queuedBlockedBy, tokens) || snapshot.queuedLaneWait != wantLane[scopeID] {
+				diagnosisMismatch(t, "lane=%v probe %s blocked_by=%v lane_wait=%q, want %v %q", lane, scopeID, snapshot.queuedBlockedBy, snapshot.queuedLaneWait, tokens, wantLane[scopeID])
 			}
 		}
-		if len(snapshot.queuedEntries) != 2 {
+		if len(snapshot.queuedEntries) != 3 {
 			t.Fatalf("lane=%v entries=%+v", lane, snapshot.queuedEntries)
 		}
 		for _, entry := range snapshot.queuedEntries {
-			if !reflect.DeepEqual(entry.BlockedBy, want[entry.ScopeID]) {
-				diagnosisMismatch(t, "lane=%v entry %s blocked_by=%v, want %v", lane, entry.ScopeID, entry.BlockedBy, want[entry.ScopeID])
+			if !reflect.DeepEqual(entry.BlockedBy, want[entry.ScopeID]) || entry.LaneWait != wantLane[entry.ScopeID] {
+				diagnosisMismatch(t, "lane=%v entry %s blocked_by=%v lane_wait=%q, want %v %q", lane, entry.ScopeID, entry.BlockedBy, entry.LaneWait, want[entry.ScopeID], wantLane[entry.ScopeID])
 			}
 		}
 		if snapshot.cpuOutstanding != 64 {

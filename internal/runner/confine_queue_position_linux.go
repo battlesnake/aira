@@ -230,8 +230,8 @@ func confineQueueNote(ctx context.Context, deps confineDeps, request ConfineRequ
 	own, boxCPU := confineOwnReserveNote(position, clientReserve), confineBoxCPUNote(position)
 	// AIRA-370. The daemon's own diagnosis, when it sent one, is the ONE reason
 	// clause: it replaces the lane clause, the ceiling clause (which it carries
-	// itself when, and only when, the cut is part of why this job waits) and the
-	// exclusive clause (said only when exclusivity is the gate, where it names
+	// itself, as ceiling-cut, whenever it refuses RAM while the ceiling is cut,
+	// whether or not the cut is what took the room) and the exclusive clause (said only when exclusivity is the gate, where it names
 	// the job), and a RAM diagnosis carries the booked figures in place of the
 	// granted clause. An older daemon sends none and gets today's clauses.
 	if diagnosis, gate, ok := confineDiagnosisNote(position); ok {
@@ -318,7 +318,7 @@ func confineDiagnosisNote(position confineQueuePosition) (string, string, bool) 
 		parts = append(parts, cpu+" (an admission count, not CPU load)")
 	}
 	if known[ConfineBlockedVRAM] {
-		parts = append(parts, "GPU memory (VRAM)")
+		parts = append(parts, "the GPU memory (VRAM) gate")
 	}
 	if len(parts) == 0 {
 		return "", "", false
