@@ -7,9 +7,12 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -422,9 +425,42 @@ exit 0`
 	}
 }
 
+// ScopeContained needs the runner to SEE the leader in cgroup.procs after
+// Start; a leader that has already exited reads, honestly, unverified. So the
+// leader must not exit on a timer (AIRA-377: a `/bin/sleep 0.03` leader exited
+// before a CPU-starved runner read cgroup.procs). It blocks on a FIFO until
+// the runner's first post-Start ledger append, which follows that membership
+// read, and startFn stalls 100ms past Start so the verdict provably no longer
+// depends on scheduling (the old fixture fails this stall every time).
 func TestRealCgroupLeaderOnlyRunRemainsContained(t *testing.T) {
 	r := realRunner(t)
-	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/sleep", "0.03"}})
+	fifo := filepath.Join(t.TempDir(), "release")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.startFn = func(cmd *exec.Cmd) error {
+		err := cmd.Start()
+		time.Sleep(100 * time.Millisecond)
+		return err
+	}
+	var release sync.Once
+	r.appendFault = func(event ledgerEvent) error {
+		// "running" (leader seen) or "scope-integrity" (not seen): both follow
+		// the membership read, so a regression still ends the run and fails
+		// on the verdict below instead of hanging.
+		if event.Kind == "running" || event.Kind == "scope-integrity" {
+			release.Do(func() {
+				go func() {
+					// Blocks until cat has opened the FIFO; closing gives it EOF.
+					if f, err := os.OpenFile(fifo, os.O_WRONLY, 0); err == nil {
+						_ = f.Close()
+					}
+				}()
+			})
+		}
+		return nil
+	}
+	record, err := r.Launch(context.Background(), Request{Argv: []string{"/bin/cat", fifo}})
 	if err != nil {
 		t.Fatal(err)
 	}
