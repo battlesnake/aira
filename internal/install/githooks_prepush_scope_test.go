@@ -167,12 +167,17 @@ func (fx pushFixture) expectScope(t *testing.T, output string, pushErr error, wa
 		t.Fatalf("hook ran %q, want exactly %q\noutput:\n%s", makes, wantLine, output)
 	}
 	// AIRA-378: only the full `make ci` is pinned at 2G; a narrowed run stays
-	// auto-sized (its peak is far below 1 GiB).
-	if airaLine, ok := findLine(fx.logLines(t), "aira argv: "); ok {
-		pinned := strings.Contains(airaLine, "--memory-reserve 2G")
-		if pinned != (want == "ci") {
-			t.Fatalf("hook ran %s but the confine line is %q (pinned at 2G=%v, want %v)", want, airaLine, pinned, want == "ci")
-		}
+	// auto-sized (its peak is far below 1 GiB). Exact line, never a substring.
+	airaLine, ok := findLine(fx.logLines(t), "aira argv: ")
+	if !ok {
+		t.Fatalf("the hook ran make but left no `aira argv:` line; log:\n%s", strings.Join(fx.logLines(t), "\n"))
+	}
+	wantConfine := "aira argv: confine -- make -C " + fx.worktree + " " + want
+	if want == "ci" {
+		wantConfine = "aira argv: confine --memory-reserve 2G -- make -C " + fx.worktree + " ci"
+	}
+	if airaLine != wantConfine {
+		t.Fatalf("confine line %q, want exactly %q", airaLine, wantConfine)
 	}
 	narrowed := want != "ci"
 	if got := strings.Contains(output, prepushNarrowedNotice); got != narrowed {
