@@ -1,0 +1,4 @@
+---
+{"schema":1,"id":"AIRA-378","project":"aira","title":"git hooks: pin make ci's admission reserve at 2G (peak 1.4 GB measured) so a cold run is not OOM-killed at the 1 GiB auto reserve and re-queued","status":"planned","kind":"chore","severity":"P3","assignee":null,"milestone":"v0.46","labels":["backlog"],"hold":false,"relations":[]}
+---
+Owner 2026-11-23: 'pin the reservation.' Measured 2026-11-22: make ci peak-rss 1.31-1.44 GB (confine trailers, three runs), wall 4m37s-4m48s; the 1 GiB auto reserve OOM-killed it (exit 137) on a cold history and each retry re-queued (waits of 465-1515 s today). .githooks/common.sh aira_hook_run_make now adds --memory-reserve 2G when the first make target is ci (the full pre-push scope); narrowed pre-push scopes (test-store test-docs) and the pre-commit quick checks stay auto-sized. Also record in the hook comment where the figure comes from and how to re-measure.

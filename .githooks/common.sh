@@ -85,7 +85,19 @@ aira_hook_run_make() {
 	if [ "$priority" = high ]; then
 		export AIRA_CONFINE_PRIORITY="${AIRA_CONFINE_PRIORITY:-high}"
 	fi
-	exec aira confine -- make -C "$root" "$@"
+	# AIRA-378: the full `make ci` is pinned at 2G. Its peak-rss was measured at
+	# 1.31-1.44 GB (the confine trailer, three runs on 2026-11-22), above the 1 GiB
+	# auto reserve a command with no peak history gets, so an unpinned cold run was
+	# OOM-killed (exit 137) and each retry waited in the admission queue again (waits
+	# of 465-1515 s that day). Re-measure with
+	# `aira confine -- make -C <worktree> ci` and read the trailer's peak-rss=.
+	# Narrowed scopes (test-store, test-docs) and the quick pre-commit checks stay
+	# auto-sized.
+	local -a reserve=()
+	if [ "${1:-}" = ci ]; then
+		reserve=(--memory-reserve 2G)
+	fi
+	exec aira confine ${reserve[@]+"${reserve[@]}"} -- make -C "$root" "$@"
 }
 
 # ---------------------------------------------------------------------------
