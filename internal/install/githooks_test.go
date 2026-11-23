@@ -466,12 +466,12 @@ func TestHooksQueuePriority(t *testing.T) {
 	t.Run("pre-push asks for nothing", func(t *testing.T) {
 		fx := newHookFixture(t)
 		push(t, fx)
-		expect(t, fx, "aira argv: confine -- make -C "+fx.worktree+" ci", "<unset>")
+		expect(t, fx, "aira argv: confine --memory-reserve 2G -- make -C "+fx.worktree+" ci", "<unset>")
 	})
 	t.Run("caller's explicit high reaches pre-push", func(t *testing.T) {
 		fx := newHookFixture(t)
 		push(t, fx, "AIRA_CONFINE_PRIORITY=high")
-		expect(t, fx, "aira argv: confine -- make -C "+fx.worktree+" ci", "high")
+		expect(t, fx, "aira argv: confine --memory-reserve 2G -- make -C "+fx.worktree+" ci", "high")
 	})
 	t.Run("every pre-push step is normal", func(t *testing.T) {
 		// Every pre-push form stays normal: `make ci` is long, and AIRA-359's
