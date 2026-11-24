@@ -58,7 +58,7 @@ func TestConfineWaitDiagnosisIsTheOneReasonClause(t *testing.T) {
 		{"ram and cpu", diagReserve(3, ConfineBlockedRAM, ConfineBlockedCeilingCut, ConfineBlockedCPU),
 			", 3 of 4 queued, waiting for RAM: 46592M of 46694M booked, ceiling cut to keep system free memory (MemAvailable 44544M); CPU slots: 32 of 32 booked (an admission count, not CPU load)" + busy},
 		{"vram", diagReserve(2, ConfineBlockedVRAM),
-			", 2 of 4 queued, waiting for GPU memory (VRAM), 46592M of 46694M granted" + busy},
+			", 2 of 4 queued, waiting for the GPU memory (VRAM) gate, 46592M of 46694M granted" + busy},
 		{"behind the head", diagReserve(2, ConfineBlockedHead),
 			", 2 of 4 queued, fits but held behind the head of the queue, 46592M of 46694M granted" + busy},
 		{"restart freeze", diagReserve(2, ConfineBlockedRestartFreeze),
@@ -125,7 +125,9 @@ func TestConfineWaitDiagnosisNamesExclusivityOnlyWhenItIsTheGate(t *testing.T) {
 
 // verifies: AIRA-370 — figures the daemon did not establish are never
 // fabricated: an unestablished ledger or an absent slot ceiling names the
-// resource without numbers (no "0M", no "0 of 0").
+// resource without numbers (no "0M", no "0 of 0"), and a negative booked
+// slot count (a ledger defect) is not printed (AIRA-375; mutation: drop the
+// `CPUOutstandingCores >= 0` guard -> "-1 of 32 booked", red).
 func TestConfineWaitDiagnosisWithholdsUnestablishedFigures(t *testing.T) {
 	reserve := diagReserve(1, ConfineBlockedRAM, ConfineBlockedCPU)
 	reserve.GrantedEstablished = false
@@ -133,11 +135,16 @@ func TestConfineWaitDiagnosisWithholdsUnestablishedFigures(t *testing.T) {
 	if note := queueNoteFor(t, 0, reserve); note != ", 1 of 4 queued, waiting for RAM; CPU slots (an admission count, not CPU load)" {
 		t.Fatalf("note=%q", note)
 	}
-	reserve = diagReserve(1, ConfineBlockedCPU)
-	reserve.CPUCeilingCores = 0
-	reserve.CPUPressureSomeAvg10 = nil
-	if note := queueNoteFor(t, 0, reserve); !strings.Contains(note, "waiting for CPU slots (an admission count, not CPU load)") {
-		t.Fatalf("note=%q", note)
+	for _, mutate := range []func(*ConfineSliceReserve){
+		func(r *ConfineSliceReserve) { r.CPUCeilingCores = 0 },
+		func(r *ConfineSliceReserve) { r.CPUOutstandingCores = -1 },
+	} {
+		reserve = diagReserve(1, ConfineBlockedCPU)
+		mutate(reserve)
+		reserve.CPUPressureSomeAvg10 = nil
+		if note := queueNoteFor(t, 0, reserve); !strings.Contains(note, "waiting for CPU slots (an admission count, not CPU load)") {
+			t.Fatalf("cpu %d of %d: note=%q", reserve.CPUOutstandingCores, reserve.CPUCeilingCores, note)
+		}
 	}
 }
 

@@ -666,10 +666,11 @@ var multiSupervisorTests = []string{
 // TestRealPytestAitestMultiSupervisorSafe is Gate C (AIRA-232): two independent
 // aitest supervisors (the `make -j` shape) under one slice, driven by one daemon,
 // cannot jointly breach the slice ledger. The ledger is pinned to two 256 MiB
-// workers' worth, and each lease is 512 MiB, so in practice ONE worker fits at a
-// time (every passing run logs "max combined granted workers=1"); the sum check
-// below is what bites, and the "more than 2 leases" arm cannot fire (a pre-existing
-// property, recorded in AIRA-367). Both supervisors continuously demand workers (4 slow tests
+// workers' worth, and each lease is pinned to 256 MiB
+// (AIRA_AITEST_WORKER_OVERHEAD_BYTES, as the sibling gates do), so two workers
+// fit at once and both the count and the sum arms can fire (AIRA-367: unpinned,
+// the 512 MiB default lease let only one worker in, and the count arm could not
+// fire). Both supervisors continuously demand workers (4 slow tests
 // each, 3 workers asked), so their combined demand exceeds the ceiling. The
 // daemon serialises them against the ONE ledger: at every sampled instant the combined granted
 // worker set is <= 2 and Σ(reserve) <= 2 workers' worth — there is no client
@@ -681,6 +682,9 @@ var multiSupervisorTests = []string{
 //     leases <= 2 and Σ(reserve) <= 2*restartGatePytestReserve at every poll. If
 //     AIRA-232 regressed to per-supervisor guarding, two supervisors would each
 //     admit up to the ceiling → combined 3-4+ workers → this reds.
+//   - The bound was reached, not just respected: at some poll 2 workers were
+//     granted at once. A fixture that admits only one worker at a time would
+//     pass the bound however the daemon guarded it.
 //   - Both supervisors actually competed: worker leases from BOTH distinct pid
 //     slots (each supervisor's own AIRA_CONFINE_SCOPE_ID pid) were observed, and
 //     every worker scope-id parses (Task 1 naming). A gate where only one
@@ -732,6 +736,10 @@ func TestRealPytestAitestMultiSupervisorSafe(t *testing.T) {
 			"AIRA_AITEST_ADMISSION=cgroup-sub-scope",
 			"AIRA_AITEST_WORKER_ADMIT_CMD="+h.binary,
 			"AIRA_AITEST_ESTIMATED_BYTES="+strconv.Itoa(restartGatePytestReserve),
+			// AIRA-367. S2b sizes a worker from overhead + increment; these tests are
+			// unannotated, so the lease is the overhead: pin it to the reserve so two
+			// leases fill the 2-worker ledger.
+			"AIRA_AITEST_WORKER_OVERHEAD_BYTES="+strconv.Itoa(restartGatePytestReserve),
 			"AIRA_REAL_CGROUP=1",
 		)
 		ch := make(chan runOutcome, 1)
@@ -821,6 +829,13 @@ func TestRealPytestAitestMultiSupervisorSafe(t *testing.T) {
 		if o.err != nil {
 			t.Fatalf("supervisor %s exited nonzero: %v\n%s", name, o.err, text)
 		}
+	}
+
+	// AIRA-367: the ledger was filled to its 2-worker bound at least once, so the
+	// bound above was exercised rather than vacuously met by a one-worker fixture.
+	if maxCount < 2 {
+		t.Fatalf("max combined granted workers=%d, want 2: the fixture never filled the 2-worker ledger, "+
+			"so the serialisation bound was not exercised (max Σ(reserve)=%d, ceiling %d)", maxCount, maxSum, ceiling)
 	}
 
 	// Both supervisors genuinely competed for workers under the one daemon: worker

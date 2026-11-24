@@ -992,6 +992,41 @@ def test_a_reused_worker_pre_checks_member_one_of_a_chunk(pytester, monkeypatch,
     assert results[1][2] is not None, "chunk member 1 still carries its wait token"
 
 
+_SINGLES_LOWER_MODULE = """
+import os
+
+def test_s1():
+    with open(os.environ["AITEST_W_LOWER_CURRENT"], "w") as handle:
+        handle.write("10")
+
+def test_s2():
+    pass
+"""
+
+
+def test_a_single_item_unit_is_only_post_checked(pytester, tmp_path, monkeypatch, clear_invalid_recycle_env_warnings):
+    """AIRA-376. A single-item unit keeps today's post-item check only: above the
+    watermark at dispatch, but test_s1 itself brings memory.current back under it,
+    so the post-check passes and the worker runs test_s2 too -- 2 results, no
+    recycle. Mutant: drop the `n >= 2` pre-check guard in run_worker_loop (the
+    pre-check reads 90% before test_s1 and retires the worker after it: 1 result)."""
+    _clear_recycle_env(monkeypatch)
+    scope = tmp_path / "scope"
+    scope.mkdir()
+    (scope / "memory.current").write_text("90")
+    (scope / "memory.max").write_text("100")
+    monkeypatch.setenv("AITEST_W_LOWER_CURRENT", str(scope / "memory.current"))
+    items = pytester.getitems(_SINGLES_LOWER_MODULE)
+    by_id = {item.nodeid: item for item in items}
+    names = list(by_id)
+    pipe_out = io.StringIO()
+    run_worker_loop(str(scope), by_id, io.StringIO(names[0] + "\n" + names[1] + "\n__stop__\n"), pipe_out)
+    results = _member_results(pipe_out)
+    assert [(n, o, r) for n, o, _w, r, _e in results] == [
+        (names[0], "passed", False), (names[1], "passed", False),
+    ]
+
+
 _WATERMARK_MODULE = """
 import os
 import pytest

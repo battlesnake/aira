@@ -7,7 +7,8 @@ import "aira/internal/runner"
 // admission or grant decision reads it, it is written only by evaluateAdmitQueue
 // under queue.mu (cleared at the start of every pass that reads the slice, then
 // set where the pass refuses the waiter), and the snapshot is its only reader
-// (admit_diagnosis_guard_test.go). Zero is "the last pass did not evaluate this
+// (TestSmallLaneDiagnosesAreWrittenByTheEvaluatorAndReadByTheSnapshot, in
+// small_lane_guard_test.go). Zero is "the last pass did not evaluate this
 // waiter", which the wire omits: unevaluated, never "not blocked".
 //
 // The head rule's refusal stays admitWaiter.heldByHead (AIRA-350) and is folded

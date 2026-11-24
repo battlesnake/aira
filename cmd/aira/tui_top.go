@@ -870,7 +870,7 @@ func topQueuedState(record runner.ConfineRecord) string {
 // topBlockedWords is the LIVE cell's word for each AIRA-370 diagnosis token.
 // "cpu slots", never "cpu": the token is the admission slot ledger, not load.
 var topBlockedWords = map[string]string{
-	runner.ConfineBlockedRestartFreeze: "freeze",
+	runner.ConfineBlockedRestartFreeze: "daemon restart",
 	runner.ConfineBlockedExclusive:     "exclusive",
 	runner.ConfineBlockedHead:          "behind head",
 	runner.ConfineBlockedRAM:           "ram",

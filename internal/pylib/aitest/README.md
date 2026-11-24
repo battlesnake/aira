@@ -149,7 +149,14 @@ the start: `aitest: batching: N tests in K chunks, cap c (AIRA_AITEST_BATCH_MAX_
   item `k > 1` prints `aira aitest: worker <pid> was lost while running item k
   of a chunk (<nodeid>); k-1 earlier items had run with shared fixtures alive;
   retrying it alone`, because a retried test usually passes alone and a memory
-  build-up across the chunk would otherwise stay invisible.
+  build-up across the chunk would otherwise stay invisible. When a fail-fast
+  leg has already tripped, the line ends `not retrying it: the fail-fast abort
+  (tripped by <nodeid>) stops the pool` instead.
+- **Concurrency.** A chunk is one unit of dispatch: it runs start to finish on
+  one worker. A run cut into K chunks can keep at most K workers busy, so at a
+  cap that brings K near or below the worker count, workers sit idle and the
+  longest chunk sets the wall time. Batching saves fixture setups, never
+  parallelism: keep K well above the worker count.
 - **Teardown errors** of a shared fixture are reported on the test whose
   teardown ran them: the last user before a scope change, or the chunk's last
   member -- serial pytest's attribution for the same order.

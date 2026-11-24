@@ -4800,7 +4800,7 @@ def test_a_mid_chunk_loss_says_so_before_the_retry_and_counts_it(pytester, monke
     assert _crash_line_count(err) == 1, err
     assert (
         "aira aitest: worker %d was lost while running item 2 of a chunk (%s); "
-        "1 earlier items had run with shared fixtures alive; retrying it alone" % (worker.pid, b)
+        "1 earlier item had run with shared fixtures alive; retrying it alone" % (worker.pid, b)
     ) in err
     assert "the one retry" not in err
     retry = _idle_worker(sup)
@@ -4810,6 +4810,29 @@ def test_a_mid_chunk_loss_says_so_before_the_retry_and_counts_it(pytester, monke
     fields = sup._pool_summary_fields(lambda value: value)
     assert fields["mid_chunk_crashes"] == 1 and fields["worker_crashes"] == 1
     assert _crash_line_count(capsys.readouterr().err) == 0
+
+
+def test_a_mid_chunk_loss_after_a_fail_fast_trip_does_not_promise_a_retry(pytester, monkeypatch, capsys):
+    """AIRA-376. A mid-chunk loss serviced after a fail-fast leg tripped in the same
+    drain pass: the pool is about to be aborted, so the line says the member is not
+    retried and names the trip, never "retrying it alone". Mutant: the old fixed
+    "retrying it alone" ending."""
+    sup, ids, _replaced = _batched_sup(pytester, monkeypatch, 3, source=_FOUR_SHARERS.replace("    def test_d(shared): pass\n", ""))
+    a, b, _c = ids
+    worker = _idle_worker(sup)
+    sup._dispatch_to_idle_workers()
+    _send(sup, worker, "%s passed" % a)
+    capsys.readouterr()
+    sup.failfast_triggered = "tests/test_marked.py::test_leg"
+    _send(sup, worker, eof=True)
+    err = capsys.readouterr().err
+    assert _crash_line_count(err) == 1, err
+    assert (
+        "aira aitest: worker %d was lost while running item 2 of a chunk (%s); "
+        "1 earlier item had run with shared fixtures alive; not retrying it: the fail-fast "
+        "abort (tripped by tests/test_marked.py::test_leg) stops the pool" % (worker.pid, b)
+    ) in err, err
+    assert "retrying it alone" not in err
 
 
 def test_no_mid_chunk_line_for_a_crash_on_item_one_or_an_idle_worker(pytester, monkeypatch, capsys):
@@ -5165,7 +5188,8 @@ def _assert_batching_report_honest(report):
     """drain_s is a real reading; the stub's worker scopes are plain directories with no
     memory.events, so the OOM count cannot be established and must not read 0."""
     assert isinstance(report["drain_s"], (int, float)) and report["drain_s"] >= 0, report["drain_s"]
-    assert report.get("oom_group_kills", "unevaluated") == "unevaluated", report.get("oom_group_kills")
+    # Indexed, not .get(): a report missing the key must fail, not read unevaluated.
+    assert report["oom_group_kills"] == "unevaluated", report["oom_group_kills"]
 
 
 def test_a_real_count_recycle_mid_chunk_requeues_the_rest_as_one_chunk(tmp_path, monkeypatch, pytester):

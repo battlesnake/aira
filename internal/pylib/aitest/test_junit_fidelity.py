@@ -666,7 +666,7 @@ def test_junit_matches_plain_pytest_for_a_failing_module_teardown_when_batched(t
     plain, plain_xml, plain_log = runs["plain"]
     aitest, aitest_xml, aitest_log = runs["aitest"]
     output = aitest.stdout + aitest.stderr
-    assert "aitest: batching: 3 tests in 1 chunks, cap 10" in output, output
+    assert "aitest: batching: 3 tests in 1 chunk, cap 10" in output, output
     assert plain_log.read_text() == aitest_log.read_text() == "setup\n"
     assert _suite_counts(plain_xml) == _suite_counts(aitest_xml), output
     assert _normalized_cases(plain_xml) == _normalized_cases(aitest_xml), output
@@ -744,7 +744,7 @@ def test_a_trylast_reorder_is_honoured_and_reproduces_serial_setup_counts(tmp_pa
         output = completed.stdout + completed.stderr
         assert completed.returncode == 0, output
         logs[name] = log.read_text().splitlines()
-    assert "aitest: batching: 6 tests in 1 chunks, cap 10" in output, output
+    assert "aitest: batching: 6 tests in 1 chunk, cap 10" in output, output
     assert "6 passed, 0 failed, 0 skipped, 0 error, 0 unevaluated" in output, output
     ran = [line for line in logs["aitest"] if line.startswith("ran ")]
     assert ran == [
