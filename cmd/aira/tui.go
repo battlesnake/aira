@@ -43,6 +43,10 @@ type tuiRuntime struct {
 	// projectless marks a face that resolves NO project/worktree scope (`aira
 	// top`). It changes what the tab line offers, never what a key does.
 	projectless bool
+	// tabsWidth is the screen width the tab line was last composed for (AIRA-381:
+	// the `aira top` legend gains `t tier` only where it fits). Set on the UI
+	// goroutine by the before-draw hook, which recomposes the line on a resize.
+	tabsWidth int
 	// isBoard marks AIRA-252's `aira board` kanban face. It selects a wholly
 	// different layout (buildBoardWidgets), render path (renderBoard), and input
 	// capture (captureBoardInput) over the SAME runtime shell, executor, watch loop
@@ -317,6 +321,16 @@ func (r *tuiRuntime) buildWidgets() {
 		AddPage(palettePage, centeredPrimitive(r.paletteList, 80, 22), true, false)
 	r.app.SetRoot(r.outerPages, true)
 	r.app.SetInputCapture(r.captureInput)
+	// The tab line's width seam (AIRA-381), on the board's pattern: a tcell resize
+	// fires this hook but not render(), so the line is recomposed here whenever the
+	// width changes, before the draw that shows it.
+	r.app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		if width, _ := screen.Size(); width != r.tabsWidth {
+			r.tabsWidth = width
+			r.renderTabLine()
+		}
+		return false
+	})
 }
 
 func (r *tuiRuntime) captureInput(event *tcell.EventKey) *tcell.EventKey {
@@ -593,6 +607,31 @@ func (r *tuiRuntime) render() {
 		r.renderBoard()
 		return
 	}
+	r.renderTabLine()
+	views := r.runtimeViews()
+	r.detachedStatus.SetText(r.state.DetachedReport)
+	r.panelPages.SwitchToPage(string(r.state.Active))
+	for _, view := range views {
+		if view == viewInsights {
+			r.renderInsights(r.state.Panels[view])
+			continue
+		}
+		model := r.state.Panels[view].Model
+		if view == viewEvents {
+			model = eventViewModel(r.state.Events)
+		}
+		if view == viewTop {
+			r.renderTopBar(r.topBar, model.Bar, r.state.Panels[view])
+			r.renderTopBar(r.topCPUBar, model.CPUBar, r.state.Panels[view])
+			r.renderTopBar(r.topVRAMBar, model.VRAMBar, r.state.Panels[view])
+		}
+		r.renderTable(view, model, r.state.Panels[view])
+	}
+}
+
+// renderTabLine composes the dashboard's one-row tab line and key legend for
+// the active view, the screen width last seen (tabsWidth) and any armed kill.
+func (r *tuiRuntime) renderTabLine() {
 	views := r.runtimeViews()
 	tabNames := make([]string, 0, len(views))
 	for index, view := range views {
@@ -620,7 +659,16 @@ func (r *tuiRuntime) render() {
 		// they work on, kill first and terse, so the whole `aira top` legend fits
 		// 80 columns and KK is still on screen at 60 (each key's confirmation
 		// says in full what it does).
-		keys = "    KK kill  f to front  e lower reserve  c cmd/dir" + keys
+		const topKeys, tierKey = "    KK kill  f to front  e lower reserve", "  t tier"
+		tail := "  c cmd/dir" + keys
+		keys = topKeys + tail
+		// AIRA-381. `t tier` joins only where the whole line still fits. The
+		// 80-column legend is full, so on `aira top` it shows only above 80, from
+		// the first width that holds the whole line (TestTopKillLegendFitsOrdinaryWidths,
+		// TestTopLegendShowsTierWhenWide).
+		if wide := topKeys + tierKey + tail; tview.TaggedStringWidth(strings.Join(tabNames, "  ")+wide) <= r.tabsWidth {
+			keys = wide
+		}
 	}
 	line := strings.Join(tabNames, "  ") + keys
 	if arm := r.state.TopKill; r.state.Active == viewTop && arm.ScopeID != "" {
@@ -633,24 +681,6 @@ func (r *tuiRuntime) render() {
 		line = "[red::b]" + action + " ARMED:[-:-:-] " + tview.Escape(arm.Job) + " · K again to confirm, any other key cancels"
 	}
 	r.tabs.SetText(line)
-	r.detachedStatus.SetText(r.state.DetachedReport)
-	r.panelPages.SwitchToPage(string(r.state.Active))
-	for _, view := range views {
-		if view == viewInsights {
-			r.renderInsights(r.state.Panels[view])
-			continue
-		}
-		model := r.state.Panels[view].Model
-		if view == viewEvents {
-			model = eventViewModel(r.state.Events)
-		}
-		if view == viewTop {
-			r.renderTopBar(r.topBar, model.Bar, r.state.Panels[view])
-			r.renderTopBar(r.topCPUBar, model.CPUBar, r.state.Panels[view])
-			r.renderTopBar(r.topVRAMBar, model.VRAMBar, r.state.Panels[view])
-		}
-		r.renderTable(view, model, r.state.Panels[view])
-	}
 }
 
 // renderTopBar paints ONE bar into ONE panel. It is a THIN face over the model:

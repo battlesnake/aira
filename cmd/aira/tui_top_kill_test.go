@@ -429,6 +429,38 @@ func TestTopKillLegendFitsOrdinaryWidths(t *testing.T) {
 	}
 }
 
+// verifies: AIRA-381 — above 80 columns the `aira top` legend also offers
+// `t tier`, where the whole line fits, without displacing a key the 80-column
+// legend shows; at 80 it is absent (that legend is full). A resize alone, with
+// no refresh or key press, recomposes the line (the before-draw width seam).
+// Mutations: `t tier` never added; added at every width (the 80-column legend
+// then clips `q quit`); added at every width above 80 without the fit check
+// (84 columns clips `q quit`); the seam not recomposing (the line keeps the
+// width it was composed for).
+func TestTopLegendShowsTierWhenWide(t *testing.T) {
+	runtime, screen, _ := startTopDialogRuntime(t, &topDialogDispatcher{}, 100, 24)
+	text := simulationTextOnUI(t, runtime, screen)
+	for _, want := range []string{"KK kill", "f to front", "e lower reserve", "t tier", "c cmd/dir", "r refresh", "q quit"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("at 100 columns the legend does not show %q:\n%s", want, text)
+		}
+	}
+	resizeBoardScreen(t, runtime, screen, 80, 24)
+	if text := simulationTextOnUI(t, runtime, screen); strings.Contains(text, "t tier") || !strings.Contains(text, "q quit") {
+		t.Fatalf("at 80 columns the legend shows `t tier` or lost `q quit`:\n%s", text)
+	}
+	// 84 columns is above 80 but too narrow for the line with `t tier` (87 on
+	// `aira top`): the key is left out rather than clipping `q quit`.
+	resizeBoardScreen(t, runtime, screen, 84, 24)
+	if text := simulationTextOnUI(t, runtime, screen); strings.Contains(text, "t tier") || !strings.Contains(text, "q quit") {
+		t.Fatalf("at 84 columns the legend shows `t tier` or lost `q quit`:\n%s", text)
+	}
+	resizeBoardScreen(t, runtime, screen, 120, 24)
+	if text := simulationTextOnUI(t, runtime, screen); !strings.Contains(text, "t tier") {
+		t.Fatalf("a resize back to 120 columns did not bring `t tier` back:\n%s", text)
+	}
+}
+
 // verifies: AIRA-271 — on a real `aira top` runtime: the legend offers KK, one
 // K says what is armed on the status line and opens nothing, an arrow key in
 // between disarms, the confirmation starts on Cancel, and Enter on Cancel, Esc,
