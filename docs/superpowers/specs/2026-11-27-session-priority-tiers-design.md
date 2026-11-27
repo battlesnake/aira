@@ -1,30 +1,18 @@
 # Session priority tiers: high / medium / low sessions in admission order (AIRA-381)
 
-Status: plan, round 3 (after review rounds 1 and 2; see the Review log), for plan review (Sol or
-Astra, plus one independent Claude lineage) and the Fable plan gate (the premise measurement in §1
-also needs its one method-and-verdict check, per the 2026-11-19 audit rules). Round 2 triggered the
-re-evaluation rule (a round-1 "design change" drew a second blocker of its class); the re-base is
-recorded in the log and needs an independent confirmation. Ticket AIRA-381, milestone v0.47.
-Correctness-critical (admission queue order): two-loop, Opus builds, Fable and Sol review. Builds on
-AIRA-307/309 (queue order, `2026-10-13-aira-queue-order-design.md`), AIRA-340 (`--priority high`),
-AIRA-350 (small-job lane, `2026-11-18-fixed-small-lane-design.md`) and AIRA-370 (wait diagnosis).
-Code references are to master at `dc19915c`.
+Status: plan, round 4, for plan review (Sol plus one Claude lineage) and the Fable plan gate; the
+owner settled the hold question (order only, D6) and this revision deletes the hold. Ticket
+AIRA-381, milestone v0.47; correctness-critical (two-loop, Opus builds, Fable and Sol review).
+Builds on AIRA-307/309 (`2026-10-13-aira-queue-order-design.md`), AIRA-340 (`--priority high`)
+and AIRA-350 (`2026-11-18-fixed-small-lane-design.md`). Code references: master at `dc19915c`.
 
 ## Summary for the owner
 
-You can mark a session HIGH or LOW from `aira top`. Every session you have not marked is MEDIUM.
-Apart from one small change to the small-job lane's order (below, L5), nothing changes until you
-mark a session. A mark does two things to waiting jobs, and nothing to running ones:
-1. **Order.** Waiting jobs are considered high-tier sessions first, then medium, then low. Inside
-   each tier a `--priority high` job (hooks, short pre-commit steps) goes before that tier's
-   ordinary jobs, oldest first. A job pushed with `--front` goes before everything.
-2. **Hold.** When a job is waiting for room at the front of the line, a job of a LOWER tier does not
-   start past it in the main queue, even one that would fit now, except in the catch-up pass the
-   box already runs once every 5 minutes while it is holding jobs back (today's rule). Jobs of the
-   front job's own tier may start past it as today: within half its booking, and in the catch-up
-   pass.
+You mark a session HIGH or LOW from `aira top` (key `t`); unmarked sessions are MEDIUM. A mark
+changes one thing, **the order in which waiting jobs are considered**, exactly as `--priority high`
+does today one level up. It adds no rule that stops a job starting; running jobs are untouched.
 
-| Waiting job | Order |
+| Waiting job | Considered |
 |---|---|
 | pushed with `aira confine --front` (any session) | 1st (latest push first, as today) |
 | HIGH session, `--priority high` job | 2nd |
@@ -34,65 +22,48 @@ mark a session. A mark does two things to waiting jobs, and nothing to running o
 | LOW session, `--priority high` job | 6th |
 | LOW session, ordinary job | 7th |
 
-Examples, on a box where memory is short and jobs queue:
-- You mark session `field` HIGH. Its next `make ci` goes before the 15 medium jobs that queued
-  before it. If it does not fit yet, those medium jobs start in the main queue only in the 5-minute
-  catch-up pass; small jobs (1 GiB or less) can also start through the small-job lane, when they
-  leave `field`'s job the room it needs. If that `make ci` runs a `--delegate-ram` suite, only the
-  suite's own admission is HIGH: its test workers' claims are MEDIUM (see below).
-- You mark a long-running sweep session LOW. Its 4 GiB job waits while any medium job of 10 GiB is
-  waiting for room, even when 4 GiB is free, until the next catch-up pass. On a quiet box (nothing
-  of a higher tier waiting) it starts at once: LOW means "behind everyone else who is waiting", not
-  "only when idle".
-- A LOW session's pre-commit hook job (`--priority high`) still waits behind every waiting MEDIUM
-  job.
-- A small job (1 GiB or less) of any session can still go through the small-job lane: the lane
-  ignores tiers and `--priority high`. HIGH gives no lane advantage, LOW no lane penalty.
-- Jobs already running are untouched: no job is stopped, slowed or resized by a tier.
+Inside each row, oldest first. With no marks the main queue's order is exactly today's (one
+small-lane change, L5). Examples, on a box where memory is short and jobs queue:
+- You mark session `field` HIGH. Its next `make ci` is considered before the 15 medium jobs that
+  queued earlier, and starts at once if it fits and nothing ahead of it is stuck. If not, it
+  becomes the front job the box protects,
+  under today's rules: jobs behind it that fit may still start past it up to half its booking in
+  total, plus whatever fits in the catch-up pass (every 5 minutes by default; a daemon setting,
+  can be disabled), plus small jobs through the lane that leave it room. That is what a
+  `--priority high` job gets today.
+- You mark a sweep session LOW. Its 4 GiB job is considered after every waiting medium and high
+  job. If a medium 10 GiB job at the front is stuck, the LOW job can still start past it within
+  that job's 5 GiB allowance, but medium and high jobs behind the stuck job are offered it first.
+  On a quiet box the LOW job starts at once: LOW means "behind everyone else waiting", never "only
+  when idle". Its `--priority high` hook jobs are considered after every waiting medium job.
 
-What you give up, said plainly:
-- **LOW can wait indefinitely.** While medium and high sessions keep jobs waiting, a LOW job starts
-  in the main queue only in a catch-up pass, and only if it fits at that moment. No age limit, no
-  automatic promotion (your decision D3).
-- **A busy HIGH session slows every unmarked session the same way**: while it has a big job
-  waiting, medium jobs start in the main queue only in the catch-up pass. Un-mark it to undo.
-- **A job waiting only for GPU memory or CPU also holds lower tiers back.** Example: a HIGH job
-  waiting two hours for the GPU lets medium jobs that need only RAM start just once per catch-up
-  pass, every 5 minutes, for those two hours. (Today the same job lets them start within half its
-  booking as well.)
-- **Test-suite worker claims are untiered, both ways** (`aitest` workers, `confine-reserve` holds,
-  L2). A HIGH session's suite gets priority only for its own admission; its workers' claims are
-  MEDIUM, ordered after other HIGH jobs. A LOW session's running suite keeps getting worker room
-  whenever it fits, even while HIGH jobs wait, exactly as suites get room past any waiting job
-  today. Claims are never held, so a running suite can always finish.
-- **A push still beats a tier.** `--front` goes first whatever the session's tier, and a session
-  may push its own job without `--steal`, so a LOW session can push its own job past everyone
-  (decision D2, owner line L9).
-- **A mark follows an owner string exactly**: the string a job's launch puts in its scope id,
-  shown in `aira top`'s SESSION cell. A Claude session's launches use `cc-<session id>` read from
-  the launching shell's environment. `/clear` gives the conversation a new id, but whether the
-  session's later Bash launches pick it up has not been verified (the 2026-10-25 identity study),
-  and the `aira` MCP server keeps the id it started with. So after a `/clear` or `/resume`, check
-  the SESSION cell of the session's new jobs and mark that string. A stable name
-  (`AIRA_CONFINE_OWNER=field`) is the only predictable key.
-- **One mark per name.** Every session launching jobs under the same owner name shares one tier.
-- **Marks last until the daemon restarts** (a release cutover or a machine restart), like `--front`
-  pushes; re-mark after a restart. At most 64 marks at once; a 65th is refused. (L3; the
-  alternative is to store marks on disk.)
+What tiers do not do, said plainly:
+- **A lower-tier job can still start ahead of a stuck higher-tier job** (the allowance and the
+  catch-up pass above). You chose this (order only): no new rule holds a job back, so there is no
+  new way for a job to get stuck, and the box stays as busy as today.
+- **Small jobs ignore tiers.** Jobs booking 1 GiB or less (default) go through the small-job lane
+  in arrival order, whatever the tier or `--priority`. About 59% of long waits are such jobs
+  (4,821 of 8,233 waits of 60 s or more in 14 days; reported by the reviewer, column semantics
+  unverified); tiers reorder them only when the lane is full and they queue in the main line.
+- **Test-suite worker claims are untiered** (L2): a HIGH session's suite is HIGH for its own start
+  only; its workers' claims are MEDIUM. A LOW session's running suite gets worker room as today.
+  And a push (`--front`) goes first whatever the tier (L9).
+- **A mark follows an owner string exactly** (the SESSION cell in `aira top`). Claude sessions use
+  `cc-<session id>`, which may change after `/clear` or `/resume` (unverified): check the new
+  jobs' cell. `AIRA_CONFINE_OWNER=field` is the predictable key; sessions sharing it share a tier.
+- **Marks survive a daemon restart** (recommended, L3: 21 restarts in the 14 days to 2026-11-27,
+  mostly cutovers, as reported by the coordinator) until set back to MEDIUM. At most 64; a 65th is
+  refused. Finished sessions' marks stay as dim rows in `aira top` until removed with `t`.
 
 ## 1. The problem, and the greenfield minimum
 
 **Problem.** The owner wants a standing, per-session say in who is admitted first, set by hand,
-with a LOW tier the box has never had. Today's levers are per job: `--front` (an operator's one-off
-push of one queued job) and `--priority high` (set at launch by hooks and Makefiles). Neither can
-demote a session, and neither applies to a session's future jobs. The owner's words: tier is keyed
-on the owner string when possible; the session tier wins, with job priorities as sub-levels under
-it; low-tier sessions wait; lanes ignore priorities and tiers.
+with a LOW tier the box has never had. Today's levers are per job: `--front` (a one-off push) and
+`--priority high` (set at launch). Neither can demote a session, and neither applies to a
+session's future jobs.
 
-**Premise measurement (decision rule written before the query).** Rule: if, over the last 14 days,
-fewer than 1% of confined runs waited 60 s or more for admission, queue order rarely decides
-anything and this spec recommends stopping; otherwise build. Query, read-only, against the live
-store (`confine_peak_history.wait_ms`, AIRA-323):
+**Premise measurement** (decision rule written before the query: stop if fewer than 1% of confined
+runs in 14 days waited 60 s or more). Query, read-only, `confine_peak_history.wait_ms` (AIRA-323):
 
 ```bash
 aira confine --memory-reserve 256M -- sqlite3 -readonly ~/.local/state/aira/state.db \
@@ -102,453 +73,378 @@ aira confine --memory-reserve 256M -- sqlite3 -readonly ~/.local/state/aira/stat
 ```
 
 Result 2026-11-27 (data starts 2026-11-15): 31,167 runs; 8,224 (26%) waited 60 s or more; 3,379
-(11%) 5 min or more; 413 waited 30 min or more; longest 7,457 s; 1,136 job-hours spent waiting; 13
-distinct days with a wait of 60 s or more. The probe's own 256M job queued 15 s, 15th of 15.
-Verdict: **build** (26% against a 1% stop threshold). Queue order decides a quarter of all runs.
+(11%) 5 min or more; 413 waited 30 min or more; longest 7,457 s. Verdict: **build**. Caveat: about
+59% of the long waits are lane-class small jobs (reported by the reviewer, see the summary), so the
+reachable share is roughly 11% of runs, still an order of magnitude over the threshold.
 
-**Greenfield minimum.** An in-memory daemon table `owner -> high|low` (medium is the absence of a
-row), read by the ONE ordering function at evaluation time, one comparison in the head rule ("a
-lower-tier waiter gets no bypass budget"), plus one verb to set a row and one place to see the
-table. Nothing is stored per waiter, so a mark applies to already-queued jobs on the next evaluator
-pass and to every future job of that owner. That is this design. The gaps from it, each justified:
+**Greenfield minimum.** A daemon table `owner -> high|low` (medium is the absence of a row),
+consulted by the ONE ordering function at evaluation time; one setter verb; the `t` key in
+`aira top`; the tier visible on rows. Nothing stored per waiter, so a mark applies to
+already-queued jobs on the next evaluator pass. That is this design. Additions, each justified:
 
-| Addition beyond the minimum | Why it stays |
+| Addition | Why it stays |
 |---|---|
-| A 64-row cap, refusal only | Bounds the reply, the footer and the idle-mark rows against a scripted loop. One count of a map the setter already holds. |
-| Idle-mark rows in `aira top` | Without them a mark on an owner with no listed jobs could not be seen or removed from `aira top`. Reuses the queued-row machinery (AIRA-308). |
-| Tier-blind lane order (D4, L5) | Required by D4. Two lines in the lane pre-pass. |
-| A writer mutex for the setter | Two concurrent setters would otherwise lose an acknowledged mark (§3.1). Readers stay lock-free. |
+| Marks stored in `state.db` (L3) | Without it every mark is silently wiped about every 16 hours (21 restarts in 14 days). One table in a database the daemon already opens; §3.1. |
+| 64-row cap, refusal only | With stored marks and no automatic prune, the only bound on the table, the reply and the idle rows. |
+| Idle-mark rows in `aira top` | A stored mark whose owner has no listed job could otherwise not be seen or removed from `aira top`. |
+| A writer mutex | Two concurrent setters would otherwise lose an acknowledged mark. |
 
-Cut, considered and rejected: a per-waiter tier field (staleness and a second source of order); a
-tier on the admit request (the client would need to know its tier); an observe-only daemon mode (an
-empty table is today's behaviour, pinned by T1 and T29, so the first mark is the enforce step);
-an ownership guard on the verb (L6); automatic eviction (round 1); a `queued_tier` wait-line field
-(round 1); a new strict hold kind (round 2: the zero-budget hold reuses the existing duty cycle and
-its bound); persistence in `state.db` (round 2: its table, load path, load-failure state and
-store-failure path existed only for L3, and it kept dead `cc-` marks forever); client-derived job
-counts (round 2: the queued rows are capped at 64).
+Cut: any hold or budget change (D6); the `confine --session-tier` flag (the verb form is the CLI;
+tests need no more); a second confirmation page (the h/m/l prompt is the confirmation; a tier is
+reversible and touches no running job); `set_at`/`set_by` metadata (the journal's audit line
+records the setter); `jobs_now` (the idle row shows a mark with no listed jobs); a `queued_tier`
+field and wait-line text (a row's tier is its owner's entry in the same reply); a per-waiter tier;
+a tier on the admit request; an observe-only mode (an empty table is today, T1); an MCP setter
+(L6); automatic pruning (R9).
 
 ## 2. Decided by the owner (2026-11-27), recorded, not reopened
 
-- **D1 Identity.** A tier is keyed on the job's owner string, the same string `aira confine` puts
-  in the scope id (owner chain `resolveConfineOwner`, `cmd/aira/main.go:2291`: `--owner`, then
-  `AIRA_CONFINE_OWNER`, then `cc-<CLAUDE_CODE_SESSION_ID>`, then the worktree id, then an inferred
-  `@cwd-<dir>`). Subagents inherit their parent's session id, so they share its tier. "When
-  possible": a waiter whose scope id carries no owner is untiered (§3.2).
-- **D2 Composition.** Lexicographic key: pushed first (latest push first); then session tier HIGH,
-  MEDIUM, LOW; inside a tier, `--priority high` before normal; FIFO (enqueue order) inside each
-  bucket. With no marks the order is element-for-element today's (pushed, job-high, rest).
-- **D3 Starvation.** LOW simply waits: no age cap, no promotion (§5). The ways a LOW job still
-  starts while higher-tier jobs wait are the lane (D4), a push (D2) and today's catch-up pass, which
-  is a per-hold time bound shared by every tier, not an age rule for LOW (L8).
-- **D4 Small lane.** The lane ignores tiers and job priorities entirely (§6).
-- **D5 Running jobs.** Admission order only: no preemption, no reservation change, no cpu.weight
-  change.
+- **D1 Identity.** Keyed on the owner string `aira confine` puts in the scope id
+  (`resolveConfineOwner`, `cmd/aira/main.go:2291`: `--owner`, `AIRA_CONFINE_OWNER`,
+  `cc-<CLAUDE_CODE_SESSION_ID>`, worktree id, inferred `@cwd-<dir>`); subagents share it.
+- **D2 Composition.** Pushed first (latest first); then tier HIGH, MEDIUM, LOW; inside a tier
+  `--priority high` before normal; FIFO inside each bucket.
+- **D3** LOW waits (no age cap, no promotion). **D4** The lane ignores tiers and job priorities.
+  **D5** Running jobs are unaffected (no preemption, reservation or cpu.weight change).
+- **D6 Order only** (owner line L8, option A). Tiers change only `admitOrderLocked`, exactly as
+  `--priority high` does (AIRA-340: "queue order only, never the head rule"). No zero-budget rule,
+  no strict hold, no new anchor, phase or diagnosis token; the head rule, the AIRA-307 budget and
+  the backstop are unchanged.
 
 ## 3. Design
 
-### 3.1 The table
+### 3.1 The table and its storage
 
-An immutable `map[string]sessionEntry` (`tier` is `high` or `low`, plus `set_at_ms`, `set_by`; no
-`medium` row ever exists) held by an `atomic.Pointer` on `Server`. Readers (evaluator, snapshot,
-lane, list) load the pointer ONCE per call, lock-free, so one evaluator pass or one snapshot sees one
-table. In memory only: a daemon start begins with an empty table (today's order), exactly as
-`--front` pushes do.
+`Server` holds `tiers atomic.Pointer[map[string]sessionTier]` (`sessionTier` is `high` or `low`;
+no `medium` row exists) and `tiersMu sync.Mutex`. The map is immutable once published. Every
+reader loads the pointer once, lock-free: an evaluator pass once, passing it to the lane pre-pass
+and the walk (so the lane's reference and the walk's head come from one order); a list reply once.
 
-Writers are serialised by one dedicated `tiersMu sync.Mutex`, held for the whole
-read-copy-check-publish of a set, so two concurrent setters cannot each publish a copy missing the
-other's row. `tiersMu` is never taken while `queue.mu` is held, and `queue.mu` is never taken while
-`tiersMu` is held (the reply's job count is read after `tiersMu` is released), so there is no
-lock-order edge.
+**Set.** Under `tiersMu`, for the whole operation: copy the current map; apply the change (`medium`
+deletes the row); if the copy has more than 64 rows, refuse `E_CONFINE_SESSION_TIERS_FULL` (a new
+row only; re-set and remove always pass the check); write the copy to the store (below); only then
+publish the pointer and write the audit line
+`confine-session-tier: setter=<caller> session=<owner> tier=<old>-><new>` (like
+`logConfineFront`). A store failure refuses the set with
+`E_CONFINE_UNAVAILABLE: store session tiers: <cause>` and publishes nothing, so memory and store
+stay equal. The set takes no `queue.mu` (no lock-order edge); its store write has a bounded
+context. The new order applies on the next evaluator pass (the existing poll tick).
 
-Cap: a set that would add a 65th row is refused with `E_CONFINE_SESSION_TIERS_FULL` (new code, exit
-1, a state condition like `E_CONFINE_NOT_QUEUED`), changing nothing. Re-setting or removing an
-existing row is always allowed. No row is removed except by a `medium` set or a daemon restart.
+**Store (L3 recommended).** One table in `state.db`, added to the schema list beside
+`confine_peak_history` (`internal/store/store.go:878`):
 
-Valid keys: anything `runner.ValidateConfineOwner` accepts, except `unknown` (the marker for "no
-owner") and the empty string; both are refused `E_CONFINE_ARGUMENT_INVALID`. An inferred
-`@cwd-<dir>` key is accepted: it groups every unattributed launch from that directory, and the reply
-says so. The key is matched exactly, never by prefix; a typo creates a row for an owner with no
-jobs, and the reply's `jobs_now: 0` plus the idle row in `aira top` make that visible.
-
-### 3.2 The ordering function and the hold
-
-**Whose tier.** A waiter's tier key is the owner EMBEDDED in its scope id,
-`runner.ParseConfineScopeID(waiter.scopeID)`, the same parse every row display (`--list`,
-`aira top`, `confine_kill_queued.go:216`) and the `--front` and kill ownership guards
-(`confine_front.go:113`) use. It is NOT `waiter.owner`, the request's claim: `validateAdmitArgs`
-(`admit.go:3796-3802`) accepts a claim when the scope id has no owner tail. Keying on the one parse
-every reader uses makes the tier and the shown owner the same string by construction. Lookup is
-`tiers[key]`, defaulting to MEDIUM.
-
-**Untiered waiters, MEDIUM whatever the table says:**
-- a sub-reservation (`isSubReservation()`: aitest workers, `confine-reserve` holds). It is a running
-  job's internal progress, so demoting it would act on a running job (D5); it already skips the
-  head rule, and so it also skips the hold;
-- a scope-less job-level waiter (`aira run`), which carries no owner (deferral R7);
-- a scoped waiter whose scope id has no owner tail (shown as unowned everywhere).
-
-Because untiered waiters sit at MEDIUM, "every session in the same tier" equals today's order only
-for MEDIUM (the empty table). With every owner HIGH, owned job-level waiters sort before every
-untiered one; with every owner LOW, after (I1, T2).
-
-**Order.** `admitOrderLocked(queue)` (`internal/daemon/admit.go:475`) becomes
-`admitOrderLocked(queue, tiers)`: one pass over `queue.waiters` sorting queued waiters into seven
-buckets (pushed; HIGH/job-high; HIGH/normal; MEDIUM/job-high; MEDIUM/normal; LOW/job-high;
-LOW/normal), pushed sorted by descending `pushSeq` as today, the rest in `queue.waiters` order. It
-stays the single source for its three readers: the evaluator (`admit.go:2676`), the snapshot
-(`admit.go:1405`: position, queued-ahead bytes, `aira top` and `--list` rows) and the lane's
-reference waiter (`small_lane.go:157`). Each passes the table it loaded; the snapshot copies that
-same pointer out, so the rows, their order and the tiers shown come from one table (T4).
-
-**The hold: a lower tier has a bypass budget of zero.** One new arm in the head-protection switch
-(`admit.go:2740`), placed AFTER the backstop arm and before the budget arm:
-
-```go
-case head.pushSeq > 0:              // unchanged: strict
-case phase == admitFreezeYield:     // unchanged: the backstop pass grants on fit, every tier
-case tierOf(waiter) < tierOf(head): // new: a lower tier gets no budget
-	fits = false
-	budgetWithheld = true
-	waiter.heldByHead = true
-case <budget exhausted>:            // unchanged: same tier
+```sql
+CREATE TABLE IF NOT EXISTS confine_session_tiers (
+    owner TEXT PRIMARY KEY, tier TEXT NOT NULL CHECK (tier IN ('high','low')))
 ```
 
-A lower-tier waiter is treated exactly as a same-tier waiter whose budget is spent: it is withheld,
-`budgetWithheld` arms the AIRA-307 anchor from idle (`admit.go:2797-2804`), the reported phase is
-`hold`, and the one backstop pass per `maxHold` (`admit.go:2609-2624`, default 5 min) grants it on
-fit, counting it against `bypassed` like any backstop grant. So the tier hold has no state, phase,
-token or bound of its own: it is the existing bounded hold. `protected` is unchanged
-(`head != nil && !waiter.isSubReservation()`), so sub-reservations are never held. A waiter of a
-higher tier than the head cannot be behind it (it sorts first); only pushes can, and a pushed waiter
-is never behind an unpushed head. The job-high / normal split inside one tier keeps today's budget,
-as AIRA-340 does.
+Two store methods: `ConfineSessionTiers(ctx) (map[string]string, error)` and
+`ReplaceConfineSessionTiers(ctx, map[string]string) error`, the latter one transaction deleting
+every row and inserting the map (at most 64 rows), so after every acknowledged set the store
+equals memory by construction, even after a failed load. Why not a file: the daemon already opens
+`state.db` at start as its single writer; a file needs a new path, an encoding and a
+temp-fsync-rename writer the daemon package does not have.
 
-Accepted side effect, with marks set only: a tier hold arms the queue's anchor earlier than a spent
-same-tier budget would, so the backstop pass may come sooner for the head's own tier too. With an
-empty table no waiter is ever lower-tier than a head, so the arm never fires (T29).
+**Load.** Once in `Serve`, after `OpenDB` (`server.go:493`) and before `net.Listen` (`:514`), so
+the first pass and every re-declared survivor see the stored marks. Any failure (query error, an
+owner `runner.ValidateConfineOwner` refuses, more than 64 rows) means **no marks**: an empty table,
+one log line, and a fixed `tiersWarning` string the list reply carries (§3.5); never a refusal to
+start. (A schema failure inside `OpenDB` refuses start today, unchanged.) ci-shim mode neither
+loads nor sets. No automatic prune: finished sessions' marks stay, bounded by the cap and shown as
+idle rows (§3.6, R9).
 
-### 3.3 The set verb and the wire
+**Valid keys.** What `runner.ValidateConfineOwner` accepts, except empty and `unknown` (refused
+`E_CONFINE_ARGUMENT_INVALID`); `@cwd-<dir>` accepted (L4); exact match, never by prefix.
 
-A new project-less confine management verb, `confine-session-tier`, sibling of `confine-front` and
-`confine-resize`, routed through `confineManagement` (`internal/daemon/confine_manage.go`). It must
-be added to BOTH client transports: the CLI's `Dispatch` list (`cmd/aira/dispatcher.go:162`) and
-`aira top`'s `DispatchPalette` list (`dispatcher.go:523`), plus `cmd/aira/main.go:381`,
-`dispatcher.go:223`, `internal/core/routing.go:51/135` and `scope_dir.go:154`. AIRA-309 found a
-missing entry once; T19 drives both transports. Args: `session` (target owner), `tier`
-(`high|medium|low`), plus the siblings' `owner` (caller) and `slice`.
+### 3.2 The order
 
-CLI: `aira confine --session-tier <owner>=<high|medium|low>`; `medium` removes the mark (the one way
-to remove it). `=` is outside the owner alphabet, so the split is exact. Reply:
-`{session, tier, previous, jobs_now}`, where `jobs_now` is the daemon's exact count of queued and
-granted waiters on the slice whose key is `session`, taken from a full walk under `queue.mu`, never
-from capped rows. Daemon audit line on success only, like `logConfineFront`:
-`confine-session-tier: setter=<caller> session=<owner> tier=<old>-><new>`. ci-shim mode refuses the
-verb with `E_CONFINE_UNAVAILABLE` (a CI container is one session).
+**Whose tier.** A waiter's key is the owner embedded in its scope id,
+`runner.ParseConfineScopeID(waiter.scopeID)` (`internal/runner/confine.go:1476`), the parse every
+row display and the `--front`/kill guards use; never `waiter.owner`, the request's claim, which
+`validateAdmitArgs` accepts when the scope id has no owner tail (I6).
 
-Error codes, each with `codes.ExitForCode` and pinned by a test (T18, T20, T25):
-`E_CONFINE_ARGUMENT_INVALID` (bad value), `E_CONFINE_UNAVAILABLE` (ci-shim),
-`E_CONFINE_SESSION_TIERS_FULL` (cap).
+**Untiered, always MEDIUM:** a sub-reservation (`isSubReservation()`: aitest workers,
+`confine-reserve` holds; a running job's internal progress, D5); a scope-less waiter (`aira run`,
+no owner; R7); a scoped waiter with no owner tail.
 
-Dispatch table (`internal/core/core.go`, beside `confine-front` at :2203): `Include: true` so the
-generated help and agent guide describe it; NO `MCPTool` (L6). Its summary says: queue order and
-hold only; set by the owner from `aira top`; agents do not set tiers.
+**The function.** `admitOrderLocked(queue)` (`internal/daemon/admit.go:475`) becomes
+`admitOrderLocked(queue, tiers)`: one pass over `queue.waiters` into seven buckets (pushed;
+HIGH/job-high; HIGH/normal; MEDIUM/job-high; MEDIUM/normal; LOW/job-high; LOW/normal), pushed
+sorted by descending `pushSeq` as today, every other bucket in `queue.waiters` (enqueue) order. With
+an empty table the MEDIUM buckets hold every unpushed waiter and the result is today's
+`pushed, high, rest` element for element. Its readers each pass one table load: the evaluator walk
+(`admit.go:2676`), the snapshot (`admit.go:1405`, which gains a `tiers` argument through
+`admitSliceSnapshotFor`) and the lane's reference (§3.4). Nothing else in the evaluator changes.
 
-Reads, one additive reply field, no request change: `confine-list` gains `session_tiers`, a list of
-`{owner, tier, set_at_ms, set_by}`. An empty list is a positive "none set" and is never
-`omitempty`-dropped (T17). An ABSENT field means an old daemon: clients render it
-`session tiers: unevaluated`, never "none set" (T17b).
+### 3.3 The accepted consequence, and its bound
 
-**Protocol version stays 15.** Precedent: AIRA-312 added `confine-resize` and AIRA-340/324/323 added
-fields without a bump, because a bump refuses every confine during a client/daemon skew while the
-old side already fails loudly per request. The admit request and the ARDR re-declare frame are
-unchanged; after a daemon restart the table is empty (T12). `TestRunnerDaemonProtocolVersionMatchesTheDaemon`
-and the `protocol_test.go` pin stay at 15 and pass unchanged; `protocol.go` gets a comment entry in
-the AIRA-340 style. Skew, measured by the builder against the live pre-381 daemon before claiming it:
-- new client, old daemon: an unknown management verb falls through to project dispatch
-  (`server.go:1041`), so its code is whatever that path answers. The client keeps the daemon's code
-  and message verbatim, exits with that code's status, and appends a qualified hint: "if the daemon
-  predates session tiers (v0.47), restart aira-daemon.service". Never a claimed success (T25).
-- old client, new daemon: the new list field is ignored (the builder confirms the list decoder is
-  not `DisallowUnknownFields`).
+The head rule is untouched: the head is still the first visited job-level, ungated waiter refused
+on capacity that could fit an empty slice, whatever its tier, and every later job-level waiter is
+judged against it by the unchanged switch (`admit.go:2738-2750`). So a lower-tier waiter can be
+granted ahead of a blocked higher-tier head. Exactly how much, from the code:
 
-### 3.4 `aira top`
+1. **Budget.** In ordinary passes, a fitting job-level waiter behind an unpushed head H is granted
+   only while `H.bypassed + charge <= H.charge / 2` (`admitBypassBudget`, `admit.go:508`).
+   `bypassed` is a field of H, written only at `admit.go:2757` and never reset, so over H's whole
+   wait the job-level grants past it in ordinary passes total at most half H's ledger booking, all
+   tiers together. Tiers decide who gets that allowance first: higher tiers are visited first.
+2. **Backstop.** The first pass at or after the anchor plus `maxHold` grants every fitting waiter
+   behind an unpushed head, then the next withheld fit re-arms (`admit.go:2609-2624`, `:2802`).
+   `maxHold` defaults to 5 minutes; `AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD` sets it (minimum 1 s) or
+   disables it, which makes the budget hold unbounded by that setting's definition
+   (`paths.go:297-322`).
+3. **Lane.** A small job is granted in the pre-pass only if guard G leaves the reference (§3.4)
+   its room. **Sub-reservations** are granted on fit, uncounted. **A pushed head** grants nothing
+   past itself.
 
-- **Where a tier shows.** The SESSION cell (`topSessionCell`, `cmd/aira/tui_top.go:1238`) of every
-  row, live and queued, gains ` (high)` or ` (low)` when the row's owner has a mark; medium shows
-  nothing. A queued row's LIVE cell keeps its words (`pushed`, `high` for `--priority high`, the
-  AIRA-370 reason; a tier-held waiter reads `behind head`, the same bounded hold as a spent budget),
-  so the two kinds of "high" stay in different columns.
-- **Idle marks.** Each mark whose owner has no LISTED row is shown as a dim row after the queued
-  rows: `session <owner>: tier low, no listed jobs (set by <setter>, <age> ago)`. The wording is
-  "listed" because the queued rows are capped at 64 (`runner.ConfineQueuedRowLimit`); when the
-  queue is longer, the existing "showing N of M" line says so (T31). A new row kind like `Queued`,
-  whose only action is `t`.
-- **Recognising a session.** The SESSION cell shows a chosen name verbatim, else the tmux window
-  name, else `cc-` plus 8 hex digits, else the worktree hash prefix (AIRA-277/313). The `t` dialog
-  adds the full owner string. It shows no job counts: counts from capped rows could be false, and
-  the daemon's exact `jobs_now` comes back in the reply, shown on the result line.
-- **The `t` key.** On any row with a valid owner (live, queued or idle-mark), `t` opens a three-way
-  choice (h/m/l) and then a confirmation page built like `topFrontConfirm` (`tui_inline.go:129`):
-  "Set session field (owner `field`, now medium) to LOW. Its queued jobs will wait behind every
-  waiting medium and high job, except in the 5-minute catch-up pass; running jobs are not affected.
-  Applies at once, until the daemon restarts." The request's `session` is the row record's full
-  owner (`record.Owner`, from the scope-id tail), never the SESSION cell's text. A row whose owner
-  is empty or `unknown` answers "this job has no session owner to mark" and sends nothing.
-- **Footer.** One line: `session tiers: high field; low cc-1a2b3c4d`, `session tiers: none set`, or
-  `session tiers: unevaluated (daemon predates session tiers)`.
+Each applies today to a normal job behind a `--priority high` head; D6 extends that contract.
 
-### 3.5 `confine --list` and the wait line
+**Wedge check.** Order-only adds no hold: no waiter is ever refused by a tier, so the set of rules
+that can keep a fitting waiter waiting is today's set (budget, pushed head, restart freeze,
+exclusivity gate). A nested `aira confine` child C of a running MEDIUM job R (an ordinary job-level
+admit, `cmd/aira/confine_nested.go:9-14`) behind a HIGH head H is an ordinary waiter behind a head:
+granted within H's budget, else in the next backstop pass, so R can finish and H can then fit. The
+only strict cases are today's operator choices: a pushed head, or `maxHold` disabled with H's
+budget spent. Reordering can make such a head appear in front of C where FIFO would not have, but
+`--priority high` already can, and both are the documented meaning of those choices.
 
-`confine --list` prints the same footer line under the slice summary; `--json` carries
-`session_tiers`. Queued rows get no new field: a row's tier is its owner's entry in the same reply's
-`session_tiers`. The client wait line is unchanged. The AIRA-370 diagnosis gains no token: a
-tier-held waiter sets `heldByHead` and reads `behind head`, and the freeze phase reads `hold`,
-both true because the tier hold is the existing hold.
+### 3.4 The small lane (D4, L5)
+
+`smallLanePassLocked` (`internal/daemon/small_lane.go:153-219`) uses `admitOrderLocked` today for
+two things, which this design separates:
+
+- **Candidate order** (which eligible small job gets lane room first when the lane cap is nearly
+  full, the loop at `:182`) becomes plain FIFO: queued waiters in `queue.waiters` order, ignoring
+  tier, `--priority high` and push. Ignoring push changes no outcome: a pushed reference already
+  closes the lane to every candidate but itself (`:191-195`), and a pushed small job the FIFO loop
+  passes before it becomes the reference reaches the main walk, where it is first in line and no
+  head precedes it.
+- **The reference** (the waiter guard G protects, `nextRef` at `:171-180`) stays in evaluation
+  order (tier-aware): G exists to keep the room of the waiter the main walk will grant or make the
+  head. The cursor is an index into the EVALUATION order `order := admitOrderLocked(queue, tiers)`,
+  never into the candidate list. After a lane grant of waiter w, `if w == order[ref] { ref =
+  nextRef(ref + 1) }`, both in evaluation-order coordinates; today's `if index == reference {
+  reference = nextRef(index + 1) }` (`:215-216`) compares and advances with the candidate index,
+  which is correct only while the two lists are the same list.
+
+Counterexample for the cursor (T7b): zero headroom, 32 GiB ceiling, lane cap at least 1.5 GiB;
+enqueue LOW L 0.5, MEDIUM M 31, HIGH H 0.5, LOW S 0.5 GiB. Evaluation order H, M, L, S; candidate
+order L, M, H, S. L is lane-granted (H fits beside it). H is lane-granted and is the reference.
+Advancing from H's candidate index 2 lands on S and skips M, so S is granted although
+31 + 1.5 > 32. Advancing in evaluation order makes M the reference, and S is `kept`.
+
+**The one visible change for sessions that do nothing** (L5): today the lane offers room to
+`--priority high` small jobs first; under D4 it offers it in arrival order. Only when the lane cap
+is contended does an older ordinary small job get the last lane room before a newer
+`--priority high` one, which then goes in the main walk at its job-high place.
+
+### 3.5 The verb and the wire
+
+A new project-less confine management verb `confine-session-tier`, args `session` (target owner),
+`tier` (`high|medium|low`) and the siblings' `owner` (caller). No `slice`: tiers are machine-wide,
+and an accepted-and-ignored `--slice` is what AIRA-82/196 refuse. CLI:
+`aira confine-session-tier <owner> <high|medium|low>`. Reply `{session, tier, previous}`.
+
+It must be added at every allowlist site, each with a test that fails when the entry is removed:
+- daemon route: `internal/daemon/server.go:939`, and a branch in `confineManagement`
+  (`internal/daemon/confine_manage.go:153`) after the caller-owner check and before the slice
+  path resolution;
+- CLI: `cmd/aira/main.go:381` (verb form to `buildRequest`), `:880` (option allowlist
+  `{"owner": true}`), `:2769` (`buildRequest`: positionals `session` and `tier`, validated by the
+  function the daemon uses), `:1613` (`confineHelpVerbs`); `:2369` is NOT touched (the
+  `confine --session-tier` flag spelling is cut);
+- client transports: `cmd/aira/dispatcher.go:162` (`Dispatch`), `:223` (old-daemon hint),
+  `:523` (`DispatchPalette`, for `aira top`), and `withOldDaemonManagementHint` (`:763`);
+- routing: `internal/core/routing.go:51` and `:135`, `cmd/aira/scope_dir.go:154`;
+- dispatch table: `internal/core/core.go`, beside `confine-front` (`:2203`), `Include: true`, no
+  `MCPTool` (L6); summary: "Set a session's admission order tier (queue order only). Set by the
+  owner from `aira top`; agents do not set tiers."
+
+ci-shim mode refuses the verb with `E_CONFINE_UNAVAILABLE` (a CI container is one session).
+
+**Error codes.** `E_CONFINE_ARGUMENT_INVALID` (exit 2: bad `session` or `tier`),
+`E_CONFINE_UNAVAILABLE` (exit 4: ci-shim, store failure), and one new code
+`E_CONFINE_SESSION_TIERS_FULL`, exit 1 (a state condition, like `E_CONFINE_NOT_QUEUED`,
+`internal/codes/codes.go:381`). It needs its catalogue entry in `codes.go`;
+`internal/codes/produced_test.go` checks both directions (produced but uncatalogued, catalogued but
+unproduced), so the entry and its producer land together.
+
+**List reply.** `confine-list` gains `session_tiers` (a list of `{owner, tier}`, sorted by owner)
+and `session_tiers_warning` (string, `omitempty`; the load-failure text of §3.1). The
+`confine-list` case loads the table pointer ONCE at its start, before the shim/live branch, and
+sets both fields on the result before every return, the `UNEVALUATED` early return included
+(`confine_manage.go:165-185`). It passes the same pointer to `admitSliceSnapshotFor`, so the
+rows' order and the reported tiers come from one table. The fields are filled from the `Server`
+table, never from the queue snapshot: a mark with no waiters, or on a box with no live queue
+(`snapshot.present` false), is still listed. `session_tiers` is a non-nil slice and never
+`omitempty`, so "none set" is `[]`; the client decodes it into a pointer, and an absent field (an
+old daemon) renders `session tiers: unevaluated`, never "none set". Queued rows gain no field.
+
+**Protocol version stays 15** (`internal/daemon/protocol.go:218`, pinned by
+`TestProtocolVersionIsPinned`, `protocol_test.go:128`, and the runner pin
+`protocol_pin_linux_test.go`): no admit, re-declare or store-op frame changes. `protocol.go` gets a
+comment entry in the AIRA-340 style. Skew, measured by the builder against the live pre-381
+daemon before claiming it:
+- new client, old daemon: the unknown verb falls through to project dispatch
+  (`server.go:1040`), whose code is outside `E_CONFINE_*`, so `withOldDaemonManagementHint`
+  keeps the daemon's code and message and appends "the running aira daemon may predate
+  `aira confine-session-tier`; restart it"; never a claimed success (T25);
+- old client, new daemon: the two new list fields are unknown to the old client's decoder, which is
+  not `DisallowUnknownFields` on this reply (the builder confirms).
+
+### 3.6 `aira top` and `confine --list`
+
+- **SESSION cell** (`topSessionCell`, `cmd/aira/tui_top.go:1237`) of every row gains ` (high)` or
+  ` (low)` for a marked owner; the LIVE cell keeps `pushed`, `high` (job priority) and the
+  AIRA-370 reason, so the two kinds of "high" stay in different columns.
+- **Idle-mark row.** Each mark whose owner has no LISTED row is drawn as a dim row after the queued
+  rows: `session <owner>: tier low, no listed jobs`. "Listed", because queued rows are capped at
+  64 (`runner.ConfineQueuedRowLimit`); when the queue is longer the existing "showing N of M" line
+  says so. Its only action is `t`.
+- **The `t` key** (in the `viewTop` key switch, `cmd/aira/tui_inline.go:106`), on any row with a
+  valid owner: one prompt, built like `topFrontConfirm` (`:129`): "Session field (owner `field`)
+  is MEDIUM. h: HIGH, m: MEDIUM (removes the mark), l: LOW, Esc: cancel. Changes the order of its
+  waiting and future jobs only; running jobs are not affected. Kept until changed." The keypress
+  sends; the result line shows `session field: medium -> low` or the error. The request's
+  `session` is the row record's full owner (`record.Owner`, from the scope-id tail), never the
+  cell text; a row whose owner is empty or `unknown` answers "this job has no session owner to
+  mark" and sends nothing. Sent through `DispatchPalette` with the caller as `state.ConfineOwner`.
+- **Footer**, and the same line under `confine --list`'s slice summary:
+  `session tiers: high field; low cc-1a2b3c4d`, `session tiers: none set`, or
+  `session tiers: unevaluated (daemon predates session tiers)`; with a warning, the line ends
+  `(stored marks did not load: <cause>)`. `--json` carries both fields.
 
 ## 4. Invariants
 
-- I1 Order: `admitOrderLocked` returns the seven-bucket order of §3.2. With an empty table it equals
-  today's three-bucket order element by element, untiered waiters included (T1). With every owner
-  HIGH: pushed; owned job-high; owned normal; untiered job-high; untiered normal. With every owner
-  LOW: pushed; untiered job-high; untiered normal; owned job-high; owned normal (each FIFO) (T2).
-- I2 No per-waiter state: nothing about tiers is written to `admitWaiter`; a mark changes the order
-  and the hold of already-queued waiters on the next pass (T8).
-- I3 One ordering source: evaluator, snapshot and lane reference call the one function, each with
-  one table load; the snapshot reports that same table (T4).
-- I4 Ledger: a set writes only the table (T14). A tier hold writes the anchor, `bypassed` and
-  `heldByHead` exactly where a spent-budget hold does, and nothing else (T23).
-- I5 Head rule: a job-level waiter of a lower tier than an unpushed head has a budget of zero:
-  withheld except in the backstop pass. A same-tier waiter has today's budget and backstop; a pushed
-  head holds everything, as today; sub-reservations are never held (T10, T11, T23, T29).
-- I6 Bound: every hold behind an unpushed head ends within one `maxHold` plus one pass for every
-  waiter that fits at the backstop pass, whatever the tiers (T30).
-- I7 Lane: candidate order ignores tier and job priority; the reference is the evaluation order's
-  (§6; T6, T7).
-- I8 Honesty: an absent `session_tiers` is rendered unevaluated, never "none" (T17, T17b); no count
-  shown is derived from a capped row list (T31).
-- I9 Identity: the tier key of a waiter is the owner every row displays for it (T24).
-- I10 Writes: after concurrent setters return, every acknowledged set is in the published map (T15b).
+- I1 Order: the seven-bucket order of §3.2; with an empty table, today's order element by element
+  (T1); all-HIGH: pushed, owned job-high, owned normal, untiered job-high, untiered normal; all-LOW:
+  pushed, untiered job-high, untiered normal, owned job-high, owned normal (T2).
+- I2 Order only: each pass makes exactly the grants, `bypassed`, anchor, phase and diagnosis
+  writes today's evaluator makes walking the tier order (T10, T29, T30).
+- I3 No per-waiter state; a mark reorders already-queued waiters on the next pass (T8).
+- I4 One table per reader call; a list reply's rows and `session_tiers` come from one load, on
+  every reply path (T4, T17c).
+- I5 Lane: candidates FIFO, blind to tier, job priority and push; reference and cursor in
+  evaluation order (T6, T6b, T7, T7b).
+- I6 Identity: a waiter's tier key is the owner its row displays (T24).
+- I7 Writes: a set changes only the table and the store; every acknowledged set is in the
+  published map and the store equals it (T14, T15, T12c).
+- I8 Persistence: after a restart the table equals the store; a failed load gives an empty table,
+  a warning and a running daemon (T12, T12b).
+- I9 Honesty: absent `session_tiers` renders unevaluated; no count comes from capped rows (T17b,
+  T31).
 
-## 5. What LOW waiting means on a saturated box (D3)
+## 5. Tests: the failure each kills
 
-What the code does, per evaluator pass (`evaluateAdmitQueue`, `admit.go:2546-2830`):
-1. The lane pre-pass grants eligible small jobs (tier-blind, §6), each only if guard G leaves the
-   reference waiter its room.
-2. The walk visits waiters in evaluation order. Before a head is set, any waiter that fits is
-   granted, so on a box with room tiers are an order, not a gate: a LOW job alone is granted in the
-   same pass (T13).
-3. The head is the first visited job-level, ungated waiter that is refused on capacity (RAM, CPU or
-   VRAM) and could fit an empty slice (`admit.go:2805`). After it: a lower-tier job-level waiter is
-   withheld (zero budget) and arms the anchor; a same-tier one is granted within the head's budget
-   (half its booking); in the backstop pass every fitting waiter is granted; a pushed head grants
-   nothing past itself (`admit.go:2741`); sub-reservations are granted on fit.
+"False order": a job goes ahead when it should not; "false starve": a job is withheld when it
+should not be. The builder runs each named mutation and records it red. Generated queues (T1, T2,
+T29) contain pushed, job-high and normal owned, sub-reservation, scope-less and ownerless waiters.
 
-"The head is a LOW waiter that does not fit while a MEDIUM waiter behind it would fit" cannot occur
-within a pass: every MEDIUM waiter is visited first. A MEDIUM job arriving while a LOW waiter is head
-sorts ahead of it on the next pass: if it fits it is granted, even when the LOW head's budget is
-spent (a head protects only the waiters after it; T28); if it does not fit it becomes the head, and
-the LOW waiter behind it is withheld. A displaced head keeps its `bypassed` count and resumes it if
-it is head again (today's rule for a head displaced by a push) (T27).
-
-What bounds what:
-- The budget bounds how much of a head's own tier starts past it; the backstop pass bounds how long
-  ANY waiter behind an unpushed head waits for a pass that grants it on fit (I6).
-- Nothing bounds how long a lower-tier job waits in total: if every backstop pass finds no room for
-  it, it never starts in the main queue. That is D3, and it applies equally to MEDIUM behind a busy
-  HIGH session.
-- Wedge check. The tier hold adds no unbounded case because it is the budget hold with a smaller
-  budget. Concretely, the case round 2 found against a strict hold: a running MEDIUM job R (14 of
-  32 GiB) launches a nested `aira confine` child C of 2 GiB (an ordinary job-level admit with no
-  parent relation, `cmd/aira/confine_nested.go:9-14`); a HIGH head H needs 20 GiB. C is withheld
-  behind H, but the backstop pass grants it within `maxHold`, so R can finish and H then fits (T30).
-  The same bound covers a head refused only on CPU or VRAM. Two unbounded cases remain, both
-  existing and both chosen by an operator: a PUSHED head holds a nested child strictly today; and
-  with `AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD=disabled` the budget hold is unbounded by that setting's
-  definition (`paths.go:297-301`), so the zero-budget tier hold is too. Head eligibility still needs
-  an empty-slice fit, so an oversized waiter cannot hold anyone; exclusivity and the restart freeze
-  are gated before order and do not read it.
-
-## 6. The small lane and the tiers (D4)
-
-The lane is NOT independent of the ordering function today. `smallLanePassLocked`
-(`small_lane.go:153-219`) uses `admitOrderLocked` for the candidate order (which eligible small job
-gets lane room first when the lane cap is nearly full, :182) and for the reference waiter guard G
-protects (`nextRef`, :171-180, and the pushed-reference closure, :192). The design separates them:
-- Candidate order becomes tier-blind and priority-blind: pushed first (latest first), then enqueue
-  order (D4). It is computed by the same function with tiers and job priority neutralised, so the
-  two orders cannot drift on pushes.
-- The reference stays the evaluation order's (tier-aware): G exists to stop small leases taking the
-  room of the waiter the walk will make the head or grant. A tier-blind reference would protect the
-  wrong waiter and leave a HIGH head unprotected. The loop's `index == reference` test becomes a
-  waiter-identity test, since the two lists differ.
-
-A LOW small job can be granted past a HIGH head only if the HIGH head still fits beside the small
-leases (today's G). The main-walk hold does not apply in the lane.
-
-**The one visible change for sessions that do nothing** (L5): today the lane walks job-high small
-jobs first; under D4 it walks them FIFO. Only when the lane cap is contended, an older ordinary
-small job gets the last lane room before a newer `--priority high` small job, which then goes in the
-main walk at its job-high place. Main-walk order and hold are unchanged with no marks (T1, T29).
-
-## 7. Failure modes and the test that kills each
-
-"False order": a job goes ahead when it should not. "False starve": a job is held when it should not
-be. Every test must fail against the named wrong implementation; the builder runs that mutation.
-Every generated queue (T1, T2, T29) contains pushed waiters, job-high and normal owned waiters,
-sub-reservations, scope-less waiters and ownerless-scope waiters.
-
-| # | Dir | Counterexample (wrong implementation) | Test |
+| # | Dir | Wrong implementation (mutation) | Test |
 |---|---|---|---|
-| T1 | order | empty table changes order, or an absent row defaults to LOW | random queues (generator above), empty table: equal to an oracle copy of today's three-bucket function, element by element |
-| T2 | order | untiered waiters tiered, or all-one-tier order mis-sorted | the I1 all-HIGH and all-LOW orders, written out per bucket, asserted element by element |
-| T3 | order | job priority used as the primary key | table over {H,M,L} x {job-high, normal} x {pushed, not}: LOW job-high after MEDIUM normal; full order asserted |
-| T4 | order | snapshot or `--list` order differs from grant order | lane off, equal sizes, room for one at a time, mixed tiers: repeated pass-then-release grants in exactly the snapshot's position order; reported `session_tiers` is the table the order used |
-| T5 | order | pushed LOW job not first, or pushes not latest-first | two pushed LOW jobs (A then B) behind HIGH jobs: grant order B, A, then the HIGH jobs |
-| T6 | order | lane walks the evaluation order | lane room for one: older LOW small job lane-granted, newer HIGH small job not |
-| T7 | starve | lane reference tier-blind | effective maximum 32 GiB, 26 granted, no small leases; queued in enqueue order: MEDIUM 8 GiB, HIGH 31.5 GiB, LOW 1 GiB small. Tier-aware reference is the HIGH job (31.5 + 1 > 32: G fails), so the small job is `kept`; a tier-blind reference (MEDIUM, 8 + 1 <= 32) would grant it |
-| T8 | order | tier copied at enqueue | enqueue, then mark LOW: next pass reorders and withholds; remove the mark: order and budget restored |
-| T9 | starve | sub-reservation tiered by its parent | parent owner LOW; queue: its sub-reservation (older), then a MEDIUM job-level waiter, room for one: the sub-reservation is granted, as with an empty table |
-| T10 | starve | a LOW head given zero budget over its own tier | LOW head refused; a fitting LOW job behind it within budget is granted; with the budget spent it is withheld, then granted in the backstop pass |
-| T11 | starve | a HIGH head zero-budget over its own tier | as AIRA-340's `TestAdmitHighHeadUsesTheBypassBudgetNotThePushedRule`, for a HIGH head and a HIGH waiter |
-| T12 | order | marks survive, or re-declared leases change, across a restart | set a mark, restart the server: table empty, footer `none set`, ARDR re-declared lease unchanged, re-admitted waiter ordered MEDIUM |
-| T13 | starve | tier used as a gate without a head | LOW job alone on an empty slice: granted in the first pass |
-| T14 | order | set touches ledger or head state | ledger, `bypassed`, anchor, exclusive gate identical before and after a set (no pass between); grant-vs-cancel race `-race -count=20` still XOR |
-| T15b | order | setters not serialised | N goroutines setting distinct owners, `-race -count=20`: every acknowledged set is in the final map; 63 rows plus 2 concurrent new owners: exactly one succeeds, the other is refused `E_CONFINE_SESSION_TIERS_FULL` |
-| T17 | order | empty list dropped by `omitempty` | no marks: `session_tiers` is `[]`, not absent |
-| T17b | order | client renders absent as "none set" | `--list` and the `aira top` footer, fed a reply without `session_tiers`, print `session tiers: unevaluated` |
-| T18 | order | `unknown`, empty, over-long or `=`-less values accepted | each refused `E_CONFINE_ARGUMENT_INVALID`, exit status pinned |
-| T19 | order | verb missing from either client transport, or `t` sends the SESSION cell's text | (a) CLI `--session-tier` from outside any project reaches a stub daemon's handler through `Dispatch`; (b) the `t` key, driven through the `aira top` model and `DispatchPalette`, reaches the same stub: rows whose cell shows a tmux window name and a shortened `cc-` id send the full scope-id owner; an ownerless row sends nothing. Deleting the verb from either list turns its half red |
-| T20 | order | cap not enforced, or enforced on re-set/remove | 64 rows: a new owner is refused `E_CONFINE_SESSION_TIERS_FULL` (exit status pinned), nothing changed; re-set and remove of an existing row succeed |
-| T21 | order | MCP exposes the setter | generated MCP tool list has no session-tier tool; help and agent guide carry the "owner sets, agents do not" sentence |
-| T22 | order | `(high)` shown for a job-priority high | queued `--priority high` row in a medium session: SESSION cell unmarked, LIVE cell `high` |
-| T23 | starve/order | hold missing, before the backstop arm, applied to sub-reservations or same-tier waiters, or not arming the anchor | MEDIUM head that does not fit; behind it, fitting: a LOW job, a scope-less job, an owned MEDIUM job and a sub-reservation; budget unspent, anchor idle. Ordinary pass: LOW withheld (`behind head`), anchor armed, reported phase `hold`; scope-less and MEDIUM granted, `bypassed` grows by their charges; sub-reservation granted, not counted. Backstop pass (clock at armed + `maxHold`, a second fitting LOW job queued): the expired anchor is cleared, the LOW jobs are granted and counted in `bypassed`, the anchor is not re-armed in that pass. Then with a HIGH head: a fitting owned MEDIUM job and a fitting scope-less job are both withheld |
-| T24 | order | tier keyed on the request's owner claim | scope id without owner tail, request owner `field`, `field` marked HIGH: the waiter is MEDIUM and its row shows unowned |
-| T25 | order | old daemon's refusal claimed as success, or its code replaced | client against a stub answering the verb with a project-dispatch error: exit non-zero with that code's status, message kept, qualified hint appended |
-| T27 | starve | displaced LOW head loses or leaks its budget | LOW head with `bypassed` X; a non-fitting MEDIUM job arrives and becomes head; a fitting LOW job is now withheld; when the MEDIUM job is granted, the LOW head resumes with `bypassed` X |
-| T28 | starve | a spent LOW head holds a higher-tier arrival | LOW head with its budget spent and a fitting LOW job withheld behind it; a fitting MEDIUM job arrives: granted on the next pass, LOW head's `bypassed` unchanged |
-| T29 | order | the head rule (not only the order) changes with no marks | random queues and passes with an empty table, against an evaluator built with the tier arm removed: identical grants, `bypassed`, anchor and phase per pass; plus a MEDIUM head with fitting scope-less and ownerless-scope waiters within budget: granted |
-| T30 | starve | a lower-tier waiter wedged behind a head | running MEDIUM R (14 of 32 GiB); HIGH head H of 20 GiB; R's nested 2 GiB child C (same owner, no parent relation), lane off: C withheld, granted in the backstop pass; R released; H granted. Same with a HIGH head refused only on VRAM and a fitting LOW RAM-only job |
-| T31 | order | a count or "no jobs" derived from capped rows | 70 queued; a LOW-marked owner whose only jobs are rows 65-70: idle row reads `no listed jobs`, "showing 64 of 70" present, `t` dialog shows no count, CLI set reply `jobs_now` is 6 |
+| T1 | order | absent row defaults to LOW; or job-high bucket dropped | random queues, empty table: equal element by element to an oracle copy of today's `pushed, high, rest` function |
+| T2 | order | untiered waiters tiered by the table | the I1 all-HIGH and all-LOW orders written out per bucket |
+| T3 | order | tier and job-priority keys swapped | {H,M,L} x {job-high, normal} x {pushed, not}: full order asserted; LOW job-high after MEDIUM normal |
+| T4 | order | snapshot ordered without the table, or with a second load | lane off, equal sizes, room for one at a time, mixed tiers: pass-then-release grants follow the snapshot's position order exactly; reply `session_tiers` is the table that order used (a set injected between two loads would split them) |
+| T5 | order | tier ranked above push; pushes not latest-first | pushed LOW A then B behind waiting HIGH jobs: grant order B, A, then the HIGH jobs |
+| T8 | order | tier copied at enqueue | enqueue MEDIUM, then mark LOW: next pass reorders; remove: order restored |
+| T9 | starve | sub-reservation tiered by its parent | parent owner LOW; its sub-reservation (older) then a MEDIUM job-level waiter, room for one: the sub-reservation is granted, as with an empty table |
+| T24 | order | key read from `waiter.owner` | scope id without owner tail, request owner `field`, `field` HIGH: the waiter is MEDIUM and its row shows unowned |
+| T10 | both | zero-budget tier arm added (false starve) or budget skipped for lower tiers (false order) | lane off, 14 of 32 GiB running, no pin discount; HIGH head H 20 GiB refused; behind it fitting MEDIUM 4, LOW 4, LOW 4 GiB: MEDIUM and the first LOW granted (8 <= 10), the second LOW withheld (12 > 10), anchor armed, phase `hold`; next backstop pass grants it. With a zero-budget arm the first LOW is withheld; without the budget the second is granted |
+| T29 | both | any tier-aware condition in the head switch | random queues, random tables, random passes: per pass grants, `bypassed`, anchor, phase, `heldByHead` and `blocked` identical to a reference evaluator holding today's walk verbatim, fed `admitOrderLocked(queue, tiers)` |
+| T13 | starve | tier used as a gate | LOW job alone on an empty slice: granted in the first pass |
+| T30 | starve | a tier hold of any kind | running MEDIUM R (14 of 32 GiB); HIGH head H 20 GiB; R's nested 2 GiB child C, lane off: C granted within H's budget; R released; H granted |
+| T6 | order | lane candidates in evaluation order | lane room for one: older LOW small job lane-granted, newer HIGH small job not (asserted via `smallLaneGrantObserver`) |
+| T6b | order | lane candidates keep job-high first | lane room for one: older normal small job, newer `--priority high` small job, same session: the older is lane-granted (observer); the newer is not lane-granted in that pass |
+| T7 | starve | lane reference taken from the candidate (FIFO) order | 32 GiB, 26 granted, no small leases; enqueue MEDIUM 8, HIGH 31.5, LOW 1 GiB small: the reference is HIGH (31.5 + 1 > 32), so the small job is `kept`; a FIFO reference (MEDIUM, 8 + 1 <= 32) would grant it |
+| T7b | false order | cursor advanced by candidate index (`nextRef(index + 1)`) | §3.4 counterexample: L and H lane-granted, S `kept`, observer's reference for S is M; with the mutation S is granted |
+| T12 | order | marks not loaded, or loaded after the first pass | set `field` HIGH, restart the Server on the same state dir with `field`'s survivor re-declaring and a new `field` waiter queued behind MEDIUM ones: the first pass orders it HIGH; footer lists `high field`; ARDR lease unchanged |
+| T12b | starve | load failure refuses start, or shows "none set" without the warning | injected failing load: daemon serves; table empty; reply carries the warning; footer ends `(stored marks did not load: ...)`; a later set rewrites the store whole |
+| T12c | order | table published before the store write | injected failing write: set refused `E_CONFINE_UNAVAILABLE`, published table and store both unchanged |
+| T14 | order | a set touches ledger or head state | ledger, `bypassed`, anchor, exclusive gate identical before and after a set with no pass between |
+| T15 | order | `tiersMu` dropped | N goroutines setting distinct owners, `-race -count=20`: every acknowledged set in the final map and the store; 63 rows plus 2 concurrent new owners: exactly one refused `E_CONFINE_SESSION_TIERS_FULL` |
+| T17 | order | empty list dropped or sent as null | no marks: `session_tiers` is `[]` |
+| T17b | order | absent rendered "none set" | `--list` and the `aira top` footer, fed a reply without `session_tiers`: `session tiers: unevaluated` |
+| T17c | order | `session_tiers` filled from the snapshot, or only on the OK path | through the real Server connection path (socket, `confineManagement`): a mark with no waiters and no live queue is listed; also on the shim path and the `UNEVALUATED` return |
+| T18 | order | `unknown`, empty, over-long or bad-tier values accepted | each refused `E_CONFINE_ARGUMENT_INVALID`, exit 2, by client and daemon |
+| T19 | order | verb missing at any allowlist site; `t` sends the cell text | (a) `aira confine-session-tier field low` from outside any project reaches a stub daemon's handler; (b) the `t` key through the `aira top` model and `DispatchPalette` reaches it; rows showing a tmux name or a shortened `cc-` id send the full owner; an ownerless row sends nothing. Removing the entry at any §3.5 site turns a half red |
+| T20 | order | cap not enforced, or enforced on re-set/remove | 64 rows: a new owner refused `E_CONFINE_SESSION_TIERS_FULL` exit 1, nothing changed; re-set and remove succeed |
+| T21 | order | MCP exposes the setter | generated MCP tool list has no session-tier tool; help and agent guide carry "agents do not set tiers" |
+| T22 | order | `(high)` shown for job priority | queued `--priority high` row of a medium session: SESSION cell unmarked, LIVE cell `high` |
+| T25 | order | old daemon's refusal claimed as success or its code replaced | stub answering the verb with a project-dispatch error: non-zero exit with that code's status, message kept, hint appended |
+| T31 | order | "no jobs" derived from capped rows | 70 queued; a LOW owner whose only jobs are rows 65-70: idle row reads `no listed jobs`; "showing 64 of 70" present |
 
-Planned mutations (each must turn at least one test red): swap the tier and job-priority keys (T3);
-default an absent owner to LOW (T1, T3); tier untiered waiters by the table (T2); read the tier from
-the parent scope id (T9); key on `waiter.owner` (T24); store the tier at enqueue (T8); lane
-candidates from the evaluation order (T6); lane reference tier-blind (T7); give a same-tier head the
-zero-budget arm (T10, T11, T23); delete the tier arm (T23); move it before the backstop arm (T23,
-T30); make it strict without `budgetWithheld` (T23, T30); drop the `!isSubReservation()` exemption
-(T23); drop `tiersMu` (T15b); drop the empty list (T17); render absent as none (T17b); remove the
-verb from either client list, or send the cell text from `t` (T19); count from rows (T31).
+## 6. Owner lines (accept or veto, one line each)
 
-## 8. Owner lines (accept or veto, one line each)
-
-- **L1 Minimum.** Accept the table-at-evaluation design of §1; no per-waiter state, no admit-wire
+- **L1 Minimum.** The table consulted at evaluation time; no per-waiter state, no admit-wire
   change, no observe mode. Recommended: accept.
-- **L2 Who is untiered.** Sub-reservations (suite worker claims), `aira run` jobs and jobs whose
-  scope id has no owner are always MEDIUM. So a HIGH session's suite is HIGH only for its own
-  admission, its workers' claims ordered after other HIGH jobs; a LOW session's running suite keeps
-  getting worker room on fit while HIGH jobs wait, as suites do past any waiting job today; and
-  marking every owner HIGH is not the same as no marks. Recommended: accept (D5 for claims; the
-  others have no owner to key on).
-- **L3 Lifetime.** Marks live in daemon memory, at most 64, a 65th refused, dropped at every daemon
-  restart like `--front`. Recommended: accept (the from-scratch minimum). Cost: re-mark the
-  sessions you care about after each release cutover. Alternative: store marks in `state.db`; adds
-  a table, a start-up load with its own failure state and an unevaluated report, a store-failure
-  path on every set and three tests, and keeps marks on dead `cc-` sessions until removed by hand
-  (each holds one of the 64 slots and an idle row).
-- **L4 `@cwd-` keys.** Allowed, with the reply saying the mark covers every unattributed launch from
-  that directory. Recommended: accept.
-- **L5 Lane order.** Follow D4 literally: lane candidates FIFO, ignoring `--priority high` too, the
-  one change for sessions that do nothing (§6). Recommended: accept. Alternative: keep job priority
-  in the lane order and ignore only tiers, so sessions that do nothing see no change at all.
-- **L6 Trust and surface.** CLI and `aira top` only; no MCP tool; no ownership guard (marking OTHER
-  sessions is the feature); every set audit-logged and shown with its setter. Any agent on this UID
-  can still run the CLI and promote itself, as it can pass `--priority high` today; the skill text
-  says agents never set tiers, and misuse is visible in `aira top` (`set by`). Recommended: accept.
-- **L7 Names.** Verb `confine-session-tier`, flag `--session-tier`, not `--tier` (the store already
-  uses "tier" for review tiers), key `t` in `aira top`. Recommended: accept.
-- **L8 The hold.** A lower tier gets no bypass budget behind a waiting head: it waits, except in the
-  catch-up pass every 5 minutes (§3.2). Example: a MEDIUM 10 GiB job waits for room; a LOW 4 GiB
-  job behind it that fits now waits until the next catch-up pass. Recommended: accept: every hold
-  stays bounded (I6). Alternatives: (a) strict, no catch-up for lower tiers: "low waits" becomes
-  literal, but a nested `aira confine` launched by a running medium job behind a waiting HIGH job
-  can wait forever, and so can that HIGH job (§5 example), and a job waiting only for GPU memory
-  holds lower tiers without bound; (b) order only, no hold: a LOW 4 GiB job also starts past a
-  waiting MEDIUM job within half its booking, which keeps the box busier but makes "low waits"
-  false whenever a higher-tier job is waiting.
+- **L2 Who is untiered.** Suite worker claims, `aira run` jobs and jobs whose scope id has no owner
+  are always MEDIUM. So marking every owner HIGH is not the same as no marks. Recommended: accept.
+- **L3 Lifetime.** Marks are stored in `state.db` and survive daemon restarts, until set back to
+  MEDIUM; at most 64; no automatic prune (finished sessions' marks stay as dim rows until removed);
+  a load failure starts the daemon with no marks and a visible warning. Recommended: accept (21
+  restarts in 14 days, reported). Alternative: marks in memory only, wiped at every restart like
+  `--front` pushes; deletes the table, the two store methods, the load, the warning field and T12b,
+  T12c; costs re-marking after each cutover, silently.
+- **L4 `@cwd-` keys.** Allowed (covers every unattributed launch from that directory). Accept.
+- **L5 Lane order.** Lane candidates plain FIFO, ignoring `--priority high` too: the one change for
+  sessions that do nothing (§3.4). Recommended: accept. Alternative: keep job priority in the lane
+  order and ignore only tiers.
+- **L6 Trust and surface.** CLI and `aira top` only; no MCP tool; no ownership guard (marking
+  other sessions is the feature); every set audit-logged with its setter in the daemon journal.
+  Any agent on this UID can still run the CLI, as it can pass `--priority high` today; the skill
+  text says agents never set tiers. Recommended: accept.
+- **L7 Names.** Verb `confine-session-tier` (bare "tier" is taken by review tiers), key `t`. Accept.
 - **L9 A push beats a tier.** `--front` goes first whatever the tier, and a session pushing its own
-  job needs no `--steal`, so a LOW session (or its agent, through the MCP `aira_confine_front`
-  tool) can push its own job past everyone. Recommended: accept (D2; a push is one job, shown as
-  `pushed`). Alternative: a push of a LOW session's job requires `--steal`.
+  job needs no `--steal`. Recommended: accept (D2). Alternative: a LOW session's push needs
+  `--steal`.
 
-## 9. Deferrals, each with the trigger that would justify it
+## 7. Deferrals, each with the trigger that would justify it
 
 | Deferred | Trigger |
 |---|---|
-| R1 cpu.weight or other runtime effect by tier | a measured case where a LOW session's running job slows a HIGH session's job materially |
-| R2 age cap or promotion for LOW | the owner reports a LOW job waiting longer than wanted, or a rant shows it |
-| R3 per-ticket tiers | the owner wants a tier to follow a ticket across sessions |
-| R4 tier by project | the owner keeps marking every session of one project the same way |
-| R5 auto-demotion of heavy sessions | evidence that one session repeatedly holds most of the slice (judgement; likely never) |
-| R6 an MCP setter | the owner asks an agent to set tiers on his behalf, often |
-| R7 tiers for `aira run` | `aira run` jobs are seen queueing (needs an owner on its admit request) |
-| R8 a tier following a Claude conversation across `/clear` or `/resume` | the owner finds re-marking a real cost (needs a stable session name the harness does not give) |
-| R9 marks stored across daemon restarts (L3 alternative) | the owner finds re-marking after cutovers a real cost |
+| R1 cpu.weight or other runtime effect by tier | a measured case where a LOW session's running job materially slows a HIGH session's job |
+| R2 age cap or promotion for LOW | the owner reports a LOW job waiting longer than wanted |
+| R3 a hold for lower tiers (L8 options strict / zero budget) | the owner finds lower-tier jobs starting past stuck higher-tier jobs a real cost |
+| R4 tier by project or ticket | the owner keeps marking every session of one project the same way |
+| R6 an MCP setter | the owner often asks an agent to set tiers |
+| R7 tiers for `aira run` | `aira run` jobs seen queueing (needs an owner on its admit request) |
+| R8 a tier following a conversation across `/clear` or `/resume` | re-marking found a real cost (needs a stable session name) |
+| R9 automatic prune of idle marks | the 64 cap is reached, or idle rows crowd `aira top` |
 
-## 10. Release and rollout
+## 8. Release and rollout
 
-- Milestone v0.47. Daemon and client change: cut over with the client install AND
-  `systemctl --user restart aira-daemon.service`, after `aira confine --list` and a heads-up to live
-  sessions (shared daemon-restart care).
-- Sessions that do nothing: no change in the main admission order or hold (T1, T29). The one change
-  is §6's lane order for `--priority high` small jobs when the lane is contended (L5). The first mark
-  the owner sets is the observe-to-enforce step for everything else.
-- Peer heads-up at the tagged release (deploy, speed): "The owner can now mark sessions high or low
-  from `aira top`; a waiting job holds back lower-tier sessions' jobs except in the 5-minute
-  catch-up pass and the small-job lane; marks are dropped at a daemon restart; agents must not set
-  tiers. Unmarked: main-queue order is unchanged; the small-job lane now takes `--priority high`
-  small jobs in plain arrival order."
-- Skill text (`aira install` template, from the dispatch table): one sentence, "Session tiers are set
-  by the owner from `aira top`; agents do not set them."
+- Milestone v0.47. Daemon, schema and client change: client install AND
+  `systemctl --user restart aira-daemon.service`, after `aira confine --list` and a heads-up
+  (shared daemon-restart care). Unmarked sessions: main-queue order and head rule unchanged (T1,
+  T29); the one change is the lane's arrival-order offer (L5).
+- Peer heads-up at the tagged release (deploy, speed): "The owner can mark sessions high or low in
+  `aira top`; a mark only reorders waiting jobs, like `--priority high`; the small-job lane ignores
+  it; marks survive daemon restarts; agents must not set tiers. The lane now takes `--priority
+  high` small jobs in plain arrival order."
+- Skill text (from the dispatch table): "Session tiers are set by the owner from `aira top`;
+  agents do not set them."
 
 ## Review log
 
-### Round 1 (Sol / Claude lineage, 9 blocking findings) -> round 2
+### Rounds 1-3 (9, 12 and 6 blocking findings)
 
-All nine held against `dc19915c`. A (tier only a sort key, G1): added a strict hold arm. B (two
-owner sources): keyed on the `ParseConfineScopeID` tail (I9, T24). C (untiered at MEDIUM, G2):
-kept and stated (I1, T2, L2). D (eviction, lifetime): eviction deleted; lifetime rewritten. E
-(unserialised writers): `tiersMu` (T15b). F (wire honesty): `queued_tier` deleted; client keeps the
-daemon's code (T25); absent field rendered unevaluated (T17b). G (porous oracles): T2, T4, T7, T9
-rewritten; T5, T10, T16, T26, T27 added.
+Round 1 added a strict hold, keyed on the `ParseConfineScopeID` tail, added `tiersMu`. Round 2
+found five blockers induced by the strict hold and re-based it onto a zero bypass budget, deleting
+persistence. Round 3 (Sol) found 6, the P1 being the lane cursor (§3.4), plus missing allowlist
+sites, the list-reply source and unqualified owner claims. A hold-class blocker in every round met
+the re-evaluation rule; the root cause was the hold itself, so it went to the owner as L8.
 
-### Round 2 (12 blocking findings, 2 P1 groups) -> round 3
+### Round 4 (this revision): owner decisions applied, scope cut
 
-Every finding was checked against `dc19915c`; all hold. Evidence re-read: the head switch and
-anchor arm (`admit.go:2738-2804`), the backstop clearing the anchor (`:2609-2624`), the phase report
-(`:2844-2857`), nested confine as an ordinary admit (`confine_nested.go:9-14`), the 64-row cap
-(`confine_queued.go:22-28`, `admit.go:1435`), the palette allowlist (`dispatcher.go:523`), the
-unverified `/clear` env refresh and the MCP server's frozen id (owner study `:95`, `:322`),
-`AIRA_DAEMON_ADMIT_FREEZE_MAX_HOLD=disabled` meaning unbounded (`paths.go:297-301`).
-
-**Re-evaluation rule triggered.** Round 1 closed group A with a "design change" (the strict hold),
-and round 2 found five blockers of that class: the nested-confine wedge, the unbounded CPU/VRAM
-head, the false `idle` phase, and both T23 oracle errors (scope-less held; anchor "unchanged"). All
-five were induced by the round-1 fix, as were the persistence costs of group D (round 1 kept
-persistence when deleting eviction). Real problem, restated: let the owner reorder sessions and make
-lower tiers yield to higher ones, without a new kind of hold. Base design that makes the recurring
-families impossible: express the tier hold in the existing hold machinery (zero budget) rather than
-copying the pushed arm, and hold marks in memory. Builder-independent confirmation of this re-base
-is requested from round 3.
-
-| Group | Findings | Root cause | Closed by |
-|---|---|---|---|
-| A. New strict hold kind | nested wedge (P1), CPU/VRAM head (P2), phase `idle` (two P2), T23 anchor (P1 part) | the hold copied the pushed arm, an operator's one-off, into a standing rule with no bound, phase or token of its own | **Design change, deletes the new hold kind:** a lower tier has zero budget (§3.2), so it arms the existing anchor, reports `hold`, and is bounded by the existing backstop (I6). Deletes the "never arms the anchor" rule and every claim and test built on it. §5 wedge check rewritten with the nested example; remaining unbounded cases (pushed head, `disabled` setting) are existing operator choices. L8 offers strict and order-only with their costs. T23 rewritten, T30 added. |
-| B. Porous or wrong oracles | T23 scope-less (P1), T19 one transport, T26 construction only, no MEDIUM-ahead-of-spent-LOW case (P1) | T23 contradicted §3.2/I5; T19 drove only `Dispatch` | T23 split same-tier grants from lower-tier holds and expects anchor expiry without re-arming; T19 drives both `Dispatch` and `DispatchPalette` through the `t` key (T26 merged); T28 MEDIUM arrival ahead of a spent LOW head; T29 empty-table head rule against an evaluator without the arm. |
-| C. Counts from capped rows | idle `no jobs`, `t` dialog counts (two P2) | client counts derived from rows capped at 64 | **Deleted:** client-side counts. Idle rows say `no listed jobs` beside the existing "showing N of M"; the only count is the daemon's exact `jobs_now` (I8, T31). |
-| D. Persistence beyond the minimum | P2 | stored marks carried the table, load failure, `session_tiers_error`, store-failure path, T12/T15/T16, and kept dead `cc-` rows forever; the owner never asked for it | **Deleted:** in memory only (§3.1, L3 recommended), persistence offered as the L3 alternative with its cost and R9. T15, T16 removed; T12 now pins marks dropped at restart. |
-| E. Owner-facing claims | lifetime (P2), rollout (P2), suite claims (P2) | claims stated beyond the evidence or one-sided | Lifetime stated as emitted owner strings, with the unverified `/clear` refresh and frozen MCP id; "nothing changes" qualified by the lane exception in the summary and §10, including the peer message; suite claims stated both ways in the summary, example 1 and L2. No code. |
-
-Convergence: round 2 of at most 3, with the re-base above. If round 3 still finds a blocker in the
-hold (group A) class, the next step is option L8(b), order only, which deletes the hold arm, T23,
-T27, T28 and T30.
+Owner, 2026-11-27: L8 option A, order only (D6); D1-D5 confirmed. L3 stays accept-or-veto,
+recommended stored (reported restart count). Deleted: the zero-budget arm and all built on it (hold
+invariants, summary and examples, the LOW-waiting analysis, the nested-wedge example, old tests
+T10, T11, T12, T23, T27, T28, T30); the `--session-tier` flag and its `=` grammar; the second
+confirmation page; `set_at_ms`, `set_by`, `jobs_now`; `slice` on the verb. Added: §3.3, the
+accepted consequence with its bound read from the code, and a one-paragraph wedge check; the lane
+cursor in evaluation-order coordinates (Sol P1, re-verified at `small_lane.go:171-216`; T7b) and
+FIFO candidates (T6b); every allowlist site (`main.go:2369` untouched, flag cut); `session_tiers`
+from the Server table on every reply path (T17c); persistence in `state.db` (T12, T12b, T12c);
+the catalogue entry for the one new code; protocol 15 checked against `protocol.go:218` and both
+pin tests; new T10, T29, T30 pin order-only in both directions.
