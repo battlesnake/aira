@@ -1,4 +1,4 @@
 ---
-{"schema":1,"id":"AIRA-381","project":"aira","title":"admission: per-session priority tiers (low / medium / high) assigned from aira top, default medium, used for admission order","status":"planned","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.47","labels":[],"hold":false,"relations":[]}
+{"schema":1,"id":"AIRA-381","project":"aira","title":"admission: per-session priority tiers (low / medium / high) assigned from aira top, default medium, used for admission order","status":"done","kind":"feature","severity":"P2","assignee":null,"milestone":"v0.47","labels":[],"hold":false,"relations":[]}
 ---
 Owner 2026-11-27: 'It would be good if we had low/med/high priority tiers of sessions, such that via aira top I could assign sessions to high/low priority tiers (or remove them), with the default for unassigned being medium, and this would be used for admission.' DESIGN FIRST (spec, plan review, plan gate), then build: admission-class, two-loop (Opus builds, Fable and Sol review). Existing pieces: admitOrderLocked three tiers (pushed, --priority high, rest; AIRA-309/340), owner attribution on every admit request, aira top front action.
