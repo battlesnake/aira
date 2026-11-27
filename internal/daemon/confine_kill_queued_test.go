@@ -360,7 +360,7 @@ func TestConfineKillQueuedThroughTheHandler(t *testing.T) {
 			}
 			requireCancelled(t, target)
 			requireUntouched(t, first, admitQueued)
-			snapshot := server.admitSliceSnapshotFor(path, "")
+			snapshot := server.admitSliceSnapshotFor(path, "", nil)
 			for _, entry := range snapshot.queuedEntries {
 				if entry.ScopeID == target.scopeID {
 					t.Fatal("--list still shows the cancelled job as queued")

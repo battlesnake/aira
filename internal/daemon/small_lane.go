@@ -141,20 +141,26 @@ func (s *Server) laneEligibleLocked(waiter *admitWaiter) bool {
 // and the exclusivity gate are derived, and before today's walk. queue.mu must be
 // held.
 //
-// Each eligible waiter, in today's evaluation order, is granted on today's fit
-// alone, with no head rule, while the small leases' bookings stay within x and
-// guard G holds for the reference waiter. A waiter it does not grant is left to
-// today's walk as an ordinary waiter (room, head rule, budget, hold, backstop).
-// Precedence (I7): a fitting sub-reservation (skip the pass), exclusivity gate,
-// pushed reference, lane cap, fit, G.
+// Each eligible waiter, in the lane's CANDIDATE order (laneCandidatesLocked:
+// pushed first, then arrival order, blind to session tier and job priority,
+// AIRA-381 D4), is granted on today's fit alone, with no head rule, while the
+// small leases' bookings stay within x and guard G holds for the reference
+// waiter. A waiter it does not grant is left to today's walk as an ordinary
+// waiter (room, head rule, budget, hold, backstop). Precedence (I7): a fitting
+// sub-reservation (skip the pass), exclusivity gate, pushed reference, lane cap,
+// fit, G.
+//
+// The reference stays in EVALUATION order (admitOrderLocked with the pass's
+// tiers): G keeps the room of the waiter the main walk will grant or make the
+// head. It is an index into that order only, never a candidate index.
 //
 // It writes no head bookkeeping: grantWaiterLocked never touches bypassed,
 // budgetWithheld or the fairness anchor (I5).
-func (s *Server) smallLanePassLocked(queue *sliceQueue, gate exclusiveGate, current, effectiveMaximum, reclaimable int64, now time.Time) {
+func (s *Server) smallLanePassLocked(queue *sliceQueue, gate exclusiveGate, current, effectiveMaximum, reclaimable int64, now time.Time, tiers map[string]sessionTier) {
 	if !s.smallLaneOn() {
 		return
 	}
-	order := admitOrderLocked(queue)
+	order := admitOrderLocked(queue, tiers)
 	// While any queued, ungated sub-reservation (a suite worker, a confine-reserve
 	// hold) fits now, wherever it is in the order, only today's walk runs: the
 	// lane never takes room a sub-reservation would get today (R6, T26).
@@ -164,10 +170,10 @@ func (s *Server) smallLanePassLocked(queue *sliceQueue, gate exclusiveGate, curr
 			return
 		}
 	}
-	// The reference waiter: the first waiter from index k on that is still
-	// queued, job-level, ungated and could fit an empty slice — the one today's
-	// walk would make the head if it does not fit, or grant if it does. It
-	// advances only when the lane grants it (T25).
+	// The reference waiter: the first waiter in evaluation order from index k on
+	// that is still queued, job-level, ungated and could fit an empty slice — the
+	// one today's walk would make the head if it does not fit, or grant if it
+	// does (T25).
 	nextRef := func(k int) int {
 		for index := k; index < len(order); index++ {
 			waiter := order[index]
@@ -179,7 +185,7 @@ func (s *Server) smallLanePassLocked(queue *sliceQueue, gate exclusiveGate, curr
 		return len(order)
 	}
 	reference := nextRef(0)
-	for index, waiter := range order {
+	for _, waiter := range laneCandidatesLocked(queue) {
 		if !s.laneEligibleLocked(waiter) || gate.blocks(queue, waiter) {
 			continue
 		}
@@ -212,9 +218,10 @@ func (s *Server) smallLanePassLocked(queue *sliceQueue, gate exclusiveGate, curr
 		if s.smallLaneGrantObserver != nil {
 			s.smallLaneGrantObserver(queue, waiter, ref, occ, effectiveMaximum)
 		}
-		if index == reference {
-			reference = nextRef(index + 1)
-		}
+		// AIRA-381. After EVERY grant, from the reference itself: nextRef skips a
+		// waiter no longer queued, so the reference moves exactly when it was the
+		// one granted, and no candidate index ever enters evaluation order.
+		reference = nextRef(reference)
 	}
 }
 

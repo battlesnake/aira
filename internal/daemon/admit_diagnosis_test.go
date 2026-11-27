@@ -289,7 +289,7 @@ func TestAdmitDiagnosisSnapshot(t *testing.T) {
 		}
 		var snapshot admitSnapshot
 		for scopeID, tokens := range want {
-			snapshot = server.admitSliceSnapshotFor("/slice", scopeID)
+			snapshot = server.admitSliceSnapshotFor("/slice", scopeID, nil)
 			if !reflect.DeepEqual(snapshot.queuedBlockedBy, tokens) || snapshot.queuedLaneWait != wantLane[scopeID] {
 				diagnosisMismatch(t, "lane=%v probe %s blocked_by=%v lane_wait=%q, want %v %q", lane, scopeID, snapshot.queuedBlockedBy, snapshot.queuedLaneWait, tokens, wantLane[scopeID])
 			}
@@ -305,7 +305,7 @@ func TestAdmitDiagnosisSnapshot(t *testing.T) {
 		if snapshot.cpuOutstanding != 64 {
 			t.Fatalf("cpuOutstanding=%d, want 64", snapshot.cpuOutstanding)
 		}
-		if other := server.admitSliceSnapshotFor("/slice", "CONFINE-nobody-1-a"); other.queuedBlockedBy != nil {
+		if other := server.admitSliceSnapshotFor("/slice", "CONFINE-nobody-1-a", nil); other.queuedBlockedBy != nil {
 			diagnosisMismatch(t, "an unmatched probe got %v", other.queuedBlockedBy)
 		}
 	}

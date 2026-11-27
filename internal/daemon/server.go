@@ -132,6 +132,15 @@ type Server struct {
 	// the small occupancy guard G was judged on, so a property test can check the
 	// cap, G and the one ceiling at the instant of each lane grant.
 	smallLaneGrantObserver func(queue *sliceQueue, granted, reference *admitWaiter, occ laneOccupancy, effectiveMaximum int64)
+	// AIRA-381. The session priority table (session_tiers.go): an immutable map
+	// published by pointer, nil = unevaluated (ci-shim, a failed load, a Server
+	// built without Serve). tiersMu serialises the setter end to end; no admission
+	// lock is ever taken under it, and it is never taken under one.
+	tiers   atomic.Pointer[map[string]sessionTier]
+	tiersMu sync.Mutex
+	// replaceSessionTiersFn is a TEST seam (nil in production, which writes
+	// through s.db): a set's store write, so a test can fail or pause it.
+	replaceSessionTiersFn func(context.Context, map[string]string) error
 	// S13 restart recovery (design §4). restartFreeze is how long NEW admissions are
 	// frozen from listen-ready (so a slow survivor's re-declare is not beaten to its
 	// space by a new admission); injectable (default 2s) so tests drive timing via the
@@ -507,6 +516,11 @@ func (s *Server) Serve(ctx context.Context) (returnErr error) {
 			returnErr = err
 		}
 	}()
+	// AIRA-381. The session tiers load once, here: after the database opens and
+	// before Listen, so nothing is enqueued (no first pass, no re-declared
+	// survivor) before the stored marks are in. A failure leaves them unevaluated
+	// and the daemon serving.
+	s.loadSessionTiers(ctx)
 	// S13 restart recovery (design §4). The fresh daemon opens an EMPTY ledger; there is
 	// no dump to reload. Survivors' keepers reconnect within the freeze armed at
 	// listen-ready below and re-declare their leases (establish-granted, S9), re-anchoring
@@ -936,7 +950,7 @@ func (s *Server) serveConnection(ctx context.Context, conn net.Conn) {
 		wrote = s.reply(conn, responseFrame(s.confineBudget(request.Request.Args)))
 		return
 	}
-	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-front" || verb == "confine-resize" {
+	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-front" || verb == "confine-resize" || verb == "confine-session-tier" {
 		if s.OnRequest != nil {
 			s.OnRequest(request.Scope, request.Request)
 		}

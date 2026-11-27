@@ -214,7 +214,7 @@ func TestAdmitDrainedQueueReadsAsAbsent(t *testing.T) {
 	}
 	read := func(server *Server) reading {
 		var r reading
-		r.present = server.admitSliceSnapshotFor("/slice", "").present
+		r.present = server.admitSliceSnapshotFor("/slice", "", nil).present
 		rows, _ := server.buildConfineDumpQueuesAndWaiters()
 		r.dumpRows = len(rows)
 		r.budgets = server.admitScopeBudgets("/slice") != nil

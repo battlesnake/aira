@@ -1206,7 +1206,7 @@ func TestSmallLaneT17CIShim(t *testing.T) {
 	if line := server.smallLaneStartupLine(); line != "aira daemon: small-job lane off" {
 		t.Fatalf("shim startup line %q", line)
 	}
-	if snapshot := server.admitSliceSnapshotFor("/no-queue", ""); snapshot.present || snapshot.laneOn ||
+	if snapshot := server.admitSliceSnapshotFor("/no-queue", "", nil); snapshot.present || snapshot.laneOn ||
 		snapshot.laneCapacity != 0 || snapshot.laneJobMax != 0 {
 		t.Fatalf("shim no-queue snapshot published the lane: %+v", snapshot)
 	}
@@ -1875,7 +1875,7 @@ func TestSmallLaneRealPathMultiPass(t *testing.T) {
 	}
 	diagnoses := func(waiter *admitWaiter, laneWait string, held bool) {
 		t.Helper()
-		snapshot := server.admitSliceSnapshotFor(path, waiter.scopeID)
+		snapshot := server.admitSliceSnapshotFor(path, waiter.scopeID, nil)
 		if snapshot.queuedLaneWait != laneWait || snapshot.queuedHeldByHead != held {
 			t.Fatalf("probe diagnoses %q %v, want %q %v", snapshot.queuedLaneWait, snapshot.queuedHeldByHead, laneWait, held)
 		}
@@ -1887,7 +1887,7 @@ func TestSmallLaneRealPathMultiPass(t *testing.T) {
 	}
 	occupancy := func(used int64, jobs int) admitSnapshot {
 		t.Helper()
-		snapshot := server.admitSliceSnapshotFor(path, "")
+		snapshot := server.admitSliceSnapshotFor(path, "", nil)
 		if !snapshot.present || !snapshot.laneOn || snapshot.laneCapacity != 8192*mib || snapshot.laneUsed != used || snapshot.laneJobs != jobs {
 			t.Fatalf("lane figures present=%v on=%v x=%dM S=%dM J=%d, want S=%dM J=%d", snapshot.present, snapshot.laneOn,
 				snapshot.laneCapacity/mib, snapshot.laneUsed/mib, snapshot.laneJobs, used/mib, jobs)
@@ -1897,7 +1897,7 @@ func TestSmallLaneRealPathMultiPass(t *testing.T) {
 
 	// Before the first admission: no queue, so no ledger (present false, S
 	// unevaluated), but the lane's configuration is published.
-	if snapshot := server.admitSliceSnapshotFor(path, ""); snapshot.present || !snapshot.laneOn ||
+	if snapshot := server.admitSliceSnapshotFor(path, "", nil); snapshot.present || !snapshot.laneOn ||
 		snapshot.laneCapacity != 8192*mib || snapshot.laneJobMax != 1024*mib || snapshot.laneUsed != 0 {
 		t.Fatalf("no-queue snapshot %+v, want the lane's x and y with no ledger", snapshot)
 	}
@@ -2070,7 +2070,7 @@ func TestSmallLaneSnapshotFields(t *testing.T) {
 		server.admitQueue = queue
 		server.evaluateAdmitQueue(queue)
 
-		snapshot := server.admitSliceSnapshotFor("/slice", waiter.scopeID)
+		snapshot := server.admitSliceSnapshotFor("/slice", waiter.scopeID, nil)
 		if !lane {
 			if snapshot.laneOn || snapshot.laneCapacity != 0 || snapshot.laneUsed != 0 || len(snapshot.scopeSmall) != 0 ||
 				snapshot.queuedLaneWait != "" || snapshot.queuedHeldByHead {

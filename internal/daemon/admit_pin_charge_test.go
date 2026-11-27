@@ -700,7 +700,7 @@ func TestPinChargeSnapshotShowsBookingAndPin(t *testing.T) {
 	queue := queueOf(server, granted, plain, ahead, me)
 	registerAdmitQueue(server, queue)
 
-	snapshot := server.admitSliceSnapshotFor("/slice", me.scopeID)
+	snapshot := server.admitSliceSnapshotFor("/slice", me.scopeID, nil)
 
 	if snapshot.queuedAheadBytes != 4*gi {
 		t.Fatalf("queuedAheadBytes=%d, want the 4 GiB booking of the waiter ahead", snapshot.queuedAheadBytes)
@@ -756,7 +756,7 @@ func runPinScenario(t *testing.T, mode pinChargeMode) pinScenarioResult {
 			}
 		}
 		queue.mu.Unlock()
-		snap := server.admitSliceSnapshotFor("/slice", waiters[len(waiters)-1].scopeID)
+		snap := server.admitSliceSnapshotFor("/slice", waiters[len(waiters)-1].scopeID, nil)
 		result.Snapshots = append(result.Snapshots, fmt.Sprintf("%d %d %d %v %v", snap.outstanding, snap.queuedAheadBytes, snap.queuedReserveBytes, snap.scopeReserves, snap.scopePins))
 	}
 	enqueue := func(i int, pin int64, discountable bool) {

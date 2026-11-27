@@ -20,7 +20,7 @@ func highWaiter(seq int64, name, owner string) *admitWaiter {
 
 func orderNames(queue *sliceQueue) string {
 	names := []string{}
-	for _, waiter := range admitOrderLocked(queue) {
+	for _, waiter := range admitOrderLocked(queue, nil) {
 		names = append(names, waiter.name)
 	}
 	return strings.Join(names, ",")
@@ -202,10 +202,10 @@ func TestAdmitSnapshotFollowsTheHighTier(t *testing.T) {
 	queue := queueOf(server, a, b, h)
 	registerAdmitQueue(server, queue)
 
-	if s := server.admitSliceSnapshotFor("/slice", h.scopeID); s.queuePosition != 1 || s.queuedAheadBytes != 0 {
+	if s := server.admitSliceSnapshotFor("/slice", h.scopeID, nil); s.queuePosition != 1 || s.queuedAheadBytes != 0 {
 		t.Fatalf("high position=%d ahead=%d, want 1/0", s.queuePosition, s.queuedAheadBytes)
 	}
-	snapshot := server.admitSliceSnapshotFor("/slice", a.scopeID)
+	snapshot := server.admitSliceSnapshotFor("/slice", a.scopeID, nil)
 	if snapshot.queuePosition != 2 || snapshot.queuedAheadBytes != 3*qGiB {
 		t.Fatalf("alpha position=%d ahead=%d, want 2 behind the high job's 3 GiB", snapshot.queuePosition, snapshot.queuedAheadBytes)
 	}
@@ -255,7 +255,7 @@ func TestAdmitHighHeadEndingWithoutAGrantLeavesNoGhost(t *testing.T) {
 					t.Fatalf("timed-out head state=%v", head.state)
 				}
 			}
-			for _, waiter := range admitOrderLocked(queue) {
+			for _, waiter := range admitOrderLocked(queue, nil) {
 				if waiter == head {
 					t.Fatal("the ended high waiter is still in the evaluation order")
 				}

@@ -884,6 +884,13 @@ func (s *Store) initDB(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS confine_peak_history_signature
 		    ON confine_peak_history(signature)`,
+		// AIRA-381. The owner's session priority marks: owner -> high|low (no row
+		// is medium). Machine-wide like confine_peak_history, so no project_id;
+		// the daemon loads it once at start and rewrites it whole on each set
+		// (internal/daemon/session_tiers.go).
+		`CREATE TABLE IF NOT EXISTS confine_session_tiers (
+		    owner TEXT PRIMARY KEY, tier TEXT NOT NULL CHECK (tier IN ('high','low'))
+		)`,
 		`CREATE TABLE IF NOT EXISTS area_hints (
             project_id TEXT NOT NULL, ticket_id TEXT NOT NULL, worktree_id TEXT NOT NULL,
             generation INTEGER NOT NULL DEFAULT 0, glob TEXT NOT NULL,
