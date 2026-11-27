@@ -131,6 +131,20 @@ func TestConfinePriorityGuidanceIsOnEveryFace(t *testing.T) {
 	if !strings.Contains(help.String(), "[--priority high|normal]") {
 		t.Errorf("confine usage line does not name [--priority high|normal]:\n%s", help.String())
 	}
+	// AIRA-381: job priority is a sub-level inside a session tier, so the long
+	// form must not claim a `high` job goes ahead of every `normal` job (a LOW
+	// session's high job follows a MEDIUM session's normal one). Mutation: the
+	// pre-381 sentence restored. The long form reaches the skill and the agent
+	// guide (the help and MCP faces carry the summary, which makes no such claim).
+	for face, text := range map[string][]byte{"skill": artifacts.SkillMD, "guide": artifacts.Guide} {
+		flat := strings.Join(strings.Fields(string(text)), " ")
+		if strings.Contains(flat, "ahead of every `normal` job.") || !strings.Contains(flat, "a job of a higher-tier session goes before it") {
+			t.Errorf("%s does not qualify --priority by session tier", face)
+		}
+		if strings.Contains(flat, "the small-job lane ignores it") || !strings.Contains(flat, "the small-job lane offers its room in the same order") {
+			t.Errorf("%s does not say the lane follows the tier order", face)
+		}
+	}
 }
 
 // verifies: AIRA-340 — a queued high row says so in `aira top`'s LIVE column; a
