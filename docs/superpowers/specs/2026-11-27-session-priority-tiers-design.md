@@ -42,8 +42,9 @@ What tiers do not do, said plainly:
   1 GiB or less (default) still go ahead of larger queued jobs through the lane whatever their
   tier, as long as the lane has room and they leave room for the next job in line; about 59% of
   long waits are such jobs (4,821 of 8,233, reported, unverified). The lane offers its room in the
-  order above, so when it is short a HIGH session's small job gets it before a LOW one's. (Amended
-  at build review, D4: a lane in arrival order changed grants for sessions that set no mark.)
+  order above, so when it is short a HIGH session's small job gets it before a LOW one's. (D4 as
+  amended at build review and confirmed by the owner on 2026-11-28: a lane in arrival order
+  changed grants for sessions that set no mark.)
 - **Test-suite worker claims are untiered** (L2): ordered MEDIUM whatever their session's tier,
   though their rows show the session's mark. A push (`--front`) goes first whatever the tier.
 - **A mark follows an owner string exactly** (the owner in the job's scope id; the SESSION cell
@@ -51,7 +52,7 @@ What tiers do not do, said plainly:
   `/resume` (unverified); `AIRA_CONFINE_OWNER=field` is the predictable key.
 - **Marks survive a daemon restart** (L3; 21 restarts in 14 days, reported) until set back to
   MEDIUM. At most 64. A mark whose session has no jobs is not shown in `aira top`;
-  `aira confine --list` lists every mark and `aira confine-session-tier <owner> medium` removes one.
+  `aira confine --list` lists every mark and `aira confine-session-tier <session-owner> medium` removes one.
 
 ## 1. The problem, and the greenfield minimum
 
@@ -98,10 +99,10 @@ from a failed load other than a daemon restart.
   `cc-<CLAUDE_CODE_SESSION_ID>`, worktree id, inferred `@cwd-<dir>`); subagents share it.
 - **D2 Composition.** Pushed first (latest first); then tier HIGH, MEDIUM, LOW; inside a tier
   `--priority high` before normal; FIFO inside each bucket.
-- **D3** LOW waits (no age cap, no promotion). **D4** (as decided) The lane ignores tiers and job
-  priorities. **Amended at build review, for the owner to confirm or veto (§3.4):** the lane
-  offers its room in evaluation order, as today; a small job of any tier still passes larger
-  queued jobs through it.
+- **D3** LOW waits (no age cap, no promotion). **D4** The lane offers its room in evaluation
+  order, as today, with the tiers added; a small job of any tier still passes larger queued jobs
+  through it. (First decided as "the lane ignores tiers and job priorities"; amended at build
+  review, and the owner confirmed the amendment on 2026-11-28, §3.4.)
   **D5** Running jobs are unaffected (no preemption, reservation or cpu.weight change).
 - **D6 Order only** (owner line L8, option A). Tiers change only `admitOrderLocked`, exactly as
   `--priority high` does (AIRA-340: "queue order only, never the head rule"). No zero-budget rule,
@@ -160,11 +161,12 @@ its single writer; a file needs a new path, an encoding and a temp-fsync-rename 
 **Load.** Once in `Serve`, after `OpenDB` (`server.go:493`) and before `net.Listen` (`:514`), so
 the first pass and every re-declared survivor see the stored marks (structural: nothing enqueues
 before `Listen`). Any failure (query error, an owner `runner.ValidateConfineOwner` refuses, more
-than 64 rows) leaves the pointer **nil**: one journal line naming the cause and the manual
-remedy (`sqlite3 <state.db> "SELECT owner, tier FROM confine_session_tiers"`, then
-`DELETE FROM confine_session_tiers WHERE owner='<owner>'` for each bad row, then restart the
-daemon), `session_tiers` absent, sets refused, never a refusal to start (a schema failure inside `OpenDB` refuses start
-today, unchanged). The only way out is a daemon restart; nothing deletes rows the daemon did not
+than 64 rows) leaves the pointer **nil**: one journal line naming the cause. For a bad stored row
+or more than 64 rows the line also names the manual remedy (`sqlite3 <state.db> "SELECT owner,
+tier FROM confine_session_tiers"`, then `DELETE FROM confine_session_tiers WHERE
+owner='<owner>'` for each bad row, then restart the daemon); a query error names its cause only.
+`session_tiers` absent, sets refused, never a refusal to start (a schema failure inside `OpenDB`
+refuses start today, unchanged). The only way out is a daemon restart; nothing deletes rows the daemon did not
 read. ci-shim neither loads nor sets (nil throughout). No automatic prune (R9).
 
 **Valid keys.** What `runner.ValidateConfineOwner` accepts, except empty and `unknown` (refused
@@ -228,7 +230,7 @@ G protects, with today's `if index == reference { reference = nextRef(index + 1)
 change is the `tiers` argument. With an empty table the lane is today's, byte for byte (T1 on the
 order; `TestSessionTiersLaneNoMarksIsTodays` on the grants).
 
-**Why not the decided arrival-order candidates (D4 as decided).** G judges a candidate against
+**Why not arrival-order candidates (D4 as first decided).** G judges a candidate against
 ONE waiter, the reference, which is sound only while every waiter ahead of the candidate in the
 walk's order has been visited. With candidates in a second order an older small job is judged
 against a newer small reference, the lane grants both, and the large waiter behind them loses the
@@ -241,8 +243,7 @@ pass, not of the cursor (an exact arrival-order G still leaves M refused, becaus
 H ahead of M), so it was closed by deleting the second order (`laneCandidatesLocked`, the cursor
 rewrite, T6b, T6c, T7c and L5) rather than by more guard machinery.
 
-**What the owner gives up** (veto restores D4 as decided, with this consequence stated): a LOW
-session's small job no longer gets the last lane room before a HIGH or MEDIUM one, and a
+**What the owner gave up** (confirmed 2026-11-28): a LOW session's small job no longer gets the last lane room before a HIGH or MEDIUM one, and a
 `--priority high` small job keeps today's place in the lane. A small job of any tier still passes
 large queued jobs through the lane, subject to G.
 
@@ -251,7 +252,7 @@ large queued jobs through the lane, subject to G.
 A new project-less confine management verb `confine-session-tier` (SafetyExecute, like its
 siblings): args `session` (target owner), `tier` (a descriptor enum `high|medium|low`, which
 `aira top`'s picker reads) and the siblings' `owner` (caller). CLI: `aira confine-session-tier
-<owner> <high|medium|low>`; reply `{session, tier, previous}`. No `slice`: tiers are machine-wide,
+<session-owner> <high|medium|low>`; reply `{session, tier, previous}`. No `slice`: tiers are machine-wide,
 and an accepted-and-ignored `--slice` is what AIRA-82/196 refuse. So the daemon **refuses a
 `slice` key** (any value) with `E_CONFINE_ARGUMENT_INVALID`, the CLI skips the slice insertion
 `dispatchConfineManagementRequest` makes for every sibling (`main.go:2386-2387`), and `aira top`
@@ -377,12 +378,12 @@ T29) contain pushed, job-high and normal owned, sub-reservation, scope-less and 
 | T29 | both | any tier-aware condition in the head switch | production is its own oracle: random queues, tables and passes, lane off; run A with the table, run B with the same waiters enqueued in A's tier order, an empty table and `high` cleared (pushes kept): per pass identical grants, `bypassed`, anchor and phase |
 | T13 | starve | tier used as a gate | LOW job alone on an empty slice: granted in the first pass |
 | T30 | starve | a tier hold of any kind | running MEDIUM R (14 of 32 GiB); HIGH head H 20 GiB; R's nested 2 GiB child C, lane off: C granted within H's budget; R released; H granted |
-| T6 | order | lane candidates in arrival order (D4 as decided) | lane room for one: older LOW and newer HIGH small jobs: HIGH lane-granted (`smallLaneGrantObserver`); LOW `laneWait` is `full` |
+| T6 | order | lane candidates in arrival order (D4 as first decided) | lane room for one: older LOW and newer HIGH small jobs: HIGH lane-granted (`smallLaneGrantObserver`); LOW `laneWait` is `full` |
 | T6n | order | lane candidates in arrival order | NO marks, zero headroom, 32 GiB, lane cap 2 GiB; enqueue M 31.5, L 0.5, H 0.5 `--priority high`: lane grants H only (observer); L `kept`; M granted by the walk (`TestSessionTiersLaneNoMarksIsTodays`) |
 | T7 | starve | lane ordered without the table | 32 GiB, 26 granted, no small leases; enqueue MEDIUM 8, HIGH 31.5, LOW 1 GiB small: the reference is HIGH (31.5 + 1 > 32), so the small job's `laneWait` is `kept` and the observer never sees it; an untiered lane order (reference MEDIUM, 8 + 1 <= 32) lane-grants it |
 | T7b | false order | lane candidates in arrival order | T6n's box with marks: MEDIUM M 31.5, LOW L 0.5, HIGH H 0.5 (evaluation H, M, L): lane grants H only; L `kept`; M granted by the walk. Mutation: L judged against H alone, L and H lane-granted, M refused (32.5 > 32) |
 | T12 | order | marks not loaded | set `field` HIGH, restart the Server on the same state dir with `field`'s survivor re-declaring and a new `field` waiter queued behind MEDIUM ones: the first pass orders it HIGH; `confine --list` reads `high field`; ARDR lease unchanged |
-| T12b | starve | load failure refuses start, reported "none set", or a set accepted on an unloaded table | injected failing load: daemon serves; pointer nil, order as empty; reply has no `session_tiers`; `--list` reads unevaluated, the footer `tiers unevaluated`; journal names the cause and the manual sqlite remedy; a set is refused `E_CONFINE_UNAVAILABLE` exit 4 (the one nil-table refusal) and the stored rows are unchanged |
+| T12b | starve | load failure refuses start, reported "none set", or a set accepted on an unloaded table | injected failing load: daemon serves; pointer nil, order as empty; reply has no `session_tiers`; `--list` reads unevaluated, the footer `tiers unevaluated`; journal names the cause, and for a bad stored row or more than 64 rows the manual sqlite remedy (a query error names its cause only); a set is refused `E_CONFINE_UNAVAILABLE` exit 4 (the one nil-table refusal) and the stored rows are unchanged |
 | T12c | order | table published before the store write | injected failing write: set refused `E_CONFINE_UNAVAILABLE`, published table and store both unchanged; with the writer paused inside the store write, a concurrent `confine-list` sees the old map |
 | T15 | order | `tiersMu` dropped | on a served Server, the paused-writer technique of T12c (no timing over `-count`): while one set is paused inside its store write a second set does not complete; resumed, both are in the final map and the store; 63 rows plus 2 concurrent new owners: exactly one refused `E_CONFINE_SESSION_TIERS_FULL` |
 | T17 | order | empty list dropped or sent as null | no marks: `session_tiers` is `[]` |
@@ -403,8 +404,6 @@ T29) contain pushed, job-high and normal owned, sub-reservation, scope-less and 
   are always MEDIUM. So marking every owner HIGH is not the same as no marks. Recommended: accept.
 - **L3, L9** are decided (D7, D2): marks persist (load failure: §3.1); a push beats a tier, with
   no `--steal` for one's own job.
-- **L5 (reopened at build review).** D4 amended: the lane keeps today's single order, tier-aware
-  (§3.4). Recommended: accept; a veto restores arrival order with its stated consequence.
 - **L4 `@cwd-` keys.** Allowed (covers every unattributed launch from that directory). Accept.
 - **L6 Trust and surface.** CLI and `aira top` only; no MCP tool or Skill action; no ownership
   guard (marking other sessions is the feature); every set audit-logged with its setter in the
@@ -474,18 +473,32 @@ every blocker sat in the surface around it, so each family is closed by deleting
 - T15 uses T12c's paused-writer technique rather than goroutines over `-count`.
 - The failed-load journal line names the manual sqlite remedy; the accepted gap of a commit that
   lands after its timeout fired is stated (§3.1).
-- Unchanged by the build and stated for the reviewer: the `aira top` key legend does not gain
-  `t tier` (TestTopKillLegendFitsOrdinaryWidths pins the 80-column legend, which is full); the key
-  is named in the generated agent guide's session-tiers paragraph instead.
+- The `aira top` key legend gains `t tier` only above 80 columns
+  (TestTopKillLegendFitsOrdinaryWidths pins the 80- and 60-column legends, which are full); the
+  key is also named in the generated agent guide's session-tiers paragraph.
 
 ### Build review round 1: 2 findings, both fixed
 
 - **Lane in a second order changed unmarked grants** (P2, probe above, §3.4): closed by a design
   change that deletes code: `laneCandidatesLocked`, the cursor rewrite, T6b, T6c, T7c and L5.
-  D4 amended for the owner to confirm (§2, §6 L5). T6 inverted, T7b re-pointed at the
+  D4 amended; the owner confirmed the amendment on 2026-11-28 (§2). T6 inverted, T7b re-pointed at the
   counterexample with marks, T6n (`TestSessionTiersLaneNoMarksIsTodays`) pins the unmarked one;
   each fails against arrival-order candidates (run), T6, T7 and T7b against an untiered lane order.
 - **Generated guidance** said a `high` job goes ahead of every `normal` job, and that the lane
   ignores tiers: `ConfinePriorityGuidance` now says job priority is a sub-level inside a session
   tier, the session-tiers paragraph that the lane offers its room in the same order;
   `TestConfinePriorityGuidanceIsOnEveryFace` checks both in the skill and the agent guide.
+
+### Build review round 2: 1 P2 decided by the owner, P3 nits fixed
+
+- **D4 amendment** (P2): the owner confirmed it on 2026-11-28; the code is unchanged (§2, §3.4).
+- `ConfinePriorityGuidance` orders a job "inside its session's tier", with the example that a
+  HIGH session's `normal` job is ahead of a MEDIUM session's `high` job; the session-tiers
+  paragraph says the lane keeps today's order with the tiers added (a LOW session's small job
+  still uses it) and that running jobs are unaffected.
+- T15 waits for a handshake (`sessionTierSetEnteredFn`) proving the second set reached the setter
+  before the paused first is resumed; without it, dropping `tiersMu` with the second request
+  delayed two seconds passed.
+- The failed-load remedy wording (§3.1, T12b) matches the code: a query error names its cause only.
+- `aira top` shows `t tier` above 80 columns where the whole legend fits; the verb's usage names
+  its positional `<session-owner>` (`--owner` stays the caller).
