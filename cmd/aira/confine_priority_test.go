@@ -131,6 +131,25 @@ func TestConfinePriorityGuidanceIsOnEveryFace(t *testing.T) {
 	if !strings.Contains(help.String(), "[--priority high|normal]") {
 		t.Errorf("confine usage line does not name [--priority high|normal]:\n%s", help.String())
 	}
+	// AIRA-381: job priority is a sub-level inside a session tier, so the long
+	// form must not claim a `high` job goes ahead of every `normal` job (a LOW
+	// session's high job follows a MEDIUM session's normal one). Mutation: the
+	// pre-381 sentence restored. The long form reaches the skill and the agent
+	// guide (the help and MCP faces carry the summary, which makes no such claim).
+	for face, text := range map[string][]byte{"skill": artifacts.SkillMD, "guide": artifacts.Guide} {
+		flat := strings.Join(strings.Fields(string(text)), " ")
+		if strings.Contains(flat, "ahead of every `normal` job.") || !strings.Contains(flat, "inside its session's tier") ||
+			!strings.Contains(flat, "a job of a higher-tier session goes before it") ||
+			!strings.Contains(flat, "a HIGH session's `normal` job is ahead of a MEDIUM session's `high` job") {
+			t.Errorf("%s does not qualify --priority by session tier", face)
+		}
+		if strings.Contains(flat, "the small-job lane ignores it") ||
+			!strings.Contains(flat, "The small-job lane keeps today's order with the tiers added") ||
+			!strings.Contains(flat, "a LOW session's small job still uses the lane") ||
+			!strings.Contains(flat, "running jobs are unaffected") {
+			t.Errorf("%s does not say the lane keeps today's order with tiers and running jobs are unaffected", face)
+		}
+	}
 }
 
 // verifies: AIRA-340 — a queued high row says so in `aira top`'s LIVE column; a
@@ -147,7 +166,7 @@ func TestTopQueuedRowMarksAHighPriorityJob(t *testing.T) {
 	} {
 		record := topQueuedTestRecord("CONFINE-zulu-201-cc@session-q", "zulu", 4*gib)
 		record.Priority, record.Pushed = test.priority, test.pushed
-		if cell := topQueuedRow(record, false, 1).Cells[3]; cell != test.want {
+		if cell := topQueuedRow(record, false, 1, nil).Cells[3]; cell != test.want {
 			t.Fatalf("priority=%s pushed=%v LIVE cell=%q, want %q", test.priority, test.pushed, cell, test.want)
 		}
 	}
@@ -259,7 +278,7 @@ func TestConfinePrioritySourceDecidesTheDisplayedPriority(t *testing.T) {
 				if test.want == runner.ConfinePriorityHigh {
 					wantCell = "high"
 				}
-				if cell := topQueuedRow(rows[0], false, 1).Cells[3]; cell != wantCell {
+				if cell := topQueuedRow(rows[0], false, 1, nil).Cells[3]; cell != wantCell {
 					t.Fatalf("aira top LIVE cell=%q, want %q", cell, wantCell)
 				}
 			})

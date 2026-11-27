@@ -612,6 +612,57 @@ type ConfineListResult struct {
 	// row) and a renderer must say so rather than present the list as complete.
 	Queued       []ConfineRecord      `json:"queued,omitempty"`
 	SliceReserve *ConfineSliceReserve `json:"slice_reserve,omitempty"`
+	// SessionTiers is the daemon's table of session priority marks (AIRA-381),
+	// sorted by owner, from the daemon's own table, never the queue: a mark with
+	// no waiting or running job is listed. ABSENT (nil) means unevaluated: an old
+	// daemon, ci-shim mode, or stored marks that did not load at daemon start;
+	// `[]` is a loaded, empty table ("none set"). Never rendered as one another.
+	SessionTiers *[]ConfineSessionTier `json:"session_tiers,omitempty"`
+}
+
+// ConfineSessionTier is one session priority mark (AIRA-381): the FULL owner
+// string a job's scope id carries, and "high" or "low" (medium is no mark).
+type ConfineSessionTier struct {
+	Owner string `json:"owner"`
+	Tier  string `json:"tier"`
+}
+
+// Session priority tiers (AIRA-381). Medium is the default and is never stored.
+const (
+	ConfineSessionTierHigh   = "high"
+	ConfineSessionTierMedium = "medium"
+	ConfineSessionTierLow    = "low"
+	// ConfineSessionTierCap bounds the stored marks: a set that would add a 65th
+	// mark is refused E_CONFINE_SESSION_TIERS_FULL (re-set and remove pass).
+	ConfineSessionTierCap = 64
+)
+
+// ConfineSessionTierResult is the reply to `aira confine-session-tier`: the
+// session (owner string) set, its new tier and the tier it had before.
+type ConfineSessionTierResult struct {
+	Session  string `json:"session"`
+	Tier     string `json:"tier"`
+	Previous string `json:"previous"`
+}
+
+// ValidateConfineSessionTierArgs is the ONE validator of a session-tier set,
+// applied by the CLI before sending and by the daemon on receipt (AIRA-381).
+// The session is an owner string as a scope id carries it (an attested name, a
+// cc-<id>, a worktree id or an inferred "@cwd-<dir>"), matched exactly; empty
+// and "unknown" are refused, since neither names a session. The tier is one of
+// high, medium, low.
+func ValidateConfineSessionTierArgs(session, tier string) error {
+	if session == "" || session == ConfineUnknownOwner {
+		return fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: session %q names no session; give the owner string a job's scope id carries (see `aira confine --list`)", session)
+	}
+	if err := ValidateConfineOwner(session); err != nil {
+		return fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: session: %w", err)
+	}
+	switch tier {
+	case ConfineSessionTierHigh, ConfineSessionTierMedium, ConfineSessionTierLow:
+		return nil
+	}
+	return fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: tier %q must be high, medium or low", tier)
 }
 
 type ConfineSliceReserve struct {

@@ -156,6 +156,15 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 	if err := runner.ValidateConfineOwner(callerOwner); err != nil {
 		return confineManagementError(fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: owner: %w", err))
 	}
+	// AIRA-381. Machine-wide, so before slice resolution: the setter refuses a
+	// slice key rather than resolving one it would ignore.
+	if core.CanonicalVerb(request.Verb) == "confine-session-tier" {
+		result, setErr := s.setSessionTier(ctx, callerOwner, request.Args)
+		if setErr != nil {
+			return confineManagementError(setErr)
+		}
+		return core.Response{OK: true, Code: "OK", Data: result}
+	}
 	path, err := s.resolveConfineManagementPath(stringArg(request.Args, "slice"))
 	if err != nil {
 		return confineManagementError(err)
@@ -168,6 +177,12 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		// os.ReadDir's the slice cgroup directory, so against the sentinel every
 		// `--list` would answer UNEVALUATED / E_CONFINE_UNAVAILABLE -- an operator
 		// surface that never works at all.
+		//
+		// AIRA-381. The session tiers are loaded ONCE, here, and the same table
+		// orders the snapshot below and fills SessionTiers on every
+		// ConfineListResult this case returns, the UNEVALUATED one included: from
+		// the Server's table, never the queue, so a mark with no job is listed.
+		published := s.tiers.Load()
 		var result runner.ConfineListResult
 		if s.shimMode() {
 			result = runner.ShimConfineList(registry)
@@ -178,6 +193,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 			}
 			result = listed
 		}
+		result.SessionTiers = sessionTierRows(published)
 		if result.Verdict == "unevaluated" {
 			return core.Response{OK: true, Code: "UNEVALUATED", Data: result, Exit: 3}
 		}
@@ -195,7 +211,7 @@ func (s *Server) confineManagement(ctx context.Context, request core.Request) co
 		// feeds: an unreadable slice memory.current says nothing about which job
 		// holds what, and withholding the attribution with it would blank
 		// `aira top`'s bar on a failed cgroup read the ledger was unaffected by.
-		snapshot := s.admitSliceSnapshotFor(path, stringArg(request.Args, "scope_id"))
+		snapshot := s.admitSliceSnapshotFor(path, stringArg(request.Args, "scope_id"), tierTable(published))
 		// AIRA-191/AIRA-192. The per-scope reserve, merged by scope id onto the
 		// records the cgroupfs scan produced. This is the ONLY place a listing's
 		// ReserveBytes is established, and a scope the ledger holds no charge for

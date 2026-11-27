@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -378,7 +379,7 @@ func runWithInputDispatcher(argv []string, stdout, stderr io.Writer, stdin io.Re
 	if verb == "confine-status" {
 		return runConfineStatusCommand(context.Background(), options, renderJSON, stdout, stderr)
 	}
-	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-front" || verb == "confine-resize" || verb == "confine-budget" {
+	if verb == "confine-list" || verb == "confine-kill" || verb == "confine-front" || verb == "confine-resize" || verb == "confine-budget" || verb == "confine-session-tier" {
 		request, requestErr := buildRequest(verb, positional, options)
 		if requestErr != nil {
 			code := store.ErrorCode(requestErr)
@@ -878,6 +879,9 @@ var parseArgsAllowedOptions = map[string]map[string]bool{
 	"confine-kill": {"steal": true, "slice": true, "owner": true},
 	// AIRA-309, the kill verb's option set: same selector, same owner guard.
 	"confine-front": {"steal": true, "slice": true, "owner": true},
+	// AIRA-381. No --slice: session tiers are machine-wide, and an
+	// accepted-and-ignored --slice is what AIRA-82/196 refuse.
+	"confine-session-tier": {"owner": true},
 	// AIRA-312, the kill verb's option set plus the new reserve, which uses the
 	// launch form's own --memory-reserve spelling and size grammar.
 	"confine-resize": {"memory-reserve": true, "steal": true, "slice": true, "owner": true},
@@ -1610,7 +1614,7 @@ func parseConfineManagementArgs(argv []string) ([]string, map[string]string, err
 // confine-reserve/confine-log/confine-input/confine-report are real, separate
 // features with their own callers (aitest, a detached job's own handle), not
 // part of the two modes AIRA-243 is about.
-var confineHelpVerbs = []string{"confine", "confine-list", "confine-budget", "confine-dump", "confine-kill", "confine-front", "confine-resize", "confine-status"}
+var confineHelpVerbs = []string{"confine", "confine-list", "confine-budget", "confine-dump", "confine-kill", "confine-front", "confine-resize", "confine-session-tier", "confine-status"}
 
 // runConfineHelpCommand answers `aira confine --help` when the request reaches
 // the parser (e.g. `confine --list --help`); the common spelling is answered by
@@ -2383,8 +2387,12 @@ func dispatchConfineManagementRequest(ctx context.Context, request core.Request,
 	if request.Args == nil {
 		request.Args = map[string]any{}
 	}
-	slice, _ := request.Args["slice"].(string)
-	request.Args["slice"] = runner.ResolveConfineSlice(slice)
+	// AIRA-381. confine-session-tier is machine-wide and its daemon handler
+	// refuses a slice key, so none is inserted for it.
+	if request.Verb != "confine-session-tier" {
+		slice, _ := request.Args["slice"].(string)
+		request.Args["slice"] = runner.ResolveConfineSlice(slice)
+	}
 	dispatcher := injected
 	var err error
 	if dispatcher == nil {
@@ -2766,6 +2774,17 @@ func buildRequestArgs(verb string, positional []string, options map[string]strin
 		}
 		args["slice"], args["owner"] = options["slice"], options["owner"]
 		args["limit"], args["direction"], args["grep"] = options["limit"], options["direction"], options["grep"]
+	case "confine-session-tier":
+		// AIRA-381. Two positionals, validated by the daemon's own validator so a
+		// bad value is refused before anything is sent.
+		if len(positional) != 2 {
+			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-session-tier requires <session-owner> <high|medium|low>")
+		}
+		if err := runner.ValidateConfineSessionTierArgs(positional[0], positional[1]); err != nil {
+			return core.Request{}, err
+		}
+		args["session"], args["tier"] = positional[0], positional[1]
+		args["owner"] = options["owner"]
 	case "confine-kill", "confine-front", "confine-resize":
 		if len(positional) != 1 || positional[0] == "" {
 			return core.Request{}, fmt.Errorf("E_CONFINE_ARGUMENT_INVALID: %s requires one selector", verb)
@@ -3654,6 +3673,8 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 	}
 	if result.Verdict == "unevaluated" {
 		_, _ = fmt.Fprintf(stdout, "confine list: unevaluated: %s\n", result.Reason)
+		// AIRA-381. The daemon's own table, carried on this path too.
+		_, _ = fmt.Fprintln(stdout, renderSessionTiersLine(result.SessionTiers))
 		if response.Exit != 0 {
 			return response.Exit
 		}
@@ -3913,10 +3934,39 @@ func renderConfineListResponse(response core.Response, stdout, stderr io.Writer)
 				result.SliceReserve.ResidualJobs, result.SliceReserve.ResidualBytes)
 		}
 	}
+	// AIRA-381. Printed whatever the slice summary established: the marks are
+	// the daemon's own table, independent of the slice reading.
+	_, _ = fmt.Fprintln(stdout, renderSessionTiersLine(result.SessionTiers))
 	if response.Exit != 0 {
 		return response.Exit
 	}
 	return 0
+}
+
+// renderSessionTiersLine is `confine --list`'s session-tier line (AIRA-381):
+// every mark by tier with its FULL owner string (never the shortened SESSION
+// cell form, so the owner shown is the one `aira confine-session-tier` takes),
+// "none set" for a loaded empty table, and unevaluated when the reply carries
+// no table at all.
+func renderSessionTiersLine(tiers *[]runner.ConfineSessionTier) string {
+	if tiers == nil {
+		return "session tiers: unevaluated (old daemon, ci-shim, or stored marks did not load: see the daemon journal)"
+	}
+	if len(*tiers) == 0 {
+		return "session tiers: none set"
+	}
+	byTier := map[string][]string{}
+	for _, mark := range *tiers {
+		byTier[mark.Tier] = append(byTier[mark.Tier], mark.Owner)
+	}
+	var groups []string
+	for _, tier := range []string{runner.ConfineSessionTierHigh, runner.ConfineSessionTierLow} {
+		if owners := byTier[tier]; len(owners) > 0 {
+			sort.Strings(owners)
+			groups = append(groups, tier+" "+strings.Join(owners, ", "))
+		}
+	}
+	return "session tiers: " + strings.Join(groups, "; ")
 }
 
 func confineNum[T int | int64](value *T) string {

@@ -2212,6 +2212,21 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 			_ = stringArg(args, "owner")
 			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-front requires the project-less daemon transport")
 		}},
+		// AIRA-381. Set one session's admission order tier (high / medium / low),
+		// machine-wide, so no slice. CLI and `aira top` only: no MCPTool, and the
+		// name is in the CLI-only exclusion list below (the drain/install
+		// precedent), so it is in generated help and the agent guide but never a
+		// Skill action or MCP tool. The owner sets tiers; agents do not.
+		"confine-session-tier": {Name: "confine-session-tier", Usage: "confine-session-tier <session-owner> <high|medium|low> [--owner ID]", Args: []ArgSpec{
+			stringSpec("session", true, true, "The session's full owner string, exactly as a job's scope id carries it (see `aira confine --list`): an AIRA_CONFINE_OWNER name, cc-<session id>, a worktree id or @cwd-<dir>"),
+			stringSpec("tier", true, true, "The session's tier: high or low; medium (the default) removes the mark", runner.ConfineSessionTierHigh, runner.ConfineSessionTierMedium, runner.ConfineSessionTierLow),
+			stringSpec("owner", false, false, "Caller owner identity (the setter, for the audit line)"),
+		}, Safety: SafetyExecute, Example: []string{"field", "high"}, Run: func(_ context.Context, args *argAccessor) (any, error) {
+			_ = stringArg(args, "session")
+			_ = stringArg(args, "tier")
+			_ = stringArg(args, "owner")
+			return nil, errors.New("E_CONFINE_UNAVAILABLE: confine-session-tier requires the project-less daemon transport")
+		}},
 		// AIRA-312. Lower the admission-ledger reserve of one RUNNING confine job,
 		// owner-checked like confine-kill (one shared guard) and answered by the
 		// same project-less daemon transport. Ledger only: the job's memory.max is
@@ -2618,6 +2633,8 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 		"confine-dump":  {summary: "Write the daemon's admission/utilisation records as JSONL for CI archival", safety: SafetyRead, example: []string{}},
 		"confine-kill":  {summary: "Kill one ownership-checked confine job: a running job's scope is cgroup.kill'ed after populated-to-empty proof (phase running, status killed); a job still waiting for admission is cancelled before it runs (phase queued, status cancelled; its launcher exits ran=no code=U_ADMIT_CANCELLED)", safety: SafetyExecute, destructive: true, example: []string{"job"}},
 		"confine-front": {summary: "Push one ownership-checked queued confine job to the front of the admission queue", safety: SafetyExecute, example: []string{"job"}},
+		// AIRA-381. CLI-only (the exclusion list below): the owner sets tiers.
+		"confine-session-tier": {summary: "Set a session's admission order tier (queue order only). Set by the owner from `aira top`; agents do not set tiers", safety: SafetyExecute, example: []string{"field", "high"}},
 		// AIRA-312. The caveats live in the summary because this is the text every
 		// generated face publishes: ledger only, the cap is unchanged, the
 		// OOM-steering budget drops with the reserve, and any re-declare undoes it.
@@ -2721,7 +2738,10 @@ func applyDispatchMetadata(verbs map[string]verbSpec) {
 			// file on the invoking process's own filesystem, which a remote MCP
 			// client cannot meaningfully name, the same local-affinity reason
 			// confine/confine-status/confine-reserve/drain are excluded.
-			name != "confine" && name != "confine-reserve" && name != "confine-status" && name != "confine-dump" && name != "drain" && name != "install"
+			name != "confine" && name != "confine-reserve" && name != "confine-status" && name != "confine-dump" && name != "drain" && name != "install" &&
+				// AIRA-381: the owner sets session tiers from `aira top` or the CLI;
+				// no MCP tool or Skill action reaches it (L6).
+				name != "confine-session-tier"
 		spec.Example = copyExample(entry.example)
 		spec.Operations = append([]OperationSpec(nil), entry.operations...)
 		verbs[name] = spec

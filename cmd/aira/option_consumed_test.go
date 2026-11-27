@@ -59,8 +59,9 @@ var optionBaseArgvs = map[string][][]string{
 	"confine-budget":    {{"confine-budget"}},
 	// confine-dump is not a CLI verb (buildRequest: E_UNKNOWN_VERB); --dump is a
 	// confine management flag parsed by parseConfineArgs.
-	"confine-kill":  {{"confine-kill", "x"}},
-	"confine-front": {{"confine-front", "x"}},
+	"confine-kill":         {{"confine-kill", "x"}},
+	"confine-front":        {{"confine-front", "x"}},
+	"confine-session-tier": {{"confine-session-tier", "field", "low"}},
 	// AIRA-312. --memory-reserve is required, so the base carries it; the probe
 	// then exercises steal/slice/owner on top.
 	"confine-resize": {{"confine-resize", "x", "--memory-reserve", "2G"}},

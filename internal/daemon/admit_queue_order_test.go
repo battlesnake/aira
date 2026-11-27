@@ -211,7 +211,7 @@ func TestAdmitOrderLatestPushFirst(t *testing.T) {
 	queue := queueOf(server, a, b, c, d)
 	order := func() string {
 		names := []string{}
-		for _, waiter := range admitOrderLocked(queue) {
+		for _, waiter := range admitOrderLocked(queue, nil) {
 			names = append(names, waiter.name)
 		}
 		return strings.Join(names, ",")
@@ -392,7 +392,7 @@ func TestAdmitSnapshotFollowsTheEvaluationOrder(t *testing.T) {
 	registerAdmitQueue(server, queue)
 	mustPush(t, queue, c.scopeID)
 
-	snapshot := server.admitSliceSnapshotFor("/slice", a.scopeID)
+	snapshot := server.admitSliceSnapshotFor("/slice", a.scopeID, nil)
 	if snapshot.queuePosition != 2 || snapshot.queuedAheadBytes != 3*qGiB {
 		t.Fatalf("alpha position=%d ahead=%d, want 2 behind the pushed charlie's 3 GiB", snapshot.queuePosition, snapshot.queuedAheadBytes)
 	}
@@ -406,7 +406,7 @@ func TestAdmitSnapshotFollowsTheEvaluationOrder(t *testing.T) {
 	if want := []string{c.scopeID, a.scopeID, b.scopeID}; strings.Join(ids, " ") != strings.Join(want, " ") {
 		t.Fatalf("queuedEntries order=%v, want %v", ids, want)
 	}
-	if pushed := server.admitSliceSnapshotFor("/slice", c.scopeID); pushed.queuePosition != 1 || pushed.queuedAheadBytes != 0 {
+	if pushed := server.admitSliceSnapshotFor("/slice", c.scopeID, nil); pushed.queuePosition != 1 || pushed.queuedAheadBytes != 0 {
 		t.Fatalf("pushed charlie position=%d ahead=%d, want 1/0", pushed.queuePosition, pushed.queuedAheadBytes)
 	}
 }
@@ -548,7 +548,7 @@ func TestConfineFrontHandlerLogsOnlyOnSuccessAndKicksTheQueue(t *testing.T) {
 			default:
 				t.Fatal("a successful push did not kick the evaluator")
 			}
-			if order := admitOrderLocked(queue); order[0] != target {
+			if order := admitOrderLocked(queue, nil); order[0] != target {
 				t.Fatal("the pushed job is not first in the evaluation order")
 			}
 		})
@@ -584,7 +584,7 @@ func TestAdmitPushSurvivesReEvaluation(t *testing.T) {
 			now = now.Add(10 * time.Minute) // well past any hold
 		}
 	}
-	if order := admitOrderLocked(queue); order[0] != head {
+	if order := admitOrderLocked(queue, nil); order[0] != head {
 		t.Fatal("the pushed head is no longer first")
 	}
 }

@@ -455,7 +455,7 @@ func (w *admitWaiter) isSubReservation() bool {
 }
 
 // admitOrderLocked is THE admission evaluation order (AIRA-309, AIRA-340),
-// derived on every call and never stored, in three tiers:
+// derived on every call and never stored. With no session marks:
 //
 //  1. pushed waiters (`aira confine --front`), LATEST push first (descending
 //     pushSeq);
@@ -464,6 +464,8 @@ func (w *admitWaiter) isSubReservation() bool {
 //     to newest-first and starve the older ones);
 //  3. every other queued waiter, in enqueue order.
 //
+// Session marks (AIRA-381) split 2 and 3 by tier, below.
+//
 // Enqueue order is the order queue.waiters already holds; queue.waiters itself
 // is never reordered. queue.mu must be held.
 //
@@ -471,31 +473,50 @@ func (w *admitWaiter) isSubReservation() bool {
 // position N of M" line, the queued-ahead total and the `aira top` row order
 // would describe a queue the evaluator does not run: the evaluator, and
 // admitSliceSnapshotFor (position, queued-ahead bytes, queuedEntries), which
-// feeds the AIRA-308 rows.
-func admitOrderLocked(queue *sliceQueue) []*admitWaiter {
-	var pushed, high, rest []*admitWaiter
+// feeds the AIRA-308 rows. (The small-job lane reads it too, for both its
+// candidates and its reference waiter.)
+//
+// AIRA-381. The session tier is the PRIMARY key below the push, and the job's
+// `--priority high` a sub-level inside each tier: pushed; HIGH session
+// job-high, HIGH normal; MEDIUM job-high, MEDIUM normal; LOW job-high, LOW
+// normal; enqueue order inside each bucket. tiers is the table the caller
+// loaded (nil or empty: every unpushed waiter is MEDIUM, which is exactly the
+// pre-381 `pushed, high, rest`). Untiered waiters are MEDIUM (waiterTier).
+func admitOrderLocked(queue *sliceQueue, tiers map[string]sessionTier) []*admitWaiter {
+	var pushed []*admitWaiter
+	// buckets[2*rank + 0] is the tier's job-high waiters, [2*rank + 1] its normal.
+	var buckets [6][]*admitWaiter
 	for _, waiter := range queue.waiters {
 		if waiter == nil || waiter.state != admitQueued {
 			continue
 		}
-		switch {
-		case waiter.pushSeq > 0:
+		if waiter.pushSeq > 0 {
 			pushed = append(pushed, waiter)
-		case waiter.high:
-			high = append(high, waiter)
-		default:
-			rest = append(rest, waiter)
+			continue
 		}
+		bucket := 2 * waiterTier(waiter, tiers).rank()
+		if !waiter.high {
+			bucket++
+		}
+		buckets[bucket] = append(buckets[bucket], waiter)
 	}
-	// pushSeq values are distinct (each push takes a fresh queue.seq), so this
-	// order is total; insertion sort keeps it allocation-free for the handful of
-	// pushes a queue ever carries.
+	sortPushedLatestFirst(pushed)
+	for _, bucket := range buckets {
+		pushed = append(pushed, bucket...)
+	}
+	return pushed
+}
+
+// sortPushedLatestFirst orders pushed waiters by descending pushSeq. pushSeq
+// values are distinct (each push takes a fresh queue.seq), so this order is
+// total; insertion sort keeps it allocation-free for the handful of pushes a
+// queue ever carries.
+func sortPushedLatestFirst(pushed []*admitWaiter) {
 	for i := 1; i < len(pushed); i++ {
 		for j := i; j > 0 && pushed[j].pushSeq > pushed[j-1].pushSeq; j-- {
 			pushed[j], pushed[j-1] = pushed[j-1], pushed[j]
 		}
 	}
-	return append(append(pushed, high...), rest...)
 }
 
 // admitBypassBudget is the AIRA-307 budget of a head: half its own requested
@@ -1339,15 +1360,21 @@ func (snapshot admitSnapshot) residualBytes() int64 {
 
 // admitSliceSnapshot is the aggregate read: no caller identity, so no
 // per-waiter position is computed. Every existing caller wants exactly this.
+//
+// AIRA-381: it passes no session tiers. Its one production caller,
+// admitQueueDiagnostics, reads the queued count and phase, both
+// order-independent.
 func (s *Server) admitSliceSnapshot(path string) admitSnapshot {
-	return s.admitSliceSnapshotFor(path, "")
+	return s.admitSliceSnapshotFor(path, "", nil)
 }
 
 // admitSliceSnapshotFor additionally locates ONE queued waiter by scope id
 // (AIRA-24). queuedScopeID is only ever compared for equality against the
 // scope ids the daemon itself minted into its waiter list, so an unknown or
 // malformed value simply matches nothing and leaves the position unestablished.
-func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot {
+// tiers is the session table the caller loaded (AIRA-381), so the rows,
+// position and queued-ahead total follow the order the evaluator runs.
+func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string, tiers map[string]sessionTier) admitSnapshot {
 	// With the duty cycle off a freeze may be actively blocking this queue, so
 	// reporting "idle" would state the opposite of the truth.
 	phase := admitFreezeIdle.String()
@@ -1402,7 +1429,7 @@ func (s *Server) admitSliceSnapshotFor(path, queuedScopeID string) admitSnapshot
 	// AIRA-309. The QUEUED half is walked in EVALUATION order (admitOrderLocked),
 	// so the position, the queued-ahead total and the AIRA-308 rows describe the
 	// queue the evaluator actually runs — a pushed job is position 1.
-	for _, waiter := range admitOrderLocked(queue) {
+	for _, waiter := range admitOrderLocked(queue, tiers) {
 		snapshot.queued++
 		// AIRA-24. The position is an index among QUEUED waiters only, so it
 		// is taken here and nowhere else: counting granted or released
@@ -2551,6 +2578,9 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// queue state.
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
+	// AIRA-381. The session tiers, loaded ONCE for the whole pass: the lane
+	// and the walk below order by the same table.
+	tiers := tierTable(s.tiers.Load())
 	// AIRA-228. The clock is read UNDER queue.mu: the queue outlives its
 	// population, so a pass that read it first and then waited for the lock
 	// could arm a population that arrived meanwhile with a pre-drain instant,
@@ -2668,12 +2698,12 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// during the restart freeze, as every new admission is; a no-op while the
 	// lane is off, so the walk below is then exactly today's.
 	if !restartFrozen {
-		s.smallLanePassLocked(queue, gate, current, effectiveMaximum, reclaimable, now)
+		s.smallLanePassLocked(queue, gate, current, effectiveMaximum, reclaimable, now, tiers)
 	}
 	// AIRA-149. Still-queued waiters already examined in THIS pass, i.e.
 	// genuinely AHEAD of any waiter reached later in it. Diagnosis only.
 	queuedAhead := 0
-	for _, waiter := range admitOrderLocked(queue) {
+	for _, waiter := range admitOrderLocked(queue, tiers) {
 		// S11 restart-freeze gate (design §4). Placed BEFORE the exclusivity gate and the
 		// fit/grant so a NEW admission during the freeze simply WAITS — it never grants
 		// (never fail-opens), never arms the AIRA-59 fairness anchor (that arm lives in the

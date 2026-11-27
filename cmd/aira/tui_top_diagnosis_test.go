@@ -54,7 +54,7 @@ func TestTopQueuedRowNamesTheWaitDiagnosis(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			record := topQueuedTestRecord("CONFINE-q-201-dd@session-q", "q", gib)
 			record.BlockedBy, record.LaneWait, record.HeldByHead, record.Priority = testCase.blocked, testCase.laneWait, testCase.held, testCase.priority
-			if got := topQueuedRow(record, false, 1).Cells[3]; got != testCase.want {
+			if got := topQueuedRow(record, false, 1, nil).Cells[3]; got != testCase.want {
 				t.Fatalf("LIVE cell=%q, want %q", got, testCase.want)
 			}
 		})

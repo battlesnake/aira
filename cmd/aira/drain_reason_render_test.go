@@ -128,7 +128,9 @@ func TestTopFooterCarriesTheExclusiveHoldReason(t *testing.T) {
 // (or a build that forgot to gate the footer's population clause) is caught.
 func TestTopFooterHonoursGrantedEstablished(t *testing.T) {
 	t.Run("established", func(t *testing.T) {
-		footer := topFooter(runner.ConfineListResult{Verdict: "pass", SliceReserve: &runner.ConfineSliceReserve{
+		// AIRA-381: a loaded (empty) tier table, so the footer's own
+		// "tiers unevaluated" clause is not what this test reads.
+		footer := topFooter(runner.ConfineListResult{Verdict: "pass", SessionTiers: &[]runner.ConfineSessionTier{}, SliceReserve: &runner.ConfineSliceReserve{
 			GrantedEstablished: true, GrantedBytes: 3 << 30, CeilingBytes: 12 << 30, Jobs: 2, ScopeJobs: 2, ScopeBytes: 3 << 30,
 		}})
 		if strings.Contains(footer, "unevaluated") {

@@ -45,6 +45,10 @@ type inlineAction struct {
 	// for running jobs: AIRA-308's "a future row action must guard on an empty ID"
 	// became "an action targets queued rows only by opting in".
 	QueuedRow bool
+	// AnyRow (AIRA-381) lifts the row-kind gate for an action that applies to
+	// running and queued rows alike: `t`, which marks the row's SESSION, not
+	// the row. Set on `t` alone; every other action keeps its row kind.
+	AnyRow bool
 }
 
 type inlineActionState struct {
@@ -108,6 +112,11 @@ func inlineActionFor(view tuiView, key rune) (inlineAction, bool) {
 			action = inlineAction{Key: key, Label: "push to front", Verb: "confine-front", Safety: core.SafetyExecute, ValueSource: inlineValueFixed, QueuedRow: true}
 		case 'e':
 			action = inlineAction{Key: key, Label: "lower reserve", Verb: "confine-resize", Safety: core.SafetyExecute, ValueSource: inlineValueFixed}
+		case 't':
+			// AIRA-381. Set the row's session tier: the enum picker over the
+			// verb's own tier enum, then one confirmation (topTierConfirm).
+			action = inlineAction{Key: key, Label: "set session tier", Verb: topTierVerb, Safety: core.SafetyExecute,
+				ValueSource: inlineValueEnum, ValueArg: "tier", EnumVerb: topTierVerb, EnumArg: "tier", AnyRow: true}
 		}
 	}
 	return action, action.Verb != ""
@@ -234,6 +243,39 @@ func topOwnerCheckClause(caller, scopeID, action string) (bool, string) {
 	}
 }
 
+// topTierVerb is `aira top`'s `t` verb (AIRA-381).
+const topTierVerb = "confine-session-tier"
+
+// topRowSessionOwner is the session a row's `t` marks: the owner parsed from
+// its scope id (runner.ParseConfineScopeID, the daemon's tier key), or "" when
+// the id does not parse or carries no owner, or the literal unknown.
+func topRowSessionOwner(scopeID string) string {
+	_, _, _, owner, ok := runner.ParseConfineScopeID(scopeID)
+	if !ok || owner == runner.ConfineUnknownOwner {
+		return ""
+	}
+	return owner
+}
+
+// topTierConfirm builds the one confirmation page of `t` (AIRA-381) once a tier
+// is picked, directly rather than through the palette, for the reason
+// topFrontConfirm gives. It sends the FULL owner (pending.Values["session"]),
+// the tier, and the caller as owner, and no slice: tiers are machine-wide and
+// the daemon refuses a slice key.
+func topTierConfirm(state tuiState, tier string) tuiState {
+	pending := state.InlineAction
+	session := pending.Values["session"]
+	request := core.Request{Verb: topTierVerb, Args: map[string]any{
+		"session": session, "tier": tier, "owner": topConfineCaller(state),
+	}}
+	summary := "Set session " + session + " to " + strings.ToUpper(tier) + ". Changes the order of its waiting and future jobs only; running jobs are not affected. Kept until changed."
+	pending.Stage = inlineStageConfirm
+	state.InlineError = ""
+	state.PaletteOpen = true
+	state.PaletteConfirm = &paletteConfirm{Request: request, Summary: summary, Safety: core.SafetyExecute, Verb: topTierVerb}
+	return state
+}
+
 // topResizeMemoryArg is the one mini-form field `e` asks for: the new reserve,
 // sent as the confine-resize verb's memory_reserve argument.
 const topResizeMemoryArg = "memory_reserve"
@@ -335,7 +377,7 @@ func onInlineActionStart(state tuiState, action inlineAction, descriptors []core
 	// opted in, and a queued-row action never reaches a live one. Refused
 	// visibly, never silently: the selected job may have been admitted between
 	// selection and keypress, and the operator must see why nothing happened.
-	if row.Queued != action.QueuedRow {
+	if !action.AnyRow && row.Queued != action.QueuedRow {
 		kind := "running (admitted) jobs"
 		if action.QueuedRow {
 			kind = "jobs still waiting in the admission queue"
@@ -353,6 +395,18 @@ func onInlineActionStart(state tuiState, action inlineAction, descriptors []core
 		state.InlineAction = pending
 		pending.Stage = inlineStageConfirm
 		return topFrontConfirm(state, row)
+	}
+	if action.Verb == topTierVerb {
+		// AIRA-381. The session is the owner parsed from the row's scope id, the
+		// daemon's own key (never the SESSION cell, which may show a tmux name or
+		// a shortened id). A row with no owner to mark sends nothing.
+		owner := topRowSessionOwner(row.ID)
+		if owner == "" {
+			state.InlineError = "E_TUI_INLINE_ROW_KIND: this job has no session owner to mark"
+			state.InlineAction = nil
+			return state, nil
+		}
+		pending.Values["session"] = owner
 	}
 	if action.Verb == "confine-resize" {
 		// AIRA-312. The new size is typed into the existing inline mini-form (the
@@ -410,6 +464,9 @@ func onInlineActionPick(state tuiState, value string, descriptors []core.Dispatc
 		return state, nil
 	}
 	pending.Values[pending.Action.ValueArg] = value
+	if pending.Action.Verb == topTierVerb {
+		return topTierConfirm(state, value), nil
+	}
 	if pending.Action.Verb == "find" && pending.Action.Operation == "set" && value == "waived" {
 		if !inlineDescriptorArgsPresent(descriptors, "find", "reason", "actor") {
 			state.InlineError = "E_TUI_INLINE_FORM: find set reason/actor arguments are absent from the live descriptor"

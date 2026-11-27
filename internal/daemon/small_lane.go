@@ -141,20 +141,28 @@ func (s *Server) laneEligibleLocked(waiter *admitWaiter) bool {
 // and the exclusivity gate are derived, and before today's walk. queue.mu must be
 // held.
 //
-// Each eligible waiter, in today's evaluation order, is granted on today's fit
-// alone, with no head rule, while the small leases' bookings stay within x and
-// guard G holds for the reference waiter. A waiter it does not grant is left to
-// today's walk as an ordinary waiter (room, head rule, budget, hold, backstop).
-// Precedence (I7): a fitting sub-reservation (skip the pass), exclusivity gate,
-// pushed reference, lane cap, fit, G.
+// Each eligible waiter, in today's evaluation order (admitOrderLocked with the
+// pass's session tiers, AIRA-381 D4 amended: with no marks the pre-381 order),
+// is granted on today's fit alone, with no head rule, while the small leases'
+// bookings stay within x and guard G holds for the reference waiter. A waiter it
+// does not grant is left to today's walk as an ordinary waiter (room, head rule,
+// budget, hold, backstop). Precedence (I7): a fitting sub-reservation (skip the
+// pass), exclusivity gate, pushed reference, lane cap, fit, G.
+//
+// The candidates and the reference share ONE order on purpose: G judges a
+// candidate only against the reference, which is sound only while every waiter
+// ahead of the candidate in the walk's order has already been visited. A lane
+// in a second order (arrival) let an older small job be judged against a newer
+// small reference that the lane then granted too, taking the room G kept for
+// the large waiter behind it (AIRA-381 build review, TestSessionTiersLaneNoMarksIsTodays).
 //
 // It writes no head bookkeeping: grantWaiterLocked never touches bypassed,
 // budgetWithheld or the fairness anchor (I5).
-func (s *Server) smallLanePassLocked(queue *sliceQueue, gate exclusiveGate, current, effectiveMaximum, reclaimable int64, now time.Time) {
+func (s *Server) smallLanePassLocked(queue *sliceQueue, gate exclusiveGate, current, effectiveMaximum, reclaimable int64, now time.Time, tiers map[string]sessionTier) {
 	if !s.smallLaneOn() {
 		return
 	}
-	order := admitOrderLocked(queue)
+	order := admitOrderLocked(queue, tiers)
 	// While any queued, ungated sub-reservation (a suite worker, a confine-reserve
 	// hold) fits now, wherever it is in the order, only today's walk runs: the
 	// lane never takes room a sub-reservation would get today (R6, T26).

@@ -263,7 +263,7 @@ func TestQueuedRowsAndCountComeFromOneLockedPass(t *testing.T) {
 		}
 	}()
 	for i := 0; i < 2000; i++ {
-		snapshot := server.admitSliceSnapshotFor(path, "")
+		snapshot := server.admitSliceSnapshotFor(path, "", nil)
 		if len(snapshot.queuedEntries) != snapshot.queued {
 			close(stop)
 			wg.Wait()

@@ -81,6 +81,13 @@ func replyText(head string, data json.RawMessage, warnings []string) string {
 				lines = append(lines, strings.ToUpper(key[:1])+key[1:]+": "+value)
 			}
 		}
+		// AIRA-381. A session-tier set: the change, only when the reply carries
+		// both its before and after.
+		if session := replyString(fields, "session"); session != "" {
+			if previous, tier := replyString(fields, "previous"), replyString(fields, "tier"); previous != "" && tier != "" {
+				lines = append(lines, "session "+session+": "+previous+" -> "+tier)
+			}
+		}
 		var before, after *int64
 		if json.Unmarshal(fields["old_reserve_bytes"], &before) == nil && json.Unmarshal(fields["new_reserve_bytes"], &after) == nil && before != nil && after != nil {
 			lines = append(lines, "Reserve: "+runner.FormatConfineMegabytes(*before)+" → "+runner.FormatConfineMegabytes(*after))
