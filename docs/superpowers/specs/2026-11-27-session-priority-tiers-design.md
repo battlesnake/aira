@@ -121,15 +121,20 @@ pre-pass, the walk and `admitSliceSnapshotFor` take the map as an argument and n
 `admitQueueDiagnostics` at `:1560` for the queued count and phase, both order-independent)
 passes nil. The build review checks the three sites by grep; no test is claimed for it.
 
-**Set.** Under `tiersMu`, for the whole operation: ci-shim refuses `E_CONFINE_UNAVAILABLE` (a
-container is one session); a nil pointer refuses `E_CONFINE_SESSION_TIERS_UNLOADED` ("session
-tiers did not load at daemon start; see the daemon journal and restart the daemon"), touching
-nothing. Otherwise copy the map; apply the change (`medium` deletes the row); over 64 rows refuse
+**Set.** Under `tiersMu`, for the whole operation: a nil pointer (ci-shim, where a container is
+one session and nothing is loaded, or a failed load) refuses with ONE refusal,
+`E_CONFINE_UNAVAILABLE` exit 4, whose message names both causes ("session tiers are unevaluated on
+this daemon: it runs in ci-shim mode (a container is one session), or the stored marks did not
+load at daemon start (see the daemon journal, fix the rows it names and restart the daemon)"),
+touching nothing. Otherwise copy the map; apply the change (`medium` deletes the row); over 64 rows refuse
 `E_CONFINE_SESSION_TIERS_FULL` (a new row only; re-set and remove always pass); write the copy to
 the store; only then publish the pointer and write the audit line
 `confine-session-tier: setter=<caller> session=<owner> tier=<old>-><new>` (like
 `logConfineFront`). A store failure refuses `E_CONFINE_UNAVAILABLE: store session tiers: <cause>`
-and publishes nothing. No `queue.mu` (no lock-order edge); the store write has a bounded context.
+and publishes nothing. No `queue.mu` (no lock-order edge); the store write has a bounded context
+(10 s). Accepted gap: a commit that lands but whose call then reports the timeout refuses the set
+while the row is stored; memory stays the old table, and the next acknowledged set (one
+delete-all-and-insert transaction from memory) or a restart's load brings the two together.
 The new order applies on the next evaluator pass (the existing poll tick).
 
 **Store.** One table in `state.db`, added to the schema list beside `confine_peak_history`
@@ -150,8 +155,10 @@ its single writer; a file needs a new path, an encoding and a temp-fsync-rename 
 **Load.** Once in `Serve`, after `OpenDB` (`server.go:493`) and before `net.Listen` (`:514`), so
 the first pass and every re-declared survivor see the stored marks (structural: nothing enqueues
 before `Listen`). Any failure (query error, an owner `runner.ValidateConfineOwner` refuses, more
-than 64 rows) leaves the pointer **nil**: one journal line naming the cause, `session_tiers`
-absent, sets refused, never a refusal to start (a schema failure inside `OpenDB` refuses start
+than 64 rows) leaves the pointer **nil**: one journal line naming the cause and the manual
+remedy (`sqlite3 <state.db> "SELECT owner, tier FROM confine_session_tiers"`, then
+`DELETE FROM confine_session_tiers WHERE owner='<owner>'` for each bad row, then restart the
+daemon), `session_tiers` absent, sets refused, never a refusal to start (a schema failure inside `OpenDB` refuses start
 today, unchanged). The only way out is a daemon restart; nothing deletes rows the daemon did not
 read. ci-shim neither loads nor sets (nil throughout). No automatic prune (R9).
 
@@ -267,11 +274,10 @@ published map and the store hold the mark.
 admission order tier (queue order only). Set by the owner from `aira top`; agents do not set tiers."
 
 **Error codes.** `E_CONFINE_ARGUMENT_INVALID` (exit 2: bad `session`, `tier` or a `slice` key),
-`E_CONFINE_UNAVAILABLE` (exit 4: ci-shim; store write failure), and two new codes, each with its
-catalogue entry and producer landing together (`produced_test.go`, both ways):
-`E_CONFINE_SESSION_TIERS_FULL`, exit 1 (a state condition, like `E_CONFINE_NOT_QUEUED`,
-`internal/codes/codes.go:381`), and `E_CONFINE_SESSION_TIERS_UNLOADED`, exit 4 (the daemon's
-environment, fixed by a restart, like `E_CONFINE_UNAVAILABLE`, `codes.go:307`).
+`E_CONFINE_UNAVAILABLE` (exit 4: an unevaluated table, ci-shim or a failed load, in one message;
+a store write failure), and one new code, its catalogue entry and producer landing together
+(`produced_test.go`, both ways): `E_CONFINE_SESSION_TIERS_FULL`, exit 1 (a state condition, like
+`E_CONFINE_NOT_QUEUED`, `internal/codes/codes.go:381`).
 
 **List reply.** `confine-list` gains one field, `session_tiers` (`*[]{owner, tier}`, sorted by
 owner, `omitempty`): absent when the pointer is nil or the daemon is old; `[]` when loaded and
@@ -313,9 +319,12 @@ new daemon: the old decoder is not `DisallowUnknownFields` on this reply (the bu
   `session field: medium -> low` or the error.
 - **`aira top` footer:** when the reply has no `session_tiers`, `tiers unevaluated` is the
   footer's first part, ahead of `box CPU busy` and the granted clause (`tui_top.go:1737-1740`:
-  the footer is one unwrapped line and later parts are clipped at 80 columns); otherwise the
-  footer gains nothing. The full mark list lives only in `confine --list`.
-- **`confine --list`**, under the slice summary: `session tiers: high field; low cc-1a2b3c4d`,
+  the footer is one unwrapped line and later parts are clipped at 80 columns), on BOTH footer
+  paths, the early return for a reply with no slice reserve included; otherwise the footer gains
+  nothing. The full mark list lives only in `confine --list`.
+- **`confine --list`**, under the slice summary, with FULL owner strings (never the SESSION cell's
+  shortened form, so what is printed is what `aira confine-session-tier` takes):
+  `session tiers: high field; low cc-1a2b3c4d-0000-4000-8000-000000000001`,
   `session tiers: none set`, or `session tiers: unevaluated (old daemon, ci-shim, or stored marks
   did not load: see the daemon journal)`. `--json` carries the field as sent.
 
@@ -335,7 +344,8 @@ new daemon: the old decoder is not `DisallowUnknownFields` on this reply (the bu
   shows are one value, the owner parsed from the scope id (T24, T19b).
 - I7 Writes: a set changes only the table and the store; every acknowledged set is in the
   published map and the store equals it; nothing is published before the store write commits
-  (T14, T15, T12c).
+  (T15, T12c; a set takes no `queue.mu` and touches no ledger or head state by construction:
+  `setSessionTier` reads only `s.tiers` and the store).
 - I8 Persistence: after a restart the table equals the store; a failed load gives a nil table
   (ordered as empty, reported unevaluated), a running daemon and refused sets, with the stored
   rows untouched, until a restart (T12, T12b).
@@ -368,13 +378,12 @@ T29) contain pushed, job-high and normal owned, sub-reservation, scope-less and 
 | T7b | false order | reference advanced from the candidate position (`nextRef(index + 1)`) | zero headroom, 32 GiB ceiling, lane cap at least 1.5 GiB; enqueue LOW L 0.5, MEDIUM M 31, HIGH H 0.5, LOW S 0.5 GiB (evaluation H, M, L, S; candidates L, M, H, S); one pass: L and H lane-granted (observer); M the reference; S's `laneWait` is `kept` (31 + 1.5 > 32); M granted by the walk (31 + 1 = 32). Mutation: from H's candidate index 2 the cursor lands on S: S lane-granted, M refused |
 | T7c | false order | today's `if index == reference` lines kept | same box; enqueue LOW A 0.5, HIGH B 31.5, MEDIUM C 0.5 (evaluation B, C, A; candidates A, B, C); one pass: A lane-granted (observer); B stays the reference; C's `laneWait` is `kept` (31.5 + 1 > 32); B granted by the walk (32 <= 32). Mutation: A's candidate index 0 equals the reference index 0, the reference jumps to C: C lane-granted, B refused (32.5 > 32) |
 | T12 | order | marks not loaded | set `field` HIGH, restart the Server on the same state dir with `field`'s survivor re-declaring and a new `field` waiter queued behind MEDIUM ones: the first pass orders it HIGH; `confine --list` reads `high field`; ARDR lease unchanged |
-| T12b | starve | load failure refuses start, reported "none set", or a set accepted on an unloaded table | injected failing load: daemon serves; pointer nil, order as empty; reply has no `session_tiers`; `--list` reads unevaluated, the footer `tiers unevaluated`; journal names the cause; a set is refused `E_CONFINE_SESSION_TIERS_UNLOADED` exit 4 and the stored rows are unchanged |
+| T12b | starve | load failure refuses start, reported "none set", or a set accepted on an unloaded table | injected failing load: daemon serves; pointer nil, order as empty; reply has no `session_tiers`; `--list` reads unevaluated, the footer `tiers unevaluated`; journal names the cause and the manual sqlite remedy; a set is refused `E_CONFINE_UNAVAILABLE` exit 4 (the one nil-table refusal) and the stored rows are unchanged |
 | T12c | order | table published before the store write | injected failing write: set refused `E_CONFINE_UNAVAILABLE`, published table and store both unchanged; with the writer paused inside the store write, a concurrent `confine-list` sees the old map |
-| T14 | order | a set touches ledger or head state | ledger, `bypassed`, anchor, exclusive gate identical before and after a set with no pass between |
-| T15 | order | `tiersMu` dropped | on a served Server, N goroutines setting distinct owners, `-race -count=20`: every acknowledged set in the final map and the store; 63 rows plus 2 concurrent new owners: exactly one refused `E_CONFINE_SESSION_TIERS_FULL` |
+| T15 | order | `tiersMu` dropped | on a served Server, the paused-writer technique of T12c (no timing over `-count`): while one set is paused inside its store write a second set does not complete; resumed, both are in the final map and the store; 63 rows plus 2 concurrent new owners: exactly one refused `E_CONFINE_SESSION_TIERS_FULL` |
 | T17 | order | empty list dropped or sent as null | no marks: `session_tiers` is `[]` |
-| T17b | order | absent rendered "none set", or the `aira top` state placed where it is clipped | a reply without `session_tiers`: `--list` prints `session tiers: unevaluated`; `aira top` drawn on a simulation screen at 80 and 120 columns (as `tui_top_diagnosis_test.go:128-139`) shows `tiers unevaluated` on screen |
-| T17c | order | `session_tiers` filled from the snapshot, only on the OK path, or dropped by the `--list` early return | through a real Server on a socket: a mark with no waiters and no live queue is listed; on the `UNEVALUATED` return the field is present and the rendered `--list` text (`main.go:3655` path) carries `session tiers: high field` |
+| T17b | order | absent rendered "none set", or the `aira top` state placed where it is clipped | a reply without `session_tiers`: `--list` prints `session tiers: unevaluated`; `aira top` drawn on a simulation screen at 80 and 120 columns (as `tui_top_diagnosis_test.go:128-139`) shows `tiers unevaluated` on screen, on both footer paths (with a slice reserve, and the early return for a reply with none) |
+| T17c | order | `session_tiers` filled from the snapshot, only on the OK path, or dropped by the `--list` early return | through a real Server on a socket: a mark with no waiters and no live queue is listed; on the `UNEVALUATED` return the field is present and the rendered `--list` text (`main.go:3655` path) carries `session tiers: high field`; a `cc-<uuid>` mark is printed with its FULL owner string |
 | T18 | order | `unknown`, empty, over-long or bad-tier values accepted | each refused `E_CONFINE_ARGUMENT_INVALID`, exit 2, by client and daemon |
 | T19 | order | verb missing at an allowlist site (§3.5 table); `t` sends the cell text, reaches one row kind, or widens another action's gate; `slice` sent or ignored | (a) `aira confine-session-tier field low --owner me` from outside any project, against a real Server on a socket: OK, map and store hold `field: low`; (b) through the `aira top` model and `DispatchPalette` to the same real Server: `t` then a pick on a running row and on a queued row each sets the row's full owner (rows showing a tmux name or a shortened `cc-` id included), the sent map has no `slice`; an ownerless row sends nothing; `f` on a running row and `e` on a queued row are still refused `E_TUI_INLINE_ROW_KIND`, and `f`, `e`, `KK` on their own row kinds send exactly today's requests; (c) daemon refuses a `slice` key (empty and non-empty), CLI refuses `--slice`, the CLI's sent map has no `slice`; (d) `aira confine --help` lists the verb; (e) `Classify`, `StoreFreeCarved`, `--scope-dir` refusal |
 | T20 | order | cap not enforced, or enforced on re-set/remove | 64 rows: a new owner refused `E_CONFINE_SESSION_TIERS_FULL` exit 1, nothing changed; re-set and remove succeed |
@@ -437,7 +446,7 @@ every blocker sat in the surface around it, so each family is closed by deleting
 - **Footer list deleted** (clipped at 80 columns, `tui_top.go:1737-1740`): `aira top` shows only
   `tiers unevaluated`, first; T17b asserts it on screen.
 - **Failed-load recovery deleted** (the next set deleted unread rows): sets refused
-  `E_CONFINE_SESSION_TIERS_UNLOADED` until a restart; T12b re-pointed.
+  `E_CONFINE_UNAVAILABLE` until a restart; T12b re-pointed.
 - **Dispatch row** (P1: `Include: true` with no `MCPTool` fails `skill_test.go:463-468`): the verb
   joins the CLI-only exclusion derivation; T21 asserts `Include` false.
 - **Stated, no design change:** a LOW job's nested child is LOW and its parent holds memory
@@ -445,3 +454,20 @@ every blocker sat in the surface around it, so each family is closed by deleting
 - **Nits:** reopened L3/L5/L9 alternatives deleted; SESSION identity, worker rows (I6), the
   nil-passing aggregate snapshot stated; T29 uses production as its oracle; T6/T6b/T7 assert
   `laneWait` or the observer; T12c pauses the writer; T12's ordering and T17c's shim case cut.
+
+### Build (AIRA-381): P3 nits folded in
+
+- `confine --list` prints FULL owner strings, never the SESSION cell's shortened form (§3.6); a
+  `cc-<uuid>` mark is in the list tests (T17c).
+- `tiers unevaluated` is also on the footer's early return for a reply with no slice reserve
+  (§3.6); T17b covers both paths.
+- Simplified: `E_CONFINE_SESSION_TIERS_UNLOADED` and the separate ci-shim branch deleted; a nil
+  table is one refusal, `E_CONFINE_UNAVAILABLE`, naming both causes (§3.1, §3.5). T14 dropped: a
+  set takes no `queue.mu` and reads nothing but `s.tiers` and the store, so it cannot touch ledger
+  or head state (I7).
+- T15 uses T12c's paused-writer technique rather than goroutines over `-count`.
+- The failed-load journal line names the manual sqlite remedy; the accepted gap of a commit that
+  lands after its timeout fired is stated (§3.1).
+- Unchanged by the build and stated for the reviewer: the `aira top` key legend does not gain
+  `t tier` (TestTopKillLegendFitsOrdinaryWidths pins the 80-column legend, which is full); the key
+  is named in the generated agent guide's session-tiers paragraph instead.

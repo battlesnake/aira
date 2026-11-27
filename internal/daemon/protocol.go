@@ -214,6 +214,16 @@ import (
 // facts of that run are lost until the daemon restarts. An old client never sends
 // them, and absent is stored NULL. Admission frames are unchanged, so a bump would
 // only add refusals at the cutover.
+//
+// AIRA-381 added the confine-session-tier management verb and the optional
+// `session_tiers` field of the confine-list REPLY WITHOUT a bump, following
+// AIRA-340: no admit, re-declare or store-op frame changes. A daemon that predates
+// the verb answers it from project dispatch with an unrelated code; measured
+// 2026-11-27 against the live pre-381 daemon from outside any project:
+// `E_CONFIG_INVALID: scope options are incomplete`, exit 2, which the client keeps
+// and to which it appends the restart hint (withOldDaemonManagementHint). An old
+// client decodes the list reply without DisallowUnknownFields, so it ignores the
+// new field, and absent reads as unevaluated in a new client.
 const (
 	ProtocolVersion = 15
 	MaxFrameBytes   = 16 << 20
