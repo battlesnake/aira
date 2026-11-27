@@ -2778,7 +2778,7 @@ func buildRequestArgs(verb string, positional []string, options map[string]strin
 		// AIRA-381. Two positionals, validated by the daemon's own validator so a
 		// bad value is refused before anything is sent.
 		if len(positional) != 2 {
-			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-session-tier requires <owner> <high|medium|low>")
+			return core.Request{}, errors.New("E_CONFINE_ARGUMENT_INVALID: confine-session-tier requires <session-owner> <high|medium|low>")
 		}
 		if err := runner.ValidateConfineSessionTierArgs(positional[0], positional[1]); err != nil {
 			return core.Request{}, err

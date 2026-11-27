@@ -2217,7 +2217,7 @@ func (c *Core) dispatchTable() map[string]verbSpec {
 		// name is in the CLI-only exclusion list below (the drain/install
 		// precedent), so it is in generated help and the agent guide but never a
 		// Skill action or MCP tool. The owner sets tiers; agents do not.
-		"confine-session-tier": {Name: "confine-session-tier", Usage: "confine-session-tier <owner> <high|medium|low> [--owner ID]", Args: []ArgSpec{
+		"confine-session-tier": {Name: "confine-session-tier", Usage: "confine-session-tier <session-owner> <high|medium|low> [--owner ID]", Args: []ArgSpec{
 			stringSpec("session", true, true, "The session's full owner string, exactly as a job's scope id carries it (see `aira confine --list`): an AIRA_CONFINE_OWNER name, cc-<session id>, a worktree id or @cwd-<dir>"),
 			stringSpec("tier", true, true, "The session's tier: high or low; medium (the default) removes the mark", runner.ConfineSessionTierHigh, runner.ConfineSessionTierMedium, runner.ConfineSessionTierLow),
 			stringSpec("owner", false, false, "Caller owner identity (the setter, for the audit line)"),

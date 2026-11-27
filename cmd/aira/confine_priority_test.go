@@ -138,11 +138,16 @@ func TestConfinePriorityGuidanceIsOnEveryFace(t *testing.T) {
 	// guide (the help and MCP faces carry the summary, which makes no such claim).
 	for face, text := range map[string][]byte{"skill": artifacts.SkillMD, "guide": artifacts.Guide} {
 		flat := strings.Join(strings.Fields(string(text)), " ")
-		if strings.Contains(flat, "ahead of every `normal` job.") || !strings.Contains(flat, "a job of a higher-tier session goes before it") {
+		if strings.Contains(flat, "ahead of every `normal` job.") || !strings.Contains(flat, "inside its session's tier") ||
+			!strings.Contains(flat, "a job of a higher-tier session goes before it") ||
+			!strings.Contains(flat, "a HIGH session's `normal` job is ahead of a MEDIUM session's `high` job") {
 			t.Errorf("%s does not qualify --priority by session tier", face)
 		}
-		if strings.Contains(flat, "the small-job lane ignores it") || !strings.Contains(flat, "the small-job lane offers its room in the same order") {
-			t.Errorf("%s does not say the lane follows the tier order", face)
+		if strings.Contains(flat, "the small-job lane ignores it") ||
+			!strings.Contains(flat, "The small-job lane keeps today's order with the tiers added") ||
+			!strings.Contains(flat, "a LOW session's small job still uses the lane") ||
+			!strings.Contains(flat, "running jobs are unaffected") {
+			t.Errorf("%s does not say the lane keeps today's order with tiers and running jobs are unaffected", face)
 		}
 	}
 }
