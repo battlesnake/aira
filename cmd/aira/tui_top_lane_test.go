@@ -302,7 +302,7 @@ func TestTopQueuedRowNamesTheLaneReason(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			record := topQueuedTestRecord("CONFINE-q-201-dd@session-q", "q", gib)
 			record.LaneWait, record.HeldByHead, record.Pushed, record.Priority = testCase.laneWait, testCase.held, testCase.pushed, testCase.priority
-			if got := topQueuedRow(record, false, 1).Cells[3]; got != testCase.want {
+			if got := topQueuedRow(record, false, 1, nil).Cells[3]; got != testCase.want {
 				t.Fatalf("LIVE cell=%q, want %q", got, testCase.want)
 			}
 		})

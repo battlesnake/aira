@@ -670,6 +670,8 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 		// one failed read would cost two ticks of CPU rates instead of none.
 		return model, previous
 	}
+	// AIRA-381. The session marks, keyed by full owner, for the SESSION cells.
+	marks := topSessionTierMarks(result.SessionTiers)
 	byID := make(map[string]runner.ConfineRecord, len(result.Scopes))
 	live := make([]string, 0, len(result.Scopes))
 	for _, record := range result.Scopes {
@@ -722,7 +724,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 				fmt.Sprint(slot), record.Name, confineNum(record.SupervisorPID),
 				topLiveCell(record), topAgeCell(record.AgeSeconds), topReservationCell(record, reserve),
 				topRAMCell(record.RSSBytes),
-				topCPUCell(rate, rateKnown), topVRAMCell(record.VRAMBytes), topSessionCell(record), topUntrustedCell(lastText),
+				topCPUCell(rate, rateKnown), topVRAMCell(record.VRAMBytes), topSessionCell(record) + topTierSuffix(record.ScopeID, marks), topUntrustedCell(lastText),
 			},
 		})
 		if reserve.State == topReserveSet {
@@ -777,7 +779,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 	// has. Nor do they pass through assignTopSlots, so a queued job taking a place
 	// in the queue (or leaving it) cannot move a live row's slot or colour.
 	for index, record := range result.Queued {
-		model.Rows = append(model.Rows, topQueuedRow(record, previous.ShowCwd, index+1))
+		model.Rows = append(model.Rows, topQueuedRow(record, previous.ShowCwd, index+1, marks))
 	}
 	// AIRA-192. ONE undrawn category now, because there is one reason: the daemon
 	// published no reserve for that scope. The note says so rather than leaving an
@@ -813,7 +815,7 @@ func topViewModel(previous topTick, result runner.ConfineListResult) (panelModel
 // the LISTED queued rows, which are in evaluation order; it undercounts the true
 // queue position when scope-less reservations are queued ahead, so it is worded
 // as the listed position.
-func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int) tableRow {
+func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int, marks map[string]string) tableRow {
 	lastText := record.Command
 	if showCwd {
 		lastText = record.Cwd
@@ -826,7 +828,7 @@ func topQueuedRow(record runner.ConfineRecord, showCwd bool, position int) table
 		Colour: topColourQueued, Cells: []string{
 			"-", record.Name, confineNum(record.SupervisorPID),
 			state, topAgeCell(record.AgeSeconds), topQueuedBytesCell(record.ReserveBytes, "0M req"),
-			"-", "-", topQueuedBytesCell(record.VRAMBytes, topVRAMCell(new(int64))), topSessionCell(record), topUntrustedCell(lastText),
+			"-", "-", topQueuedBytesCell(record.VRAMBytes, topVRAMCell(new(int64))), topSessionCell(record) + topTierSuffix(record.ScopeID, marks), topUntrustedCell(lastText),
 		},
 	}
 }
@@ -1259,6 +1261,38 @@ func topSessionCell(record runner.ConfineRecord) string {
 	default:
 		return owner
 	}
+}
+
+// topSessionTierMarks is the list reply's session marks by full owner
+// (AIRA-381); nil when the reply carries none.
+func topSessionTierMarks(tiers *[]runner.ConfineSessionTier) map[string]string {
+	if tiers == nil || len(*tiers) == 0 {
+		return nil
+	}
+	marks := make(map[string]string, len(*tiers))
+	for _, mark := range *tiers {
+		marks[mark.Owner] = mark.Tier
+	}
+	return marks
+}
+
+// topTierSuffix is the SESSION cell's mark (AIRA-381): " (high)" or " (low)"
+// when the owner parsed from the row's scope id (the daemon's tier key, never
+// the cell text) is marked. It marks the SESSION, not the row's order: a suite
+// worker's row carries its parent's owner and shows the mark while it is
+// ordered medium (L2), and a `--priority high` job is marked in LIVE, not here.
+func topTierSuffix(scopeID string, marks map[string]string) string {
+	if len(marks) == 0 {
+		return ""
+	}
+	_, _, _, owner, ok := runner.ParseConfineScopeID(scopeID)
+	if !ok || owner == "" {
+		return ""
+	}
+	if tier := marks[owner]; tier != "" {
+		return " (" + tier + ")"
+	}
+	return ""
 }
 
 // isWorktreeHash reports whether owner is a discovered worktree id: EXACTLY the
@@ -1699,10 +1733,20 @@ func topFloor(value int64) int64 {
 // are scopes only: a slice can legitimately hold far more admitted jobs than it
 // has scopes, and reading the two against each other is what produced two false
 // P0s (AIRA-68, AIRA-108).
+//
+// AIRA-381. A reply with no session_tiers (an old daemon, ci-shim, or marks
+// that did not load) puts "tiers unevaluated" FIRST on both paths, the
+// nil-SliceReserve one included (the daemon-down fallback always takes it):
+// the footer is one unwrapped line, clipped at 80 columns. A loaded table adds
+// nothing here; the marks are on the rows and in `confine --list`.
 func topFooter(result runner.ConfineListResult) string {
+	tiersUnevaluated := ""
+	if result.SessionTiers == nil {
+		tiersUnevaluated = "tiers unevaluated | "
+	}
 	reserve := result.SliceReserve
 	if reserve == nil {
-		return fmt.Sprintf("%d %s; slice reserve unevaluated",
+		return fmt.Sprintf("%s%d %s; slice reserve unevaluated", tiersUnevaluated,
 			len(result.Scopes), confinePlural(len(result.Scopes), "scope", "scopes"))
 	}
 	// AIRA-220. Granted/jobs are unestablished when the daemon holds no ledger
@@ -1730,6 +1774,9 @@ func topFooter(result runner.ConfineListResult) string {
 		populationClause = "populations unevaluated"
 	}
 	var parts []string
+	if tiersUnevaluated != "" {
+		parts = append(parts, "tiers unevaluated")
+	}
 	// AIRA-370. The machine's CPU load, said once and only when it is high:
 	// context for long waits, never an admission reason (the rows name those).
 	// First: the footer is one unwrapped line and the granted clause alone can

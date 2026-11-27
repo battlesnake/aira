@@ -147,7 +147,7 @@ func TestTopQueuedRowMarksAHighPriorityJob(t *testing.T) {
 	} {
 		record := topQueuedTestRecord("CONFINE-zulu-201-cc@session-q", "zulu", 4*gib)
 		record.Priority, record.Pushed = test.priority, test.pushed
-		if cell := topQueuedRow(record, false, 1).Cells[3]; cell != test.want {
+		if cell := topQueuedRow(record, false, 1, nil).Cells[3]; cell != test.want {
 			t.Fatalf("priority=%s pushed=%v LIVE cell=%q, want %q", test.priority, test.pushed, cell, test.want)
 		}
 	}
@@ -259,7 +259,7 @@ func TestConfinePrioritySourceDecidesTheDisplayedPriority(t *testing.T) {
 				if test.want == runner.ConfinePriorityHigh {
 					wantCell = "high"
 				}
-				if cell := topQueuedRow(rows[0], false, 1).Cells[3]; cell != wantCell {
+				if cell := topQueuedRow(rows[0], false, 1, nil).Cells[3]; cell != wantCell {
 					t.Fatalf("aira top LIVE cell=%q, want %q", cell, wantCell)
 				}
 			})

@@ -159,7 +159,7 @@ func (d *daemonDispatcher) Dispatch(ctx context.Context, scope daemon.WorktreeSc
 	// invocation in every directory. Both shipped spellings (`confine --budget`
 	// and `confine-budget`) converge here, so the verb was wholly unreachable and
 	// the daemon's own handler at internal/daemon/server.go:785 was dead code.
-	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-front" || canonical == "confine-resize" || canonical == "confine-budget" || canonical == "confine-dump" {
+	if canonical == "confine-list" || canonical == "confine-kill" || canonical == "confine-front" || canonical == "confine-resize" || canonical == "confine-budget" || canonical == "confine-dump" || canonical == "confine-session-tier" {
 		if canonical == "confine-budget" || canonical == "confine-dump" {
 			return d.dispatchConfineHistory(ctx, request)
 		}
@@ -220,7 +220,7 @@ func (d *daemonDispatcher) dispatchConfineManagementOnce(ctx context.Context, re
 	frame := daemon.RequestFrame{Proto: daemon.ProtocolVersion, Scope: daemon.WorktreeScope{}, Request: request}
 	response, err := d.doExchange(ctx, frame)
 	if err == nil {
-		if request.Verb == "confine-front" || request.Verb == "confine-resize" {
+		if request.Verb == "confine-front" || request.Verb == "confine-resize" || request.Verb == "confine-session-tier" {
 			return withOldDaemonManagementHint(request.Verb, response.CoreResponse())
 		}
 		return response.CoreResponse()
@@ -520,7 +520,7 @@ func (d *daemonDispatcher) TUILeaseToken(scope daemon.WorktreeScope, ticketID st
 func (d *daemonDispatcher) DispatchPalette(ctx context.Context, scope daemon.WorktreeScope, request core.Request) paletteDispatchAttempt {
 	canonical, route := core.ClassifyRequest(request)
 	request.Verb = canonical
-	if canonical == "confine-front" || canonical == "confine-resize" || canonical == "confine-kill" {
+	if canonical == "confine-front" || canonical == "confine-resize" || canonical == "confine-kill" || canonical == "confine-session-tier" {
 		// AIRA-309. `aira top`'s `f` key (topFrontConfirm), AIRA-312's `e` key
 		// (topResizeConfirm) and AIRA-271's KK (topKillConfirm) are the confirmed
 		// row actions that are client-routed:
@@ -751,7 +751,8 @@ func prepareRoutedRequest(request *core.Request) {
 	}
 }
 
-// withOldDaemonManagementHint (AIRA-309, extended to confine-resize by AIRA-312)
+// withOldDaemonManagementHint (AIRA-309, extended to confine-resize by AIRA-312
+// and to confine-session-tier by AIRA-381)
 // explains a confine-front or confine-resize refusal whose code is outside the
 // verb's own vocabulary. The protocol version did not change, so a daemon that
 // predates the verb accepts the frame and answers with an unrelated code (an
@@ -764,11 +765,14 @@ func withOldDaemonManagementHint(verb string, response core.Response) core.Respo
 	if response.OK || strings.HasPrefix(response.Code, "E_CONFINE_") || strings.HasPrefix(response.Code, "U_CONFINE_") || response.Code == "E_SELECTOR_AMBIGUOUS" {
 		return response
 	}
-	flag := "--front"
-	if verb == "confine-resize" {
-		flag = "--resize"
+	command := "aira confine --front"
+	switch verb {
+	case "confine-resize":
+		command = "aira confine --resize"
+	case "confine-session-tier":
+		command = "aira confine-session-tier"
 	}
-	response.Error += " (the running aira daemon may predate `aira confine " + flag + "`; restart it with `systemctl --user restart aira-daemon.service`)"
+	response.Error += " (the running aira daemon may predate `" + command + "`; restart it with `systemctl --user restart aira-daemon.service`)"
 	return response
 }
 
