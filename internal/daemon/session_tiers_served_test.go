@@ -130,13 +130,16 @@ func seedTiers(t *testing.T, paths Paths, rows map[string]string) {
 	}
 }
 
-func captureLog(t *testing.T) *bytes.Buffer {
+// captureLog redirects the standard logger to a lockedBuffer for the test. The
+// daemon's goroutines keep logging while the test reads, so every read goes
+// through the buffer's locked String.
+func captureLog(t *testing.T) *lockedBuffer {
 	t.Helper()
-	var buffer lockedBuffer
+	buffer := &lockedBuffer{}
 	previous := log.Writer()
-	log.SetOutput(&buffer)
+	log.SetOutput(buffer)
 	t.Cleanup(func() { log.SetOutput(previous) })
-	return &buffer.buf
+	return buffer
 }
 
 type lockedBuffer struct {
@@ -148,6 +151,12 @@ func (b *lockedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // verifies: AIRA-381 T12 (D7, I8) — marks persist across a daemon restart: set
@@ -313,12 +322,16 @@ func TestSessionTiersT12cPublishOnlyAfterTheStoreWrite(t *testing.T) {
 }
 
 // verifies: AIRA-381 T15 (I7) — tiersMu serialises the setter end to end, by
-// the paused-writer technique (no timing over -count): (a) while one set is
-// paused inside its store write, a second set does not complete; resumed, both
-// are in the final table and the store. (b) 63 marks plus two concurrent NEW
-// owners: exactly one is refused E_CONFINE_SESSION_TIERS_FULL. Mutation: drop
-// tiersMu (the second set completes while the first is paused; both new owners
-// pass the cap check).
+// the paused-writer technique: (a) while one set is paused inside its store
+// write, a second set that has PROVABLY reached the setter (the
+// sessionTierSetEnteredFn handshake, waited for before the first is resumed)
+// does not complete; resumed, both are in the final table and the store. (b) 63
+// marks plus two concurrent NEW owners: exactly one is refused
+// E_CONFINE_SESSION_TIERS_FULL. The handshake makes the mutation deterministic:
+// without tiersMu the second set reads the table the paused first has not yet
+// published, so one update is lost (or both new owners pass the cap check)
+// however late the second request arrives. Mutation: drop tiersMu, with the
+// second goroutine delayed two seconds -> red.
 func TestSessionTiersT15SetsAreSerialised(t *testing.T) {
 	for _, full := range []bool{false, true} {
 		t.Run(fmt.Sprintf("full=%v", full), func(t *testing.T) {
@@ -327,6 +340,12 @@ func TestSessionTiersT15SetsAreSerialised(t *testing.T) {
 			var calls int
 			var callsMu sync.Mutex
 			paused, resume := make(chan struct{}), make(chan struct{})
+			secondEntered := make(chan struct{})
+			server.sessionTierSetEnteredFn = func(session string) {
+				if session == "second" {
+					close(secondEntered)
+				}
+			}
 			server.replaceSessionTiersFn = func(ctx context.Context, marks map[string]string) error {
 				if err := server.db.ReplaceConfineSessionTiers(ctx, marks); err != nil {
 					return err
@@ -357,6 +376,15 @@ func TestSessionTiersT15SetsAreSerialised(t *testing.T) {
 				t.Fatal("the first set never reached the store write")
 			}
 			go func() { secondDone <- socketSet(t, paths, "second", "low") }()
+			// The contention handshake: the second set is inside the setter (past
+			// validation, at the lock) before the first is released.
+			select {
+			case <-secondEntered:
+			case response := <-secondDone:
+				t.Fatalf("the second set completed while the first was paused: %+v", response)
+			case <-testdeadline.After(10 * time.Second):
+				t.Fatal("the second set never reached the setter")
+			}
 			select {
 			case response := <-secondDone:
 				t.Fatalf("the second set completed while the first was paused: %+v", response)

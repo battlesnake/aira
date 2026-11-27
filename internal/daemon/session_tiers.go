@@ -175,6 +175,9 @@ func (s *Server) setSessionTier(ctx context.Context, callerOwner string, args ma
 		return runner.ConfineSessionTierResult{}, err
 	}
 	tier, _ := parseSessionTier(tierText)
+	if s.sessionTierSetEnteredFn != nil {
+		s.sessionTierSetEnteredFn(session)
+	}
 	s.tiersMu.Lock()
 	defer s.tiersMu.Unlock()
 	current := s.tiers.Load()

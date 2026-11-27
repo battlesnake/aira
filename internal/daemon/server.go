@@ -141,6 +141,11 @@ type Server struct {
 	// replaceSessionTiersFn is a TEST seam (nil in production, which writes
 	// through s.db): a set's store write, so a test can fail or pause it.
 	replaceSessionTiersFn func(context.Context, map[string]string) error
+	// sessionTierSetEnteredFn is a TEST seam (nil in production): called with the
+	// session name by every set that passed validation, just BEFORE it takes
+	// tiersMu, so a test can prove a second set reached the setter while a first
+	// holds the lock.
+	sessionTierSetEnteredFn func(session string)
 	// S13 restart recovery (design §4). restartFreeze is how long NEW admissions are
 	// frozen from listen-ready (so a slow survivor's re-declare is not beaten to its
 	// space by a new admission); injectable (default 2s) so tests drive timing via the
