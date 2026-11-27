@@ -21,8 +21,8 @@ does today one level up. It adds no rule that stops a job starting; running jobs
 | LOW session, `--priority high` job | 6th |
 | LOW session, ordinary job | 7th |
 
-Inside each row, oldest first. With no marks the main queue's order is exactly today's (one
-small-lane change, L5). Examples, on a box where memory is short and jobs queue:
+Inside each row, oldest first. With no marks the order, the small-job lane included, is exactly
+today's. Examples, on a box where memory is short and jobs queue:
 - You mark session `field` HIGH. Its next `make ci` is considered before the 15 medium jobs that
   queued earlier and starts at once if it fits and nothing ahead is stuck; if not, it becomes the
   front job the box protects under today's rules (jobs behind it may start past it up to half its
@@ -38,10 +38,12 @@ What tiers do not do, said plainly:
 - **A LOW session's running job keeps its memory while higher tiers keep queueing.** A nested
   `aira confine` inside a LOW job is itself LOW (same owner), so while medium and high jobs keep
   arriving and fitting it can wait indefinitely, and its parent holds its reservation meanwhile.
-- **The small-job lane takes jobs in arrival order.** Jobs booking 1 GiB or less (default) go
-  through the lane oldest first (a push still first), whatever the tier or `--priority`; about
-  59% of long waits are such jobs (4,821 of 8,233, reported, unverified). A tier changes only which
-  queued larger job the lane leaves room for, and the order of small jobs once the lane is full.
+- **The small-job lane still lets small jobs pass larger ones, in the same order.** Jobs booking
+  1 GiB or less (default) still go ahead of larger queued jobs through the lane whatever their
+  tier, as long as the lane has room and they leave room for the next job in line; about 59% of
+  long waits are such jobs (4,821 of 8,233, reported, unverified). The lane offers its room in the
+  order above, so when it is short a HIGH session's small job gets it before a LOW one's. (Amended
+  at build review, D4: a lane in arrival order changed grants for sessions that set no mark.)
 - **Test-suite worker claims are untiered** (L2): ordered MEDIUM whatever their session's tier,
   though their rows show the session's mark. A push (`--front`) goes first whatever the tier.
 - **A mark follows an owner string exactly** (the owner in the job's scope id; the SESSION cell
@@ -96,7 +98,10 @@ from a failed load other than a daemon restart.
   `cc-<CLAUDE_CODE_SESSION_ID>`, worktree id, inferred `@cwd-<dir>`); subagents share it.
 - **D2 Composition.** Pushed first (latest first); then tier HIGH, MEDIUM, LOW; inside a tier
   `--priority high` before normal; FIFO inside each bucket.
-- **D3** LOW waits (no age cap, no promotion). **D4** The lane ignores tiers and job priorities.
+- **D3** LOW waits (no age cap, no promotion). **D4** (as decided) The lane ignores tiers and job
+  priorities. **Amended at build review, for the owner to confirm or veto (§3.4):** the lane
+  offers its room in evaluation order, as today; a small job of any tier still passes larger
+  queued jobs through it.
   **D5** Running jobs are unaffected (no preemption, reservation or cpu.weight change).
 - **D6 Order only** (owner line L8, option A). Tiers change only `admitOrderLocked`, exactly as
   `--priority high` does (AIRA-340: "queue order only, never the head rule"). No zero-budget rule,
@@ -215,30 +220,31 @@ job is LOW (its parent's owner): it is not wedged by a rule, but while higher-ti
 arriving and fitting it is considered last and can wait indefinitely, its parent holding its
 reservation throughout (D3, D5; stated in the summary; R2).
 
-### 3.4 The small lane (D4, L5)
+### 3.4 The small lane (D4 amended)
 
-`smallLanePassLocked` (`internal/daemon/small_lane.go:153-219`) uses `admitOrderLocked` today for
-two things, which this design separates:
+`smallLanePassLocked` (`internal/daemon/small_lane.go`) keeps today's single order:
+`order := admitOrderLocked(queue, tiers)` for both its candidates and the reference waiter guard
+G protects, with today's `if index == reference { reference = nextRef(index + 1) }`. The only
+change is the `tiers` argument. With an empty table the lane is today's, byte for byte (T1 on the
+order; `TestSessionTiersLaneNoMarksIsTodays` on the grants).
 
-- **Candidate order** (the loop at `:182`): pushed waiters latest push first, exactly today's
-  prefix, then every other waiter in `queue.waiters` (enqueue) order, ignoring tier and
-  `--priority high` (D4's two keys only). Both lists share the pushed prefix, so every push outcome
-  is today's. Plain FIFO would not keep them: an older small job visited while a newer pushed one
-  is the reference takes `laneWaitPushed` (`:191-195`), is not revisited, and a head in the walk
-  charges it to its budget (T6c).
-- **The reference** (the waiter guard G protects, `nextRef` at `:171-180`) stays in evaluation
-  order (tier-aware): G keeps the room of the waiter the main walk will grant or make the head.
-  It is an index into `order := admitOrderLocked(queue, tiers)` only. After **every** lane grant,
-  `reference = nextRef(reference)`; the comparison at `:215-216` is deleted. `nextRef` skips a
-  waiter no longer `admitQueued` (`grantWaiterLocked` sets `admitGranted`, `admit.go:2940`), so
-  the reference moves exactly when it was the one granted, and no candidate index is ever used.
+**Why not the decided arrival-order candidates (D4 as decided).** G judges a candidate against
+ONE waiter, the reference, which is sound only while every waiter ahead of the candidate in the
+walk's order has been visited. With candidates in a second order an older small job is judged
+against a newer small reference, the lane grants both, and the large waiter behind them loses the
+room G kept for it. Counterexample with **no marks** (build review, probe on master `7905c619`
+passes, on `595c94b3` fails): 32 GiB, zero headroom, lane cap 2 GiB; enqueue M 31.5 GiB, L 0.5,
+H 0.5 `--priority high`. Today: H lane-granted, L kept, M granted (32). Arrival order: L judged
+against H only, L and H lane-granted, M refused (32.5 > 32). With marks the same path lets an
+older LOW small job squeeze out a MEDIUM or HIGH large job. It is a property of two orders in one
+pass, not of the cursor (an exact arrival-order G still leaves M refused, because the walk grants
+H ahead of M), so it was closed by deleting the second order (`laneCandidatesLocked`, the cursor
+rewrite, T6b, T6c, T7c and L5) rather than by more guard machinery.
 
-T7b and T7c (§5) are the counterexamples a cursor built from the candidate index fails; T7b
-alone passes against today's `index == reference` lines by accident.
-
-**The one visible change for sessions that do nothing** (L5): when the lane cap is contended, an
-older ordinary small job gets the last lane room before a newer `--priority high` one, which then
-goes in the main walk at its job-high place.
+**What the owner gives up** (veto restores D4 as decided, with this consequence stated): a LOW
+session's small job no longer gets the last lane room before a HIGH or MEDIUM one, and a
+`--priority high` small job keeps today's place in the lane. A small job of any tier still passes
+large queued jobs through the lane, subject to G.
 
 ### 3.5 The verb and the wire
 
@@ -338,8 +344,8 @@ new daemon: the old decoder is not `DisallowUnknownFields` on this reply (the bu
 - I3 No per-waiter state; a mark reorders already-queued waiters on the next pass (T8).
 - I4 One load per reader, by structure (§3.1, three `Load` sites); `session_tiers` is on every
   `ConfineListResult` the case returns and `confine --list` prints it on both paths (T4, T17c).
-- I5 Lane: candidates pushed-first then FIFO, blind to tier and job priority; the reference is in
-  evaluation order and moves only by `nextRef(reference)` (T6, T6b, T6c, T7, T7b, T7c).
+- I5 Lane: candidates and reference in the one evaluation order, as today; empty table: today's
+  grants (T6, T7, T7b, `TestSessionTiersLaneNoMarksIsTodays`).
 - I6 Identity: a waiter's tier key, the owner `t` sends and the owner whose mark the SESSION cell
   shows are one value, the owner parsed from the scope id (T24, T19b).
 - I7 Writes: a set changes only the table and the store; every acknowledged set is in the
@@ -371,12 +377,10 @@ T29) contain pushed, job-high and normal owned, sub-reservation, scope-less and 
 | T29 | both | any tier-aware condition in the head switch | production is its own oracle: random queues, tables and passes, lane off; run A with the table, run B with the same waiters enqueued in A's tier order, an empty table and `high` cleared (pushes kept): per pass identical grants, `bypassed`, anchor and phase |
 | T13 | starve | tier used as a gate | LOW job alone on an empty slice: granted in the first pass |
 | T30 | starve | a tier hold of any kind | running MEDIUM R (14 of 32 GiB); HIGH head H 20 GiB; R's nested 2 GiB child C, lane off: C granted within H's budget; R released; H granted |
-| T6 | order | lane candidates in evaluation order | lane room for one: older LOW small job lane-granted (`smallLaneGrantObserver`); newer HIGH small job's `laneWait` is `full` |
-| T6b | order | lane candidates keep job-high first | lane room for one, same session: older normal small job lane-granted (observer); newer `--priority high` small job's `laneWait` is `full` |
-| T6c | false order | lane candidates ignore push (plain FIFO) | zero headroom, 32 GiB, 14 running; enqueue MEDIUM small A 0.5, HIGH B 20 (refused), then push small P 0.5: P and A lane-granted in one pass (observer) and B's `bypassed` stays 0; FIFO candidates leave A `laneWaitPushed`, and the walk grants it charged to B (`bypassed` 0.5) |
-| T7 | starve | lane reference taken from the candidate (FIFO) order | 32 GiB, 26 granted, no small leases; enqueue MEDIUM 8, HIGH 31.5, LOW 1 GiB small: the reference is HIGH (31.5 + 1 > 32), so the small job's `laneWait` is `kept` and the observer never sees it; a FIFO reference (MEDIUM, 8 + 1 <= 32) lane-grants it |
-| T7b | false order | reference advanced from the candidate position (`nextRef(index + 1)`) | zero headroom, 32 GiB ceiling, lane cap at least 1.5 GiB; enqueue LOW L 0.5, MEDIUM M 31, HIGH H 0.5, LOW S 0.5 GiB (evaluation H, M, L, S; candidates L, M, H, S); one pass: L and H lane-granted (observer); M the reference; S's `laneWait` is `kept` (31 + 1.5 > 32); M granted by the walk (31 + 1 = 32). Mutation: from H's candidate index 2 the cursor lands on S: S lane-granted, M refused |
-| T7c | false order | today's `if index == reference` lines kept | same box; enqueue LOW A 0.5, HIGH B 31.5, MEDIUM C 0.5 (evaluation B, C, A; candidates A, B, C); one pass: A lane-granted (observer); B stays the reference; C's `laneWait` is `kept` (31.5 + 1 > 32); B granted by the walk (32 <= 32). Mutation: A's candidate index 0 equals the reference index 0, the reference jumps to C: C lane-granted, B refused (32.5 > 32) |
+| T6 | order | lane candidates in arrival order (D4 as decided) | lane room for one: older LOW and newer HIGH small jobs: HIGH lane-granted (`smallLaneGrantObserver`); LOW `laneWait` is `full` |
+| T6n | order | lane candidates in arrival order | NO marks, zero headroom, 32 GiB, lane cap 2 GiB; enqueue M 31.5, L 0.5, H 0.5 `--priority high`: lane grants H only (observer); L `kept`; M granted by the walk (`TestSessionTiersLaneNoMarksIsTodays`) |
+| T7 | starve | lane ordered without the table | 32 GiB, 26 granted, no small leases; enqueue MEDIUM 8, HIGH 31.5, LOW 1 GiB small: the reference is HIGH (31.5 + 1 > 32), so the small job's `laneWait` is `kept` and the observer never sees it; an untiered lane order (reference MEDIUM, 8 + 1 <= 32) lane-grants it |
+| T7b | false order | lane candidates in arrival order | T6n's box with marks: MEDIUM M 31.5, LOW L 0.5, HIGH H 0.5 (evaluation H, M, L): lane grants H only; L `kept`; M granted by the walk. Mutation: L judged against H alone, L and H lane-granted, M refused (32.5 > 32) |
 | T12 | order | marks not loaded | set `field` HIGH, restart the Server on the same state dir with `field`'s survivor re-declaring and a new `field` waiter queued behind MEDIUM ones: the first pass orders it HIGH; `confine --list` reads `high field`; ARDR lease unchanged |
 | T12b | starve | load failure refuses start, reported "none set", or a set accepted on an unloaded table | injected failing load: daemon serves; pointer nil, order as empty; reply has no `session_tiers`; `--list` reads unevaluated, the footer `tiers unevaluated`; journal names the cause and the manual sqlite remedy; a set is refused `E_CONFINE_UNAVAILABLE` exit 4 (the one nil-table refusal) and the stored rows are unchanged |
 | T12c | order | table published before the store write | injected failing write: set refused `E_CONFINE_UNAVAILABLE`, published table and store both unchanged; with the writer paused inside the store write, a concurrent `confine-list` sees the old map |
@@ -397,8 +401,10 @@ T29) contain pushed, job-high and normal owned, sub-reservation, scope-less and 
   change, no observe mode. Recommended: accept.
 - **L2 Who is untiered.** Suite worker claims, `aira run` jobs and jobs whose scope id has no owner
   are always MEDIUM. So marking every owner HIGH is not the same as no marks. Recommended: accept.
-- **L3, L5, L9** are decided (D7, D4, D2): marks persist (load failure: §3.1); lane candidates
-  pushed first, then FIFO (§3.4); a push beats a tier, with no `--steal` for one's own job.
+- **L3, L9** are decided (D7, D2): marks persist (load failure: §3.1); a push beats a tier, with
+  no `--steal` for one's own job.
+- **L5 (reopened at build review).** D4 amended: the lane keeps today's single order, tier-aware
+  (§3.4). Recommended: accept; a veto restores arrival order with its stated consequence.
 - **L4 `@cwd-` keys.** Allowed (covers every unattributed launch from that directory). Accept.
 - **L6 Trust and surface.** CLI and `aira top` only; no MCP tool or Skill action; no ownership
   guard (marking other sessions is the feature); every set audit-logged with its setter in the
@@ -422,12 +428,12 @@ T29) contain pushed, job-high and normal owned, sub-reservation, scope-less and 
 ## 8. Release and rollout
 
 - Milestone v0.47. Client install AND `systemctl --user restart aira-daemon.service`, after
-  `aira confine --list` and a heads-up. Unmarked sessions: main-queue order and head rule
-  unchanged (T1, T29); the one change is the lane's arrival-order offer (L5).
+  `aira confine --list` and a heads-up. Unmarked sessions: order, lane and head rule unchanged
+  (T1, T29, T6n).
 - Peer heads-up at the tagged release (deploy, speed): "The owner can mark sessions high or low in
-  `aira top`; a mark only reorders waiting jobs, like `--priority high`; the small-job lane ignores
-  it; marks survive daemon restarts; agents must not set tiers. The lane now takes `--priority
-  high` small jobs in arrival order."
+  `aira top`; a mark only reorders waiting jobs, like `--priority high`, the small-job lane
+  included; marks survive daemon restarts; agents must not set tiers. With no marks nothing
+  changes."
 
 ## Review log
 
@@ -471,3 +477,15 @@ every blocker sat in the surface around it, so each family is closed by deleting
 - Unchanged by the build and stated for the reviewer: the `aira top` key legend does not gain
   `t tier` (TestTopKillLegendFitsOrdinaryWidths pins the 80-column legend, which is full); the key
   is named in the generated agent guide's session-tiers paragraph instead.
+
+### Build review round 1: 2 findings, both fixed
+
+- **Lane in a second order changed unmarked grants** (P2, probe above, §3.4): closed by a design
+  change that deletes code: `laneCandidatesLocked`, the cursor rewrite, T6b, T6c, T7c and L5.
+  D4 amended for the owner to confirm (§2, §6 L5). T6 inverted, T7b re-pointed at the
+  counterexample with marks, T6n (`TestSessionTiersLaneNoMarksIsTodays`) pins the unmarked one;
+  each fails against arrival-order candidates (run), T6, T7 and T7b against an untiered lane order.
+- **Generated guidance** said a `high` job goes ahead of every `normal` job, and that the lane
+  ignores tiers: `ConfinePriorityGuidance` now says job priority is a sub-level inside a session
+  tier, the session-tiers paragraph that the lane offers its room in the same order;
+  `TestConfinePriorityGuidanceIsOnEveryFace` checks both in the skill and the agent guide.

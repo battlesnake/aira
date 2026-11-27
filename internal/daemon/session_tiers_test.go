@@ -532,67 +532,78 @@ func tierLaneJob(seq int64, name, owner string, reserve int64, high bool) *admit
 
 const halfGiB = qGiB / 2
 
-// verifies: AIRA-381 T6 (D4) — lane candidates ignore the tier: lane room for
-// one, an older LOW small job is lane-granted and a newer HIGH small job's
-// laneWait is full. Mutation: lane candidates in evaluation order.
-func TestSessionTiersT6LaneIgnoresTier(t *testing.T) {
+// verifies: AIRA-381 T6 (D4) — the lane offers its room in EVALUATION order,
+// tier first: lane room for one, an older LOW small job and a newer HIGH small
+// job; the HIGH one is lane-granted and the LOW one's laneWait is full.
+// Mutation: lane candidates in arrival order (the LOW job takes the room).
+func TestSessionTiersT6LaneFollowsTier(t *testing.T) {
 	now := time.Unix(387000, 0)
 	server, observed := tierLaneServer(t, halfGiB, &now)
 	low, high := tierLaneJob(1, "low", "lo", halfGiB, false), tierLaneJob(2, "high", "hi", halfGiB, false)
 	queue := queueOf(server, low, high)
 	publishTiers(server, map[string]sessionTier{"hi": tierHigh, "lo": tierLow})
 	server.evaluateAdmitQueue(queue)
-	if got := strings.Join(*observed, ","); got != "low" {
-		t.Fatalf("lane grants %q, want low", got)
+	if got := strings.Join(*observed, ","); got != "high" {
+		t.Fatalf("lane grants %q, want high", got)
 	}
-	requireLaneWait(t, high, laneWaitFull)
+	requireLaneWait(t, low, laneWaitFull)
 }
 
-// verifies: AIRA-381 T6b (D4) — lane candidates ignore job priority: lane room
-// for one, same session, an older normal small job is lane-granted and a newer
-// `--priority high` one's laneWait is full. Mutation: lane candidates keep
-// job-high first (the pre-381 order).
-func TestSessionTiersT6bLaneIgnoresJobPriority(t *testing.T) {
-	now := time.Unix(387100, 0)
-	server, observed := tierLaneServer(t, halfGiB, &now)
-	normal, high := tierLaneJob(1, "normal", "me", halfGiB, false), tierLaneJob(2, "high", "me", halfGiB, true)
-	queue := queueOf(server, normal, high)
+// laneSqueezeQueue is the build-review counterexample to a lane in a second
+// order: zero headroom, 32 GiB, lane cap 2 GiB, lane job max 1 GiB; enqueued
+// in this order, M 31.5 (owner me, not lane-sized), L 0.5 (owner lo), H 0.5
+// (owner hi, `--priority high` when jobHigh). The reviewer's probe, verbatim
+// in shape: on master the unmarked form grants H in the lane and M in the walk.
+func laneSqueezeQueue(t *testing.T, jobHigh bool, marks map[string]sessionTier) (queue *sliceQueue, l, m, h *admitWaiter, observed *[]string) {
+	t.Helper()
+	now := time.Unix(387600, 0)
+	server, observed := tierLaneServer(t, 2*qGiB, &now)
+	m = tierLaneJob(1, "M", "me", 31*qGiB+halfGiB, false)
+	l = tierLaneJob(2, "L", "lo", halfGiB, false)
+	h = tierLaneJob(3, "H", "hi", halfGiB, jobHigh)
+	queue = queueOf(server, m, l, h)
+	if marks != nil {
+		publishTiers(server, marks)
+	}
 	server.evaluateAdmitQueue(queue)
-	if got := strings.Join(*observed, ","); got != "normal" {
-		t.Fatalf("lane grants %q, want normal", got)
-	}
-	requireLaneWait(t, high, laneWaitFull)
+	return queue, l, m, h, observed
 }
 
-// verifies: AIRA-381 T6c — lane candidates keep the push first: zero headroom,
-// 32 GiB, 14 running; enqueue MEDIUM small A 0.5, HIGH B 20 (refused), then
-// push small P 0.5: P and A are lane-granted in one pass and B's bypassed
-// stays 0. Mutation: plain FIFO candidates (A meets the pushed reference P and
-// is laneWaitPushed; the walk then grants it charged to B: bypassed 0.5).
-func TestSessionTiersT6cLaneKeepsPushFirst(t *testing.T) {
-	now := time.Unix(387200, 0)
-	server, observed := tierLaneServer(t, 8*qGiB, &now)
-	a := tierLaneJob(2, "A", "me", halfGiB, false)
-	b := tierLaneJob(3, "B", "hi", 20*qGiB, false)
-	p := tierLaneJob(4, "P", "me", halfGiB, false)
-	queue := queueOf(server, heldLease(1, 14*qGiB), a, b, p)
-	mustPush(t, queue, p.scopeID)
-	publishTiers(server, map[string]sessionTier{"hi": tierHigh})
-	server.evaluateAdmitQueue(queue)
-	if got := strings.Join(*observed, ","); got != "P,A" {
-		t.Fatalf("lane grants %q, want P,A", got)
+// verifies: AIRA-381 T6n (no mark, no change; build review) — with NO session marks
+// the lane's grants are today's: the newer `--priority high` small job H is
+// lane-granted, the older normal small job L is kept back for the 31.5 GiB
+// job M, and the walk grants M (0.5 + 31.5 = 32). Mutation: lane candidates in
+// arrival order (L is judged against H alone, both are lane-granted, and M is
+// refused, 32.5 > 32), the pre-fix branch's grants for an unmarked queue.
+func TestSessionTiersLaneNoMarksIsTodays(t *testing.T) {
+	_, l, m, _, observed := laneSqueezeQueue(t, true, nil)
+	if got := strings.Join(*observed, ","); got != "H" {
+		t.Fatalf("lane grants %q, want H (today's)", got)
 	}
-	requireAdmitQueued(t, b)
-	if b.bypassed != 0 {
-		t.Fatalf("B bypassed=%d, want 0 (A went through the lane, not past B)", b.bypassed)
-	}
+	requireLaneWait(t, l, laneWaitKept)
+	requireAdmitQueued(t, l)
+	waitAdmitGrant(t, m)
 }
 
-// verifies: AIRA-381 T7 — the lane reference stays in EVALUATION order: 32 GiB,
-// 26 granted, no small leases; enqueue MEDIUM 8, HIGH 31.5, LOW 1 GiB small.
-// The reference is the HIGH waiter (31.5 + 1 > 32), so the small job is kept
-// and never lane-granted. Mutation: the reference taken from the candidate
-// (arrival) order (MEDIUM 8: 8 + 1 <= 32, the small job lane-granted).
+// verifies: AIRA-381 T7b (build review, with marks) — the same squeeze by tier:
+// MEDIUM M 31.5, LOW L, HIGH H (evaluation H, M, L). H lane-granted; M the
+// reference; L kept (31.5 + 1 > 32); M granted by the walk. Mutation: lane
+// candidates in arrival order (L and H lane-granted, M refused).
+func TestSessionTiersT7bLaneLeavesRoomForTheTierOrder(t *testing.T) {
+	_, l, m, _, observed := laneSqueezeQueue(t, false, map[string]sessionTier{"hi": tierHigh, "lo": tierLow})
+	if got := strings.Join(*observed, ","); got != "H" {
+		t.Fatalf("lane grants %q, want H", got)
+	}
+	requireLaneWait(t, l, laneWaitKept)
+	requireAdmitQueued(t, l)
+	waitAdmitGrant(t, m)
+}
+
+// verifies: AIRA-381 T7 — the lane's order and reference use the pass's tiers:
+// 32 GiB, 26 granted, no small leases; enqueue MEDIUM 8, HIGH 31.5, LOW 1 GiB
+// small. The reference is the HIGH waiter (31.5 + 1 > 32), so the small job is
+// kept and never lane-granted. Mutation: the lane ordered without the table
+// (reference MEDIUM 8: 8 + 1 <= 32, the small job lane-granted).
 func TestSessionTiersT7LaneReferenceInEvaluationOrder(t *testing.T) {
 	now := time.Unix(387300, 0)
 	server, observed := tierLaneServer(t, 8*qGiB, &now)
@@ -606,55 +617,6 @@ func TestSessionTiersT7LaneReferenceInEvaluationOrder(t *testing.T) {
 		t.Fatalf("lane grants %v, want none", *observed)
 	}
 	requireLaneWait(t, s, laneWaitKept)
-}
-
-// verifies: AIRA-381 T7b — the reference advances in evaluation coordinates:
-// zero headroom, 32 GiB, lane cap 1.5 GiB; enqueue LOW L 0.5, MEDIUM M 31,
-// HIGH H 0.5, LOW S 0.5 (evaluation H, M, L, S; candidates L, M, H, S). One
-// pass: L and H lane-granted; M is the reference; S kept (31 + 1.5 > 32); M
-// granted by the walk (31 + 1 = 32). Mutation: the reference advanced from the
-// candidate position (`nextRef(index + 1)`): from H's candidate index 2 it
-// lands on S, S is lane-granted and M refused.
-func TestSessionTiersT7bReferenceAdvancesInEvaluationOrder(t *testing.T) {
-	now := time.Unix(387400, 0)
-	server, observed := tierLaneServer(t, qGiB+halfGiB, &now)
-	l := tierLaneJob(1, "L", "lo", halfGiB, false)
-	m := tierLaneJob(2, "M", "me", 31*qGiB, false)
-	h := tierLaneJob(3, "H", "hi", halfGiB, false)
-	s := tierLaneJob(4, "S", "lo", halfGiB, false)
-	queue := queueOf(server, l, m, h, s)
-	publishTiers(server, map[string]sessionTier{"hi": tierHigh, "lo": tierLow})
-	server.evaluateAdmitQueue(queue)
-	if got := strings.Join(*observed, ","); got != "L,H" {
-		t.Fatalf("lane grants %q, want L,H", got)
-	}
-	requireLaneWait(t, s, laneWaitKept)
-	waitAdmitGrant(t, m)
-	requireAdmitQueued(t, s)
-}
-
-// verifies: AIRA-381 T7c — the reference moves only when it is the one
-// granted: same box; enqueue LOW A 0.5, HIGH B 31.5, MEDIUM C 0.5 (evaluation
-// B, C, A; candidates A, B, C). One pass: A lane-granted; B stays the
-// reference; C kept (31.5 + 1 > 32); B granted by the walk (32 <= 32).
-// Mutation: today's `if index == reference` lines kept (A's candidate index 0
-// equals the reference index 0, the reference jumps to C: C lane-granted, B
-// refused).
-func TestSessionTiersT7cReferenceMovesOnlyWhenGranted(t *testing.T) {
-	now := time.Unix(387500, 0)
-	server, observed := tierLaneServer(t, qGiB+halfGiB, &now)
-	a := tierLaneJob(1, "A", "lo", halfGiB, false)
-	b := tierLaneJob(2, "B", "hi", 31*qGiB+halfGiB, false)
-	c := tierLaneJob(3, "C", "me", halfGiB, false)
-	queue := queueOf(server, a, b, c)
-	publishTiers(server, map[string]sessionTier{"hi": tierHigh, "lo": tierLow})
-	server.evaluateAdmitQueue(queue)
-	if got := strings.Join(*observed, ","); got != "A" {
-		t.Fatalf("lane grants %q, want A", got)
-	}
-	requireLaneWait(t, c, laneWaitKept)
-	waitAdmitGrant(t, b)
-	requireAdmitQueued(t, c)
 }
 
 // verifies: AIRA-381 T18 (daemon half) — bad values are refused

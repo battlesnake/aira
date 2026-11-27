@@ -473,8 +473,8 @@ func (w *admitWaiter) isSubReservation() bool {
 // position N of M" line, the queued-ahead total and the `aira top` row order
 // would describe a queue the evaluator does not run: the evaluator, and
 // admitSliceSnapshotFor (position, queued-ahead bytes, queuedEntries), which
-// feeds the AIRA-308 rows. (The small-job lane reads it for its reference
-// waiter only; its candidates have their own order, laneCandidatesLocked.)
+// feeds the AIRA-308 rows. (The small-job lane reads it too, for both its
+// candidates and its reference waiter.)
 //
 // AIRA-381. The session tier is the PRIMARY key below the push, and the job's
 // `--priority high` a sub-level inside each tier: pushed; HIGH session
@@ -517,26 +517,6 @@ func sortPushedLatestFirst(pushed []*admitWaiter) {
 			pushed[j], pushed[j-1] = pushed[j-1], pushed[j]
 		}
 	}
-}
-
-// laneCandidatesLocked is the small-job lane's CANDIDATE order (AIRA-381 D4):
-// pushed waiters latest push first, exactly admitOrderLocked's prefix, then
-// every other queued waiter in enqueue order, blind to session tier and job
-// priority. queue.mu must be held.
-func laneCandidatesLocked(queue *sliceQueue) []*admitWaiter {
-	var pushed, rest []*admitWaiter
-	for _, waiter := range queue.waiters {
-		if waiter == nil || waiter.state != admitQueued {
-			continue
-		}
-		if waiter.pushSeq > 0 {
-			pushed = append(pushed, waiter)
-		} else {
-			rest = append(rest, waiter)
-		}
-	}
-	sortPushedLatestFirst(pushed)
-	return append(pushed, rest...)
 }
 
 // admitBypassBudget is the AIRA-307 budget of a head: half its own requested
@@ -2598,8 +2578,8 @@ func (s *Server) evaluateAdmitQueue(queue *sliceQueue) {
 	// queue state.
 	queue.mu.Lock()
 	defer queue.mu.Unlock()
-	// AIRA-381. The session tiers, loaded ONCE for the whole pass: the lane's
-	// reference and the walk below order by the same table.
+	// AIRA-381. The session tiers, loaded ONCE for the whole pass: the lane
+	// and the walk below order by the same table.
 	tiers := tierTable(s.tiers.Load())
 	// AIRA-228. The clock is read UNDER queue.mu: the queue outlives its
 	// population, so a pass that read it first and then waited for the lock

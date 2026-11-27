@@ -17,7 +17,7 @@ import (
 // HIGH or LOW; every other session is MEDIUM. A mark changes ONE thing, the
 // admission evaluation order (admitOrderLocked), exactly as `--priority high`
 // does one level down: no hold, no head-rule, budget or backstop change, no
-// per-waiter state. The small-job lane ignores tiers (small_lane.go).
+// per-waiter state. The small-job lane walks the same order (small_lane.go).
 //
 // The table is Server.tiers: an immutable map published by pointer. A nil
 // pointer is UNEVALUATED (ci-shim mode, a failed load at start, a Server built
